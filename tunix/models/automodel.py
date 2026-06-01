@@ -500,6 +500,23 @@ class AutoModel:
             'Gemma 3 models are only supported from GCS or INTERNAL.'
             f' Specified model source: {model_source}'
         )
+    # Gemma 4: Orbax loading for GCS/INTERNAL sources.
+    # Other sources (e.g., HuggingFace) fall through to the common
+    # SafeTensors path, which resolves to gemma4/params_safetensors.py.
+    elif naming_info.model_family == 'gemma4':
+      if model_source in (ModelSource.GCS, ModelSource.INTERNAL):
+        # Name is legacy — dynamically resolves to gemma4 via ModelNaming.
+        model, model_params = create_gemma3_model_from_checkpoint(
+            ckpt_path=resolved_model_path,
+            model_name=naming_info.model_name,
+            mesh=mesh,
+        )
+      else:
+        logging.info(
+            'Gemma 4 source %s is not GCS/INTERNAL, falling through to'
+            ' SafeTensors loader.',
+            model_source,
+        )
     # For other native Tunix models with special handling cases for Gemma2 models
     elif naming_info.model_family in ('gemma', 'gemma1p1', 'gemma2'):
       if model_source == ModelSource.KAGGLE:

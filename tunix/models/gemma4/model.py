@@ -1237,7 +1237,13 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       cache=None,
       attention_mask=None,
       decode_only_last_token=False,
+      **kwargs,
   ):
+    # Tunix's RL pipeline (rl/common.py) uses inspect.signature to detect
+    # **kwargs and conditionally passes segment_ids for sequence packing.
+    # Gemma 4 doesn't use segment_ids in attention, but accepting **kwargs
+    # prevents a crash when the trainer passes it.
+    del kwargs
     if positions is None:
       B, T = tokens.shape  # pylint: disable=invalid-name
       positions = jnp.tile(jnp.arange(T)[None, :], (B, 1))
