@@ -19,7 +19,6 @@ This module provides utility functions to parse and handle model names and
 convert them to internal model naming structures.
 """
 
-
 import dataclasses
 from typing import NewType
 import immutabledict
@@ -66,6 +65,7 @@ class ModelNaming:
       model version, used in the ModelConfig class. e.g., "gemma_2b_it" or
       "qwen2p5_0p5b".
   """
+
   # TODO(b/451662153): use HFModelId and ConfigId throughout, add validation,
   # and then remove str support.
   model_id: HFModelId | ConfigId | str | None = None
@@ -135,6 +135,9 @@ class _ModelFamilyInfo:
 
 # HF model family info mapping.
 _HF_MODEL_FAMILY_INFO_MAPPING = immutabledict.immutabledict({
+    'diffusion-gemma-': _ModelFamilyInfo(
+        family='diffusion_gemma', config_category='diffusion_gemma'
+    ),
     'gemma-': _ModelFamilyInfo(family='gemma', config_category='gemma'),
     'gemma-1.1-': _ModelFamilyInfo(family='gemma1p1', config_category='gemma'),
     'gemma-2-': _ModelFamilyInfo(family='gemma2', config_category='gemma'),
@@ -152,6 +155,9 @@ _HF_MODEL_FAMILY_INFO_MAPPING = immutabledict.immutabledict({
 
 # Config id model family info mapping.
 _CONFIG_ID_MODEL_FAMILY_INFO_MAPPING = immutabledict.immutabledict({
+    'diffusion_gemma_': _ModelFamilyInfo(
+        family='diffusion_gemma', config_category='diffusion_gemma'
+    ),
     'gemma_': _ModelFamilyInfo(family='gemma', config_category='gemma'),
     'gemma1p1_': _ModelFamilyInfo(family='gemma1p1', config_category='gemma'),
     'gemma2_': _ModelFamilyInfo(family='gemma2', config_category='gemma'),

@@ -184,7 +184,8 @@ def create_gemma_model_with_nnx_conversion(
       logging.warning(
           'model_path is not provided. Inferring from model_name. This may lead'
           ' to incorrect results if the model_name (%s) is not a standard Gemma'
-          ' model name.', model_name
+          ' model name.',
+          model_name,
       )
       naming_info = naming.ModelNaming(model_name=model_name)
       version_dashed = None
@@ -285,6 +286,22 @@ def create_gemma3_model_from_checkpoint(
   return model, model_params
 
 
+def create_diffusion_gemma_model_from_checkpoint(
+    ckpt_path: str, model_name: str, mesh: jax.sharding.Mesh, **kwargs
+) -> tuple[nnx.Module, Any]:
+  """Creates a DiffusionGemma model from a checkpoint."""
+  model_params = call_model_config(model_name)
+  valid_kwargs = {
+      k: v
+      for k, v in kwargs.items()
+      if hasattr(model_params, k) and v is not None
+  }
+  model_params = dataclasses.replace(model_params, **valid_kwargs)
+  params_lib = get_model_module(model_name, ModelModule.PARAMS)
+  model = params_lib.create_model_from_checkpoint(ckpt_path, model_params, mesh)
+  return model, model_params
+
+
 def download_model(
     model_id_or_path: str,
     model_download_path: str | None,
@@ -332,7 +349,7 @@ def create_model_from_safe_tensors(
     model_config: Any,
     mesh: jax.sharding.Mesh,
     dtype: jnp.dtype | None = None,
-    mode: str = "auto",
+    mode: str = 'auto',
 ) -> Any:
   """Dynamically imports the correct module and calls `create_model_from_safe_tensors` based on the model_name.
 
@@ -355,7 +372,12 @@ def create_model_from_safe_tensors(
   """
   naming_info = naming.ModelNaming(model_name=model_name)
   if naming_info.model_family in (
-      'gemma', 'gemma1p1', 'gemma2', 'gemma3', 'gemma4'
+      'gemma',
+      'gemma1p1',
+      'gemma2',
+      'gemma3',
+      'gemma4',
+      'diffusion_gemma',
   ):
     params_module = get_model_module(model_name, ModelModule.PARAMS_SAFETENSORS)
   else:
@@ -523,6 +545,20 @@ class AutoModel:
       else:
         logging.info(
             'Gemma 4 source %s is not GCS/INTERNAL, falling through to'
+            ' SafeTensors loader.',
+            model_source,
+        )
+    elif naming_info.model_family == 'diffusion_gemma':
+      if model_source in (ModelSource.GCS, ModelSource.INTERNAL):
+        model, model_params = create_diffusion_gemma_model_from_checkpoint(
+            ckpt_path=resolved_model_path,
+            model_name=naming_info.model_name,
+            mesh=mesh,
+            **kwargs,
+        )
+      else:
+        logging.info(
+            'DiffusionGemma source %s is not GCS/INTERNAL, falling through to'
             ' SafeTensors loader.',
             model_source,
         )
