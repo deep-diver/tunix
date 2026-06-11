@@ -87,9 +87,9 @@ def _dtype_from_name(name: str):
   }[name]
 
 
-def _mesh() -> jax.sharding.Mesh:
+def _mesh(fsdp: int, tp: int) -> jax.sharding.Mesh:
   return jax.make_mesh(
-      (1, 1),
+      (fsdp, tp),
       ("fsdp", "tp"),
       axis_types=(jax.sharding.AxisType.Auto,) * 2,
   )
@@ -226,7 +226,12 @@ def _full_sequence_logits(
 
 def _load_real_model(args):
   dtype = _dtype_from_name(args.dtype)
-  mesh = _mesh()
+  if args.mesh_fsdp * args.mesh_tp != jax.device_count():
+    raise ValueError(
+        "mesh_fsdp * mesh_tp must equal jax.device_count(). Got "
+        f"{args.mesh_fsdp} * {args.mesh_tp} != {jax.device_count()}."
+    )
+  mesh = _mesh(args.mesh_fsdp, args.mesh_tp)
   with mesh:
     config = diffusion_model.ModelConfig.diffusion_gemma_a26b_a4b()
     return diffusion_params.create_model_from_checkpoint(
@@ -462,6 +467,8 @@ def parse_args() -> argparse.Namespace:
       choices=("bfloat16", "float16", "float32"),
       default="bfloat16",
   )
+  parser.add_argument("--mesh_fsdp", type=int, default=1)
+  parser.add_argument("--mesh_tp", type=int, default=1)
   parser.add_argument("--no_chat_template", action="store_true")
   parser.add_argument("--tiny", action="store_true")
   parser.add_argument("--tiny_vocab_size", type=int, default=256)
