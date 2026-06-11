@@ -18,10 +18,12 @@ This directory is the runbook for the Tunix DiffusionGemma MVP integration.
 
 - The NNX MVP uses a full-sequence denoising compatibility path for the decoder loss. It still builds the prefilled KV cache and selected-canvas `end_index`, but Tunix Gemma4 does not yet expose the official multi-token canvas attention-over-prefilled-cache path used by the Flax Linen implementation.
 - The full-model logits parity script covers the direct transformer forward path without cache. The cached official SFT decoder path is still distinct from the MVP full-sequence denoising compatibility path because Tunix Gemma4 cache updates do not yet implement the official multi-token canvas write-at-`end_index` behavior.
-- Upstream Orbax checkpoint loading maps the Gemma4-compatible backbone and known `self_conditioner` leaves. The public `diffusiongemma-26B-A4B-it` checkpoint has been loaded successfully on a 4xH100 JAX mesh.
+- Upstream Orbax checkpoint loading maps the Gemma4-compatible backbone and known `self_conditioner` leaves. The public `diffusiongemma-26B-A4B-it` checkpoint has been loaded successfully on 4xH100 and 8x96GB JAX meshes.
 - The no-tuning generation demo uses the full-sequence no-cache path covered by logits parity, not the official cached production sampler. Treat it as a load/denoise visibility smoke test, not a quality benchmark.
-- Public 26B PubMedQA training is not yet passing on the current `PeftTrainer` JIT path. A 4xH100 smoke reaches finite PubMedQA loss with the public checkpoint, but the LoRA train step OOMs while compiling/executing `jit__train_step` even with `prompt_len=64`, `canvas_size=8`, and one canvas. `mesh_fsdp=2, mesh_tp=2` reduces the failing allocation substantially versus `mesh_fsdp=4, mesh_tp=1`, but still does not fit.
+- Public 26B PubMedQA LoRA tuning now passes a reduced 1-step smoke on an 8x RTX PRO 6000 96GB VM with `mesh_fsdp=4, mesh_tp=2`, `prompt_len=64`, `canvas_size=8`, one canvas, batch size 1, and short answers. This proves the real-data load/loss/update path, LoRA-only update check, and minimal state save path on a public checkpoint. It is not yet the full official recipe shape.
+- The official PubMedQA SFT recipe uses `prompt_len=1024`, `num_canvases=2`, `canvas_size=128`, batch size 2, long answers, and 2000 train steps. The current full-sequence compatibility decoder path is expected to be much heavier at that shape and still needs the official cached selected-canvas decoder update before full-recipe timing is meaningful.
 - For public 26B smoke runs, `scripts/smoke_diffusion_gemma_pubmedqa_tunix.py` defaults to a minimal `minimal_state.json` proof artifact instead of Tunix/Orbax optimizer checkpointing. Use `--orbax_checkpoint` only when the shape is known to fit; the public 26B optimizer checkpoint path can exceed memory.
+- GPU memory headroom was not captured in the first successful 8-GPU run because no `nvidia-smi` polling was enabled before the VM was destroyed. The smoke script now has `--gpu_memory_poll_seconds` so future runs write `gpu_memory` peak/headroom fields into `train_complete` and `minimal_state.json`.
 
 ## Local Commands
 
@@ -104,6 +106,14 @@ jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/ubuntu/tunix-dg-pubmed
 jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/ubuntu/tunix-dg-pubmedqa-tp && . .venv/bin/activate && python scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --steps 1 --batch_size 1 --prompt_len 64 --canvas_size 8 --num_canvases 1 --max_examples 2 --max_context_chars 300 --no-use_long_answer --checkpoint /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 2 --mesh_tp 2 --restore_concurrent_gb 16 --checkpoint_dir /home/ubuntu/diffusion_gemma_pubmedqa_state_fsdp2_tp2 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption'
 ```
 
+Repeatable 8-GPU public-checkpoint command with VRAM telemetry:
+
+```bash
+jl create --gpu RTX-PRO6000 --region IN1 --num-gpus 8 --storage 300 --vm --yes --json
+jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/ubuntu/tunix-dg-pubmedqa-8gpu && . .venv/bin/activate && python scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --steps 1 --batch_size 1 --prompt_len 64 --canvas_size 8 --num_canvases 1 --max_examples 2 --max_context_chars 300 --no-use_long_answer --checkpoint /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 4 --mesh_tp 2 --restore_concurrent_gb 16 --checkpoint_dir /home/ubuntu/diffusion_gemma_pubmedqa_state_8gpu_fsdp4_tp2 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption --gpu_memory_poll_seconds 2'
+jl destroy <machine_id> --yes --json
+```
+
 Latest verified 4xH100 PubMedQA public-checkpoint result:
 
 - Machine: `424974` (`H100`, `IN2`, 4 GPUs, VM), destroyed after the run.
@@ -116,7 +126,21 @@ Latest verified 4xH100 PubMedQA public-checkpoint result:
 - `mesh_fsdp=1, mesh_tp=4` run: `r_f3f3ff49`, failed at checkpoint load because a weight with shape `(2, 2816, 512)` cannot shard axis 0 over TP 4.
 - `mesh_fsdp=2, mesh_tp=2` run: `r_13800793`, public checkpoint loaded and PubMedQA loss was finite: total `17.48516845703125`, decoder `8.583871841430664`, encoder `8.901296615600586`.
 - `mesh_fsdp=2, mesh_tp=2` train step failed: XLA reported `RESOURCE_EXHAUSTED` while allocating `37.05GiB` in `jit__train_step`; rematerialization reduced the module to about `56.47GiB`, down from `57.09GiB`.
-- Verdict: this proves real PubMedQA preprocessing and public-checkpoint forward/loss compatibility, but not usable 26B LoRA tuning yet. The next required work is a lower-memory train path, likely by avoiding the full-sequence compatibility decoder path during SFT and implementing the official cached selected-canvas decoder update in Tunix Gemma4.
+- 4xH100 verdict: this proves real PubMedQA preprocessing and public-checkpoint forward/loss compatibility, but 4 GPUs are not enough for the current 26B LoRA train step. The next required work for smaller GPU counts is a lower-memory train path, likely by avoiding the full-sequence compatibility decoder path during SFT and implementing the official cached selected-canvas decoder update in Tunix Gemma4.
+
+Latest verified 8x RTX PRO 6000 PubMedQA public-checkpoint result:
+
+- Machine: `425022` (`RTX-PRO6000`, `IN1`, 8 GPUs, 96GB each, VM), destroyed after the run.
+- H200 8-GPU creation was attempted first and failed with `H200 not available at this moment`; RTX PRO 6000 was the best available 8-GPU high-memory option returned by JarvisLabs.
+- Checkpoint mirror: `r_57434190`, 31 objects, 37.633 GiB, 379.773 seconds.
+- Run: `r_4eb26186`, `mesh_fsdp=4`, `mesh_tp=2`.
+- Public checkpoint loaded, PubMedQA loss was finite, and one LoRA train step completed.
+- Initial loss: total `15.572822570800781`, decoder `6.76804256439209`, encoder `8.804780006408691`.
+- Final loss: total `13.501846313476562`, decoder `5.226025104522705`, encoder `8.2758207321167`.
+- LoRA norm delta: `0.00029754638671875`; sampled non-LoRA checksum delta: `0.0`.
+- Artifact: `/home/ubuntu/diffusion_gemma_pubmedqa_state_8gpu_fsdp4_tp2/minimal_state.json`.
+- VRAM headroom: not measured in this run. The machine was destroyed before a peak memory report was copied; rerun with `--gpu_memory_poll_seconds 2` to preserve per-GPU peak used and minimum free memory.
+- Runtime estimate: this 1-step run includes checkpoint restore and first JIT compile, so it is not enough to extrapolate steady-state throughput. A reduced-shape 2000-step run is plausibly hours, not minutes, on the same 8x96GB class hardware. The full official PubMedQA shape should be treated as unmeasured and likely too heavy for the current full-sequence compatibility path until the cached selected-canvas decoder path is implemented and timed with a 10-50 step probe.
 
 ## JarvisLabs Smoke
 

@@ -25,6 +25,7 @@ public DiffusionGemma checkpoint for a GPU smoke run.
 from __future__ import annotations
 
 import argparse
+import atexit
 import dataclasses
 import json
 import os
@@ -33,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import Any
 
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
@@ -85,6 +87,98 @@ class PreparedExample:
 
 def _log(event: str, **kwargs: Any) -> None:
   print(json.dumps({"event": event, **kwargs}, ensure_ascii=False), flush=True)
+
+
+class _GpuMemoryMonitor:
+  """Polls nvidia-smi so GPU smoke runs leave explicit VRAM evidence."""
+
+  def __init__(self, poll_seconds: float):
+    self._poll_seconds = poll_seconds
+    self._stop_event = threading.Event()
+    self._thread: threading.Thread | None = None
+    self._samples = 0
+    self._peak_used_mib: dict[str, int] = {}
+    self._total_mib: dict[str, int] = {}
+    self._last_error = ""
+    self._lock = threading.Lock()
+
+  def start(self) -> None:
+    if self._poll_seconds <= 0:
+      return
+    if not shutil.which("nvidia-smi"):
+      _log("gpu_memory_monitor_unavailable", reason="nvidia-smi not found")
+      return
+    self._thread = threading.Thread(
+        target=self._poll_loop,
+        name="gpu-memory-monitor",
+        daemon=True,
+    )
+    self._thread.start()
+    atexit.register(self.stop)
+    _log("gpu_memory_monitor_started", poll_seconds=self._poll_seconds)
+
+  def stop(self) -> dict[str, Any] | None:
+    if self._thread is None:
+      return None
+    self._stop_event.set()
+    self._thread.join(timeout=max(1.0, self._poll_seconds + 1.0))
+    with self._lock:
+      if not self._peak_used_mib:
+        return {
+            "samples": self._samples,
+            "last_error": self._last_error,
+            "observed": False,
+        }
+      free_mib = {
+          index: self._total_mib[index] - used
+          for index, used in self._peak_used_mib.items()
+      }
+      return {
+          "samples": self._samples,
+          "observed": True,
+          "total_mib_by_gpu": dict(sorted(self._total_mib.items())),
+          "peak_used_mib_by_gpu": dict(sorted(self._peak_used_mib.items())),
+          "min_free_mib_by_gpu": dict(sorted(free_mib.items())),
+          "max_peak_used_mib": max(self._peak_used_mib.values()),
+          "min_headroom_mib": min(free_mib.values()),
+          "last_error": self._last_error,
+      }
+
+  def _poll_loop(self) -> None:
+    while not self._stop_event.is_set():
+      self._sample_once()
+      self._stop_event.wait(self._poll_seconds)
+    self._sample_once()
+
+  def _sample_once(self) -> None:
+    try:
+      proc = subprocess.run(
+          [
+              "nvidia-smi",
+              "--query-gpu=index,memory.used,memory.total",
+              "--format=csv,noheader,nounits",
+          ],
+          check=True,
+          capture_output=True,
+          text=True,
+          timeout=10,
+      )
+      with self._lock:
+        self._samples += 1
+        for line in proc.stdout.strip().splitlines():
+          if not line.strip():
+            continue
+          index, used, total = [part.strip() for part in line.split(",")]
+          used_mib = int(used)
+          total_mib = int(total)
+          self._total_mib[index] = total_mib
+          self._peak_used_mib[index] = max(
+              self._peak_used_mib.get(index, 0), used_mib
+          )
+        self._last_error = ""
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      with self._lock:
+        self._last_error = repr(exc)
 
 
 def _dtype_from_name(name: str):
@@ -448,6 +542,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       devices=[str(d) for d in jax.devices()],
       backend=jax.default_backend(),
   )
+  gpu_memory_monitor = _GpuMemoryMonitor(args.gpu_memory_poll_seconds)
+  gpu_memory_monitor.start()
   train_path, test_path = _prepare_pubmedqa(args)
   all_examples = _read_jsonl(train_path)
   examples = all_examples[args.slice_start :]
@@ -598,6 +694,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       "num_canvases": args.num_canvases,
       "batch_size": args.batch_size,
   }
+  gpu_memory = gpu_memory_monitor.stop()
+  if gpu_memory is not None:
+    result["gpu_memory"] = gpu_memory
+    _log("gpu_memory_summary", **gpu_memory)
   if trainer.train_steps < args.steps:
     raise RuntimeError(
         f"Expected {args.steps} train steps, got {trainer.train_steps}"
@@ -671,6 +771,15 @@ def parse_args() -> argparse.Namespace:
       "--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16"
   )
   parser.add_argument("--restore_concurrent_gb", type=int, default=16)
+  parser.add_argument(
+      "--gpu_memory_poll_seconds",
+      type=float,
+      default=0.0,
+      help=(
+          "Poll nvidia-smi at this interval and write peak VRAM/headroom into "
+          "the final train_complete JSON. Disabled when set to 0."
+      ),
+  )
   parser.add_argument("--mesh_fsdp", type=int, default=1)
   parser.add_argument("--mesh_tp", type=int, default=1)
   parser.add_argument("--lora_rank", type=int, default=4)
