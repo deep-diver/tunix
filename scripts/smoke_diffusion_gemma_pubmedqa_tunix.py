@@ -450,10 +450,15 @@ def _load_real_model(args: argparse.Namespace):
         f"{args.mesh_fsdp} * {args.mesh_tp} != {jax.device_count()}."
     )
   mesh = _mesh(args.mesh_fsdp, args.mesh_tp)
+  remat_config = (
+      gemma4_model.RematConfig.DECODER if args.remat_decoder else None
+  )
   with mesh:
     return diffusion_params.create_model_from_checkpoint(
         args.checkpoint,
-        diffusion_model.ModelConfig.diffusion_gemma_a26b_a4b(),
+        diffusion_model.ModelConfig.diffusion_gemma_a26b_a4b(
+            remat_config=remat_config
+        ),
         mesh=mesh,
         dtype=_dtype_from_name(args.dtype),
         restore_concurrent_gb=args.restore_concurrent_gb,
@@ -484,7 +489,10 @@ def _small_leaf_checksums(
   for path, value in sorted(flat.items(), key=lambda item: str(item[0])):
     if not hasattr(value, "shape") or value.size > max_size:
       continue
-    checksums[path] = jnp.sum(value.astype(jnp.float32))
+    try:
+      checksums[path] = jnp.sum(value.astype(jnp.float32))
+    except (TypeError, NotImplementedError):
+      continue
     if len(checksums) >= limit:
       break
   return checksums
@@ -507,6 +515,17 @@ def _max_checksum_delta(
   return float(jax.device_get(jnp.max(jnp.stack(deltas))))
 
 
+def _state_summary(state: Any) -> dict[str, int]:
+  leaves = [leaf for leaf in jax.tree.leaves(state) if hasattr(leaf, "shape")]
+  num_elements = sum(int(leaf.size) for leaf in leaves)
+  num_bytes = sum(int(leaf.size * leaf.dtype.itemsize) for leaf in leaves)
+  return {
+      "leaves": len(leaves),
+      "elements": num_elements,
+      "bytes": num_bytes,
+  }
+
+
 def _make_train_batches(
     examples: list[PreparedExample],
     *,
@@ -516,8 +535,10 @@ def _make_train_batches(
 ) -> list[dict[str, jax.Array]]:
   tiny_vocab_size = vocab_size if args.tiny else None
   batches = []
-  for step in range(args.steps):
-    start = (step * args.batch_size) % len(examples)
+  accumulation_steps = args.gradient_accumulation_steps or 1
+  num_micro_batches = args.steps * accumulation_steps
+  for micro_step in range(num_micro_batches):
+    start = (micro_step * args.batch_size) % len(examples)
     batch_examples = [
         examples[(start + offset) % len(examples)]
         for offset in range(args.batch_size)
@@ -529,7 +550,7 @@ def _make_train_batches(
         canvas_size=args.canvas_size,
         num_canvases=args.num_canvases,
         use_long_answer=args.use_long_answer,
-        rng_seed=args.seed + 10_000 + step,
+        rng_seed=args.seed + 10_000 + micro_step,
         tiny_vocab_size=tiny_vocab_size,
     )
     batches.append(diffusion_sft.gen_model_input_fn(batch))
@@ -595,6 +616,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       lora_rank=args.lora_rank,
       lora_module_path=args.lora_module_path,
   )
+  trainable_summary = _state_summary(nnx.state(model, nnx.LoRAParam))
+  frozen_summary = _state_summary(
+      nnx.state(model, nnx.filterlib.Not(nnx.LoRAParam))
+  )
+  _log(
+      "trainable_state",
+      lora=trainable_summary,
+      frozen=frozen_summary,
+      lora_fraction=(
+          trainable_summary["elements"]
+          / max(trainable_summary["elements"] + frozen_summary["elements"], 1)
+      ),
+  )
 
   diffusion_config = diffusion_sft.DiffusionGemmaSFTConfig(
       prompt_len=args.prompt_len,
@@ -607,6 +641,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       stop_gradient_from_denoiser_to_encoder=(
           args.stop_gradient_from_denoiser_to_encoder
       ),
+      decoder_implementation=args.decoder_implementation,
       fast_uniform_corruption=args.fast_uniform_corruption,
   )
   train_batches = _make_train_batches(
@@ -628,8 +663,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       ),
       time_mean=float(jax.device_get(initial_aux["time_mean"])),
   )
+  trainable_summary = _state_summary(nnx.state(model, nnx.LoRAParam))
+  frozen_summary = _state_summary(
+      nnx.state(model, nnx.filterlib.Not(nnx.LoRAParam))
+  )
+  _log(
+      "trainable_state_after_materialize",
+      lora=trainable_summary,
+      frozen=frozen_summary,
+      lora_fraction=(
+          trainable_summary["elements"]
+          / max(trainable_summary["elements"] + frozen_summary["elements"], 1)
+      ),
+  )
 
   lora_before_norm = _tree_l2_norm(nnx.state(model, nnx.LoRAParam))
+  lora_before_checksums = _small_leaf_checksums(
+      nnx.state(model, nnx.LoRAParam), limit=32, max_size=262144
+  )
   base_before_checksums = _small_leaf_checksums(
       nnx.state(model, nnx.filterlib.Not(nnx.LoRAParam))
   )
@@ -650,6 +701,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
   train_config = peft_trainer.TrainingConfig(
       eval_every_n_steps=max(1, args.steps),
       max_steps=args.steps,
+      gradient_accumulation_steps=args.gradient_accumulation_steps,
       checkpoint_root_directory=ckpt_dir if args.orbax_checkpoint else None,
       max_inflight_computations=1,
       pbar_description=None,
@@ -671,6 +723,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
   lora_norm_delta = float(
       jax.device_get(jnp.abs(lora_after_norm - lora_before_norm))
   )
+  lora_checksum_delta = _max_checksum_delta(
+      lora_before_checksums, nnx.state(model, nnx.LoRAParam)
+  )
   base_checksum_delta = _max_checksum_delta(
       base_before_checksums, nnx.state(model, nnx.filterlib.Not(nnx.LoRAParam))
   )
@@ -687,12 +742,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       "lora_norm_before": float(jax.device_get(lora_before_norm)),
       "lora_norm_after": float(jax.device_get(lora_after_norm)),
       "lora_norm_delta": lora_norm_delta,
+      "lora_checksum_delta": lora_checksum_delta,
       "base_checksum_delta": base_checksum_delta,
       "first_pubmed_id": examples[0].pubmed_id,
       "prompt_len": args.prompt_len,
       "canvas_size": args.canvas_size,
       "num_canvases": args.num_canvases,
       "batch_size": args.batch_size,
+      "gradient_accumulation_steps": args.gradient_accumulation_steps or 1,
+      "effective_batch_size": (
+          args.batch_size * (args.gradient_accumulation_steps or 1)
+      ),
+      "decoder_implementation": args.decoder_implementation,
+      "trainable_state": trainable_summary,
+      "frozen_state": frozen_summary,
   }
   gpu_memory = gpu_memory_monitor.stop()
   if gpu_memory is not None:
@@ -704,8 +767,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
   if not result["checkpoint_dir_exists"]:
     raise RuntimeError(f"Checkpoint directory was not created: {ckpt_dir}")
-  if lora_norm_delta <= 0:
-    raise RuntimeError("LoRA parameter norm did not change during training.")
+  if lora_norm_delta <= 0 and lora_checksum_delta <= 0:
+    raise RuntimeError("LoRA parameters did not change during training.")
   if base_checksum_delta != 0:
     raise RuntimeError(
         "Sampled non-LoRA parameter checksums changed during LoRA training."
@@ -725,6 +788,7 @@ def parse_args() -> argparse.Namespace:
   )
   parser.add_argument("--steps", type=int, default=2)
   parser.add_argument("--batch_size", type=int, default=1)
+  parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
   parser.add_argument("--prompt_len", type=int, default=1024)
   parser.add_argument("--canvas_size", type=int, default=128)
   parser.add_argument("--num_canvases", type=int, default=2)
@@ -734,6 +798,15 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--self_cond_prob", type=float, default=1.0)
   parser.add_argument("--decoder_loss_weight", type=float, default=1.0)
   parser.add_argument("--encoder_loss_weight", type=float, default=1.0)
+  parser.add_argument(
+      "--decoder_implementation",
+      choices=[
+          "cached_selected_canvas",
+          "cached_selected_canvas_slice",
+          "full_sequence",
+      ],
+      default="cached_selected_canvas",
+  )
   parser.add_argument(
       "--fast_uniform_corruption",
       action=argparse.BooleanOptionalAction,
@@ -769,6 +842,17 @@ def parse_args() -> argparse.Namespace:
   )
   parser.add_argument(
       "--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16"
+  )
+  parser.add_argument(
+      "--remat_decoder",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Enable decoder rematerialization. This can reduce activation memory,"
+          " but Qwix currently only materializes self-conditioner LoRA leaves"
+          " behind decoder remat, so it is disabled by default for LoRA"
+          " coverage."
+      ),
   )
   parser.add_argument("--restore_concurrent_gb", type=int, default=16)
   parser.add_argument(

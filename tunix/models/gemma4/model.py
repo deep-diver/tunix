@@ -668,10 +668,12 @@ class Attention(nnx.Module):
         rope_proportion=self.rope_proportion,
     )
 
+    cache_positions = None
     if kv_shared_cache is not None:
       assert cache is None
       key_proj = kv_shared_cache['k']
       value_proj = kv_shared_cache['v']
+      cache_positions = kv_shared_cache.get('positions')
     else:
       if hasattr(self, 'k_einsum'):  # case where k_eq_v is True
         key_proj = self.k_einsum(x)
@@ -693,6 +695,7 @@ class Attention(nnx.Module):
           scale_factor=self.rope_scale_factor,
           rope_proportion=self.rope_proportion,
       )
+      cache_positions = segment_pos
 
     if cache is not None:
       assert kv_shared_cache is None
@@ -714,34 +717,55 @@ class Attention(nnx.Module):
               .at[:, latest_indices, ...]
               .set(key_proj[:, -valid_len:, ...])
           )
+          if 'positions' in cache:
+            cache_positions = (
+                cache['positions']
+                .at[:, latest_indices]
+                .set(segment_pos[:, -valid_len:])
+            )
         else:
-          cache_v = cache['v'].at[:, :seq_len, ...].set(value_proj)
-          cache_k = cache['k'].at[:, :seq_len, ...].set(key_proj)
+          indices = (
+              cache['end_index'][:, None] + jnp.arange(seq_len)[None, :]
+          ) % cache_len
+          batch_indices = jnp.arange(x.shape[0])[:, None]
+          cache_v = cache['v'].at[batch_indices, indices].set(value_proj)
+          cache_k = cache['k'].at[batch_indices, indices].set(key_proj)
+          value_proj = cache_v
+          key_proj = cache_k
+          if 'positions' in cache:
+            cache_positions = (
+                cache['positions'].at[batch_indices, indices].set(segment_pos)
+            )
 
         new_cache = {
             'v': cache_v,
             'k': cache_k,
             'end_index': cache['end_index'] + seq_len,
         }
+        if cache_positions is not None:
+          new_cache['positions'] = cache_positions
       else:  # decode
-        end_index = cache['end_index'][0]
-        slice_indices = (0, end_index % cache_len, 0, 0)
-        value_proj = jax.lax.dynamic_update_slice(
-            cache['v'], value_proj, slice_indices
-        )
-        key_proj = jax.lax.dynamic_update_slice(
-            cache['k'], key_proj, slice_indices
-        )
+        indices = cache['end_index'][:, None] % cache_len
+        batch_indices = jnp.arange(x.shape[0])[:, None]
+        value_proj = cache['v'].at[batch_indices, indices].set(value_proj)
+        key_proj = cache['k'].at[batch_indices, indices].set(key_proj)
         new_cache = {
             'v': value_proj,
             'k': key_proj,
             'end_index': cache['end_index'] + seq_len,
         }
+        if 'positions' in cache:
+          cache_positions = (
+              cache['positions'].at[batch_indices, indices].set(segment_pos)
+          )
+          new_cache['positions'] = cache_positions
     else:
       new_cache = {
           'v': value_proj,
           'k': key_proj,
       }
+      if cache_positions is not None:
+        new_cache['positions'] = cache_positions
 
     _, _, qh, _ = query_proj.shape
 
@@ -820,12 +844,24 @@ class Attention(nnx.Module):
       else:
         logits = jnp.einsum('BTNH,BSNH->BTNS', query_proj, key_proj)
 
-      if seq_len > 1:
+      if seq_len > 1 and key_proj.shape[1] == seq_len:
         # Only compute attention scores for the actual sequence length.
         attn_mask = attn_mask[..., :seq_len]
 
       if self.attn_type == AttentionType.LOCAL_SLIDING:
         if (
+            cache_positions is not None
+            and cache_positions.shape[-1] == key_proj.shape[1]
+        ):
+          sliding_mask = (
+              cache_positions[:, None, :]
+              > segment_pos[:, :, None] - self.config.sliding_window_size
+          ) & (
+              cache_positions[:, None, :]
+              < segment_pos[:, :, None] + self.config.sliding_window_size
+          )
+          attn_mask = sliding_mask * attn_mask
+        elif (
             segment_pos.shape[1] == 1
             and self.config.use_sliding_window_kv_cache
         ):
@@ -886,7 +922,13 @@ class Attention(nnx.Module):
 
     attn_output = self.attn_vec_einsum(encoded)
     attn_output = shard(attn_output, self.config.shd_config.act_btd)
-    return new_cache, attn_output, (key_proj, value_proj)
+    layer_kv = {
+        'k': key_proj,
+        'v': value_proj,
+    }
+    if cache_positions is not None:
+      layer_kv['positions'] = cache_positions
+    return new_cache, attn_output, layer_kv
 
   @property
   def use_gqa(self):
@@ -922,7 +964,7 @@ class Attention(nnx.Module):
     k = shard(
         np.zeros(cache_shape, dtype),
         self.config.shd_config.act_btnh,
-        eager=True
+        eager=True,
     )
     v = shard(
         np.zeros(cache_shape, dtype),
@@ -934,7 +976,12 @@ class Attention(nnx.Module):
         self.config.shd_config.act_btnh[:1],
         eager=True,
     )
-    return {'k': k, 'v': v, 'end_index': end_index}
+    positions = shard(
+        np.zeros((batch_size, cache_len), np.int32),
+        self.config.shd_config.act_btd[:2],
+        eager=True,
+    )
+    return {'k': k, 'v': v, 'end_index': end_index, 'positions': positions}
 
 
 class FeedForward(nnx.Module):
@@ -1268,8 +1315,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         shared_layer_name = f'layer_{shared_idx}'
         if is_prefill:
           # During prefill, use full KV projections from the shared layer.
-          shared_k, shared_v = transient_kvs[shared_layer_name]
-          kv_shared_cache = {'k': shared_k, 'v': shared_v}
+          kv_shared_cache = transient_kvs[shared_layer_name]
         else:
           # During decoding, use the shared layer's cache (which may be
           # an optimized sliding window ring cache).
@@ -1324,9 +1370,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     dummy_batch_size = 2
     dummy_seq_len = 2
     return {
-        'tokens': jnp.ones(
-            (dummy_batch_size, dummy_seq_len), dtype=jnp.int32
-        ),
+        'tokens': jnp.ones((dummy_batch_size, dummy_seq_len), dtype=jnp.int32),
         'positions': jnp.ones(
             (dummy_batch_size, dummy_seq_len), dtype=jnp.int32
         ),

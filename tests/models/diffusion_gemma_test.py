@@ -14,6 +14,8 @@
 
 """Tests for the DiffusionGemma Tunix integration."""
 
+import dataclasses
+
 from absl.testing import absltest
 from flax import nnx
 import jax
@@ -24,6 +26,7 @@ from tunix.models import automodel
 from tunix.models import naming
 from tunix.models.diffusion_gemma import model as diffusion_model
 from tunix.models.diffusion_gemma import sft as diffusion_sft
+from tunix.models.gemma4 import model as gemma4_model
 from tunix.sft import peft_trainer
 
 
@@ -124,6 +127,28 @@ class DiffusionGemmaTest(absltest.TestCase):
     self.assertEqual(info.model_config_category, "diffusion_gemma")
     cfg = automodel.call_model_config("diffusion-gemma-a26b-a4b-it")
     self.assertEqual(cfg.num_embed, 262144)
+    self.assertIsNone(cfg.remat_config)
+
+  def test_decoder_remat_reduces_qwix_lora_coverage(self):
+    vocab_size = 32
+    no_remat = diffusion_model.DiffusionGemma_A26B_A4B(
+        diffusion_model.ModelConfig.tiny(vocab_size=vocab_size),
+        rngs=nnx.Rngs(0),
+    )
+    no_remat = diffusion_sft.apply_lora(no_remat, rank=4, alpha=8.0)
+    remat_cfg = dataclasses.replace(
+        diffusion_model.ModelConfig.tiny(vocab_size=vocab_size),
+        remat_config=gemma4_model.RematConfig.DECODER,
+    )
+    remat = diffusion_model.DiffusionGemma_A26B_A4B(
+        remat_cfg,
+        rngs=nnx.Rngs(0),
+    )
+    remat = diffusion_sft.apply_lora(remat, rank=4, alpha=8.0)
+
+    no_remat_leaves = jax.tree.leaves(nnx.state(no_remat, nnx.LoRAParam))
+    remat_leaves = jax.tree.leaves(nnx.state(remat, nnx.LoRAParam))
+    self.assertGreater(len(no_remat_leaves), len(remat_leaves))
 
   def test_sft_loss_is_finite(self):
     vocab_size = 32
@@ -145,6 +170,181 @@ class DiffusionGemmaTest(absltest.TestCase):
     self.assertTrue(bool(jnp.isfinite(loss)))
     self.assertIn("decoder_loss", aux)
     self.assertIn("encoder_loss", aux)
+
+  def test_masked_ce_matches_optax_reference(self):
+    logits = jnp.array(
+        [
+            [[1.0, -1.0, 0.5], [0.25, 0.5, -0.75]],
+            [[-0.5, 1.5, 0.0], [0.75, -0.25, 0.125]],
+        ],
+        dtype=jnp.float32,
+    )
+    targets = jnp.array([[0, 2], [1, 0]], dtype=jnp.int32)
+    mask = jnp.array([[True, False], [True, True]], dtype=jnp.bool_)
+
+    actual = diffusion_sft._masked_ce_loss(  # pylint: disable=protected-access
+        logits, targets, mask
+    )
+    expected = _official_reference_masked_ce(logits, targets, mask)
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+  def test_cached_decoder_updates_cache_at_per_example_end_index(self):
+    vocab_size = 32
+    config = diffusion_model.ModelConfig.tiny(vocab_size=vocab_size)
+    config = dataclasses.replace(
+        config,
+        attention_pattern=(gemma4_model.AttentionType.GLOBAL,),
+        use_sliding_window_kv_cache=False,
+    )
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        config,
+        rngs=nnx.Rngs(0),
+    )
+    cache = model.init_cache(batch_size=2, max_seq_len=6, dtype=jnp.float32)
+    cache = diffusion_sft.set_cache_end_index(
+        cache, jnp.array([1, 3], dtype=jnp.int32)
+    )
+    _, new_cache = model(
+        jnp.array([[5, 6], [7, 8]], dtype=jnp.int32),
+        positions=jnp.array([[10, 11], [20, 21]], dtype=jnp.int32),
+        cache=cache,
+        attention_mask=jnp.ones((2, 2, 6), dtype=jnp.bool_),
+    )
+    self.assertIsNotNone(new_cache)
+    for layer_cache in new_cache.values():
+      np.testing.assert_array_equal(layer_cache["end_index"], [3, 5])
+      np.testing.assert_array_equal(layer_cache["positions"][0, 1:3], [10, 11])
+      np.testing.assert_array_equal(layer_cache["positions"][1, 3:5], [20, 21])
+
+  def test_cached_decoder_returns_canvas_only_logits(self):
+    vocab_size = 32
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        diffusion_model.ModelConfig.tiny(vocab_size=vocab_size),
+        rngs=nnx.Rngs(0),
+    )
+    cfg = diffusion_sft.DiffusionGemmaSFTConfig(
+        prompt_len=4,
+        canvas_size=4,
+        num_canvases=2,
+        vocab_size=vocab_size,
+        self_cond_prob=1.0,
+    )
+    batch = _make_batch(vocab_size=vocab_size)
+    x0_tokens = batch.canvas
+    selected_canvas_idx = jnp.array([0, 1], dtype=jnp.int32)
+    encoder_logits, kv_cache, positions, prompt_mask = diffusion_sft.sft_encode(
+        model,
+        prompt=batch.prompt,
+        x0_tokens=x0_tokens,
+        canvas_mask=batch.canvas_mask,
+        selected_canvas_idx=selected_canvas_idx,
+        config=cfg,
+    )
+    del encoder_logits
+    kv_cache = diffusion_sft.set_cache_end_index(
+        kv_cache, cfg.prompt_len + selected_canvas_idx * cfg.canvas_size
+    )
+    logits = diffusion_sft.sft_decode_cached_selected_canvas(
+        model,
+        xt=x0_tokens,
+        kv_cache=kv_cache,
+        positions=positions,
+        prompt_mask=prompt_mask,
+        canvas_mask=batch.canvas_mask,
+        selected_canvas_idx=selected_canvas_idx,
+        config=cfg,
+    )
+    self.assertEqual(logits.shape, (2, cfg.total_canvas_len, vocab_size))
+
+  def test_cached_slice_decoder_matches_full_for_first_canvas(self):
+    vocab_size = 32
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        diffusion_model.ModelConfig.tiny(vocab_size=vocab_size),
+        rngs=nnx.Rngs(0),
+    )
+    cfg = diffusion_sft.DiffusionGemmaSFTConfig(
+        prompt_len=4,
+        canvas_size=4,
+        num_canvases=2,
+        vocab_size=vocab_size,
+        self_cond_prob=1.0,
+    )
+    batch = _make_batch(vocab_size=vocab_size)
+    selected_canvas_idx = jnp.array([0, 0], dtype=jnp.int32)
+    encoder_logits, kv_cache, positions, prompt_mask = diffusion_sft.sft_encode(
+        model,
+        prompt=batch.prompt,
+        x0_tokens=batch.canvas,
+        canvas_mask=batch.canvas_mask,
+        selected_canvas_idx=selected_canvas_idx,
+        config=cfg,
+    )
+    del encoder_logits
+    kv_cache = diffusion_sft.set_cache_end_index(
+        kv_cache, cfg.prompt_len + selected_canvas_idx * cfg.canvas_size
+    )
+    full_logits = diffusion_sft.sft_decode_cached_selected_canvas(
+        model,
+        xt=batch.canvas,
+        kv_cache=kv_cache,
+        positions=positions,
+        prompt_mask=prompt_mask,
+        canvas_mask=batch.canvas_mask,
+        selected_canvas_idx=selected_canvas_idx,
+        config=cfg,
+    )
+
+    _, kv_cache, positions, prompt_mask = diffusion_sft.sft_encode(
+        model,
+        prompt=batch.prompt,
+        x0_tokens=batch.canvas,
+        canvas_mask=batch.canvas_mask,
+        selected_canvas_idx=selected_canvas_idx,
+        config=cfg,
+    )
+    kv_cache = diffusion_sft.set_cache_end_index(
+        kv_cache, cfg.prompt_len + selected_canvas_idx * cfg.canvas_size
+    )
+    slice_logits = diffusion_sft.sft_decode_cached_selected_canvas_slice(
+        model,
+        xt=batch.canvas,
+        kv_cache=kv_cache,
+        positions=positions,
+        prompt_mask=prompt_mask,
+        canvas_mask=batch.canvas_mask,
+        selected_canvas_idx=selected_canvas_idx,
+        config=cfg,
+    )
+    np.testing.assert_allclose(
+        full_logits[:, : cfg.canvas_size],
+        slice_logits,
+        rtol=0,
+        atol=0,
+    )
+
+  def test_slice_decoder_sft_loss_is_finite(self):
+    vocab_size = 32
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        diffusion_model.ModelConfig.tiny(vocab_size=vocab_size),
+        rngs=nnx.Rngs(0),
+    )
+    cfg = diffusion_sft.DiffusionGemmaSFTConfig(
+        prompt_len=4,
+        canvas_size=4,
+        num_canvases=2,
+        vocab_size=vocab_size,
+        self_cond_prob=1.0,
+        decoder_implementation="cached_selected_canvas_slice",
+    )
+    batch = _make_batch(vocab_size=vocab_size)
+    loss, aux = diffusion_sft.make_loss_fn(cfg)(
+        model, **diffusion_sft.gen_model_input_fn(batch)
+    )
+    self.assertTrue(bool(jnp.isfinite(loss)))
+    self.assertEqual(
+        int(jax.device_get(aux["decoder_implementation"])),
+        1,
+    )
 
   def test_official_helper_parity(self):
     prompt_mask = jnp.array(

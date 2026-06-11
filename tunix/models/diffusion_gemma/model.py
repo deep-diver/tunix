@@ -44,9 +44,14 @@ class ModelConfig:
       sharding_config: gemma4_model.ShardingConfig = (
           gemma4_model.ShardingConfig.get_default_sharding()
       ),
+      remat_config: gemma4_model.RematConfig | None = None,
   ) -> gemma4_model.ModelConfig:
     """Returns the official DiffusionGemma A26B/A4B base config."""
-    return gemma4_model.ModelConfig.gemma4_26b_a4b(sharding_config)
+    return dataclasses.replace(
+        gemma4_model.ModelConfig.gemma4_26b_a4b(sharding_config),
+        remat_config=remat_config,
+        use_sliding_window_kv_cache=False,
+    )
 
   @classmethod
   def diffusion_gemma_a26b_a4b_it(
@@ -54,9 +59,10 @@ class ModelConfig:
       sharding_config: gemma4_model.ShardingConfig = (
           gemma4_model.ShardingConfig.get_default_sharding()
       ),
+      remat_config: gemma4_model.RematConfig | None = None,
   ) -> gemma4_model.ModelConfig:
     """Instruction-tuned DiffusionGemma uses the same architecture config."""
-    return cls.diffusion_gemma_a26b_a4b(sharding_config)
+    return cls.diffusion_gemma_a26b_a4b(sharding_config, remat_config)
 
   @classmethod
   def tiny(
@@ -240,7 +246,7 @@ class DiffusionGemma_A26B_A4B(gemma4_model.Gemma4):  # pylint: disable=invalid-n
     if self.config.per_layer_input_dim > 0:
       per_layer_inputs = self.embedder.encode_per_layer_input(x, tokens)
 
-    transient_kvs: dict[str, tuple[Any, Any]] = {}
+    transient_kvs: dict[str, dict[str, Any]] = {}
     is_prefill = tokens.shape[1] > 1
     for i, layer in enumerate(self.layers):
       layer_name = f"layer_{i}"
@@ -250,8 +256,7 @@ class DiffusionGemma_A26B_A4B(gemma4_model.Gemma4):  # pylint: disable=invalid-n
         layer_cache = None
         shared_layer_name = f"layer_{shared_idx}"
         if is_prefill:
-          shared_k, shared_v = transient_kvs[shared_layer_name]
-          kv_shared_cache = {"k": shared_k, "v": shared_v}
+          kv_shared_cache = transient_kvs[shared_layer_name]
         else:
           kv_shared_cache = new_cache.get(shared_layer_name)
       else:
