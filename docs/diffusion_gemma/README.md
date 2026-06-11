@@ -28,6 +28,7 @@ python -m pytest tests/models/diffusion_gemma_test.py -q --import-mode=importlib
 python scripts/verify_diffusion_gemma_official_parity.py
 python scripts/verify_diffusion_gemma_official_logits.py
 python scripts/generate_diffusion_gemma_tunix.py --tiny --max_new_tokens 4 --canvas_length 4 --denoising_steps 3 --prompt "Hi" --animation_output /tmp/diffusion_gemma_tiny_trace.html --trace_json /tmp/diffusion_gemma_tiny_trace.json
+python scripts/render_diffusion_gemma_trace_gif.py /tmp/diffusion_gemma_tiny_trace.json --output /tmp/diffusion_gemma_tiny_trace.gif --width 900 --height 520
 python -m pytest tests/models/registry_test.py -q --import-mode=importlib
 python -m pytest tests/models/naming_test.py -q --import-mode=importlib -k 'not model_id_exists_on_huggingface'
 python scripts/smoke_diffusion_gemma_tunix.py --steps 3 --use_lora
@@ -113,6 +114,7 @@ jl run /tmp/tunix-dg-generate --script scripts/generate_diffusion_gemma_tunix.py
 jl run logs <run_id> --tail 120
 jl download <machine_id> /home/ubuntu/diffusion_gemma_trace.html /tmp/diffusion_gemma_trace.html
 jl download <machine_id> /home/ubuntu/diffusion_gemma_trace.json /tmp/diffusion_gemma_trace.json
+python scripts/render_diffusion_gemma_trace_gif.py /tmp/diffusion_gemma_trace.json --output /tmp/diffusion_gemma_trace.gif
 jl destroy <machine_id> --yes --json
 ```
 
@@ -124,6 +126,7 @@ Latest verified 4xH100 generation run:
 - Checkpoint download run: `r_8683c723`, completed in 351.254 seconds.
 - Step-visible generation run: `r_3c3c26ee`, 32-token canvas, 8 denoising steps, completed in 79.06 seconds.
 - Animation artifact: `/tmp/diffusion_gemma_trace.html`, with 9 frames (initial canvas plus 8 denoising steps).
+- GIF artifact: `/tmp/diffusion_gemma_trace.gif`, 1280x720, 27 frames.
 - Final visible output: `<|channel>thought\n<channel|>Diffusion language models are tapered that generate text by iteratively refining noisy data into ... sequences through a reverse diffusion process.<eos>`.
 
 ## References
