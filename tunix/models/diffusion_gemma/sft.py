@@ -153,6 +153,7 @@ def sft_encode(
     canvas_mask: jax.Array,
     selected_canvas_idx: jax.Array,
     config: DiffusionGemmaSFTConfig,
+    return_encoder_logits: bool = True,
 ) -> tuple[jax.Array, Any, jax.Array, jax.Array]:
   del selected_canvas_idx
   full_seq = jnp.concatenate([prompt, x0_tokens], axis=1)
@@ -166,6 +167,7 @@ def sft_encode(
       positions=positions,
       cache=kv_cache,
       attention_mask=attention_mask,
+      decode_only_last_token=not return_encoder_logits,
   )
   if kv_cache is None:
     raise ValueError("KV cache should not be None after SFT prefill.")
@@ -520,6 +522,7 @@ def diffusion_gemma_sft_loss(
       canvas_mask=canvas_mask,
       selected_canvas_idx=selected_canvas_idx,
       config=config,
+      return_encoder_logits=config.encoder_loss_weight != 0.0,
   )
   end_index = config.prompt_len + selected_canvas_idx * config.canvas_size
   kv_cache = set_cache_end_index(kv_cache, end_index)
@@ -649,19 +652,35 @@ def apply_lora(
     alpha: float = 8.0,
     module_path: str = DEFAULT_LORA_MODULE_PATH,
     rng_seed: int = 10003,
+    materialize_without_remat: bool = True,
 ) -> nnx.Module:
   provider = qwix.LoraProvider(
       module_path=module_path,
       rank=rank,
       alpha=alpha,
   )
-  model = qwix.apply_lora_to_model(
-      model,
-      provider,
-      **model.get_model_input(),
-      rngs=nnx.Rngs(rng_seed),
+  original_config = getattr(model, "config", None)
+  remat_config = getattr(original_config, "remat_config", None)
+  temporarily_disable_remat = (
+      materialize_without_remat
+      and remat_config is not None
+      and dataclasses.is_dataclass(original_config)
   )
-  model.set_attributes(qwix_rngs=nnx.Rngs(rng_seed))
+  if temporarily_disable_remat:
+    model.set_attributes(
+        config=dataclasses.replace(original_config, remat_config=None)
+    )
+  try:
+    model = qwix.apply_lora_to_model(
+        model,
+        provider,
+        **model.get_model_input(),
+        rngs=nnx.Rngs(rng_seed),
+    )
+    model.set_attributes(qwix_rngs=nnx.Rngs(rng_seed))
+  finally:
+    if temporarily_disable_remat:
+      model.set_attributes(config=original_config)
   return model
 
 

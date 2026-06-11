@@ -129,7 +129,7 @@ class DiffusionGemmaTest(absltest.TestCase):
     self.assertEqual(cfg.num_embed, 262144)
     self.assertIsNone(cfg.remat_config)
 
-  def test_decoder_remat_reduces_qwix_lora_coverage(self):
+  def test_decoder_remat_preserves_qwix_lora_coverage(self):
     vocab_size = 32
     no_remat = diffusion_model.DiffusionGemma_A26B_A4B(
         diffusion_model.ModelConfig.tiny(vocab_size=vocab_size),
@@ -148,7 +148,7 @@ class DiffusionGemmaTest(absltest.TestCase):
 
     no_remat_leaves = jax.tree.leaves(nnx.state(no_remat, nnx.LoRAParam))
     remat_leaves = jax.tree.leaves(nnx.state(remat, nnx.LoRAParam))
-    self.assertGreater(len(no_remat_leaves), len(remat_leaves))
+    self.assertEqual(len(no_remat_leaves), len(remat_leaves))
 
   def test_sft_loss_is_finite(self):
     vocab_size = 32
@@ -255,6 +255,51 @@ class DiffusionGemmaTest(absltest.TestCase):
         config=cfg,
     )
     self.assertEqual(logits.shape, (2, cfg.total_canvas_len, vocab_size))
+
+  def test_sft_encode_can_skip_full_encoder_logits(self):
+    vocab_size = 32
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        diffusion_model.ModelConfig.tiny(vocab_size=vocab_size),
+        rngs=nnx.Rngs(0),
+    )
+    cfg = diffusion_sft.DiffusionGemmaSFTConfig(
+        prompt_len=4,
+        canvas_size=4,
+        num_canvases=2,
+        vocab_size=vocab_size,
+    )
+    batch = _make_batch(vocab_size=vocab_size)
+    selected_canvas_idx = jnp.array([0, 1], dtype=jnp.int32)
+    full_logits, full_cache, full_positions, full_prompt_mask = (
+        diffusion_sft.sft_encode(
+            model,
+            prompt=batch.prompt,
+            x0_tokens=batch.canvas,
+            canvas_mask=batch.canvas_mask,
+            selected_canvas_idx=selected_canvas_idx,
+            config=cfg,
+        )
+    )
+    last_logits, last_cache, last_positions, last_prompt_mask = (
+        diffusion_sft.sft_encode(
+            model,
+            prompt=batch.prompt,
+            x0_tokens=batch.canvas,
+            canvas_mask=batch.canvas_mask,
+            selected_canvas_idx=selected_canvas_idx,
+            config=cfg,
+            return_encoder_logits=False,
+        )
+    )
+
+    self.assertEqual(
+        full_logits.shape,
+        (2, cfg.prompt_len + cfg.total_canvas_len, vocab_size),
+    )
+    self.assertEqual(last_logits.shape, (2, 1, vocab_size))
+    self.assertEqual(full_cache.keys(), last_cache.keys())
+    np.testing.assert_array_equal(full_positions, last_positions)
+    np.testing.assert_array_equal(full_prompt_mask, last_prompt_mask)
 
   def test_cached_slice_decoder_matches_full_for_first_canvas(self):
     vocab_size = 32

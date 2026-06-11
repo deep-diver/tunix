@@ -21,9 +21,9 @@ This directory is the runbook for the Tunix DiffusionGemma MVP integration.
 - The full-model logits parity script covers the direct transformer forward path without cache. Cached SFT logits parity against the full official Flax/Linen stack is still a next gate.
 - Upstream Orbax checkpoint loading maps the Gemma4-compatible backbone and known `self_conditioner` leaves. The public `diffusiongemma-26B-A4B-it` checkpoint has been loaded successfully on 4xH100 and 8x96GB JAX meshes.
 - The no-tuning generation demo uses the full-sequence no-cache path covered by logits parity, not the official cached production sampler. Treat it as a load/denoise visibility smoke test, not a quality benchmark.
-- Public 26B PubMedQA LoRA tuning passes a reduced 1-step smoke on an 8x RTX PRO 6000 96GB container with `mesh_fsdp=4, mesh_tp=2`, `prompt_len=128`, `canvas_size=32`, one canvas, batch size 1, long answers, and `cached_selected_canvas_slice` denoiser-only loss. This proves public-checkpoint load, real PubMedQA preprocessing, backbone LoRA coverage, LoRA-only update, base-parameter non-update, VRAM telemetry, and minimal state save.
-- The official PubMedQA SFT recipe uses `prompt_len=1024`, `num_canvases=2`, `canvas_size=128`, batch size 2, long answers, encoder AR loss, and 2000 train steps. At that shape, forward/loss is finite on 8x96GB, but training with encoder AR loss still OOMs; denoiser-only official-shape train-step compilation was too slow for a smoke run and was stopped to control cost.
-- Decoder rematerialization reduces memory but currently prevents Qwix from materializing backbone LoRA leaves behind rematted decoder blocks. The default DiffusionGemma config keeps `remat_config=None` for LoRA coverage; the PubMedQA smoke exposes `--remat_decoder` only as an explicit memory experiment.
+- Public 26B PubMedQA LoRA tuning now passes 1-step official-length smokes on an 8x RTX PRO 6000 96GB container with `mesh_fsdp=4, mesh_tp=2`, `prompt_len=1024`, `num_canvases=2`, `canvas_size=128`, batch size 1, long answers, `cached_selected_canvas_slice`, decoder remat, self-conditioning, encoder AR loss, full backbone LoRA coverage, LoRA-only update, base-parameter non-update, VRAM telemetry, and minimal state save.
+- The official PubMedQA SFT recipe uses the same prompt/canvas geometry, batch size 2, long answers, encoder AR loss, and 2000 train steps. The latest GPU smoke proves the official geometry and full loss at batch size 1; batch size 2/effective batch 2 and long multi-step throughput still need a dedicated run before a full training-time estimate is meaningful.
+- Decoder rematerialization is compatible with Qwix LoRA materialization in this MVP. The SFT adapter temporarily disables decoder remat while Qwix discovers LoRA targets, then restores remat for the actual forward/train path; GPU logs verify the same 366 LoRA leaves with `--remat_decoder`.
 - For public 26B smoke runs, `scripts/smoke_diffusion_gemma_pubmedqa_tunix.py` defaults to a minimal `minimal_state.json` proof artifact instead of Tunix/Orbax optimizer checkpointing. Use `--orbax_checkpoint` only when the shape is known to fit; the public 26B optimizer checkpoint path can exceed memory.
 
 ## Local Commands
@@ -111,7 +111,10 @@ Repeatable 8-GPU public-checkpoint command with VRAM telemetry:
 
 ```bash
 jl create --gpu RTX-PRO6000 --region IN1 --num-gpus 8 --storage 300 --template pytorch --yes --json
-jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/tunix-dg-efficient && . .venv/bin/activate && python scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --steps 1 --batch_size 1 --prompt_len 128 --canvas_size 32 --num_canvases 1 --max_examples 4 --max_context_chars 600 --checkpoint /root/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /root/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 4 --mesh_tp 2 --restore_concurrent_gb 16 --checkpoint_dir /root/diffusion_gemma_pubmedqa_state_8gpu_slice_reduced_b1 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption --decoder_implementation cached_selected_canvas_slice --encoder_loss_weight 0.0 --stop_gradient_from_denoiser_to_encoder --gpu_memory_poll_seconds 2'
+jl run /tmp/tunix-dg-efficient --script scripts/download_public_gcs_prefix.py --on <machine_id> --requirements /tmp/tunix-dg-efficient/requirements-gpu.txt --json --yes -- --bucket gemma-data --prefix checkpoints/diffusiongemma-26B-A4B-it/ --dest /root/checkpoints/diffusiongemma-26B-A4B-it --workers 16
+jl exec <machine_id> --json -- sh -lc 'mkdir -p /root/checkpoints/tokenizers && curl -L https://storage.googleapis.com/gemma-data/tokenizers/tokenizer_gemma4.model -o /root/checkpoints/tokenizers/tokenizer_gemma4.model'
+jl run /tmp/tunix-dg-efficient --script scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --on <machine_id> --requirements /tmp/tunix-dg-efficient/requirements-gpu.txt --json --yes -- --steps 1 --batch_size 1 --prompt_len 1024 --canvas_size 128 --num_canvases 2 --max_examples 4 --max_context_chars 4000 --checkpoint /root/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /root/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 4 --mesh_tp 2 --restore_concurrent_gb 16 --checkpoint_dir /root/diffusion_gemma_pubmedqa_state_8gpu_remat_official_denoiser_b1_prefillskip --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption --decoder_implementation cached_selected_canvas_slice --encoder_loss_weight 0.0 --stop_gradient_from_denoiser_to_encoder --remat_decoder --gpu_memory_poll_seconds 2
+jl run /tmp/tunix-dg-efficient --script scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --on <machine_id> --requirements /tmp/tunix-dg-efficient/requirements-gpu.txt --json --yes -- --steps 1 --batch_size 1 --prompt_len 1024 --canvas_size 128 --num_canvases 2 --max_examples 4 --max_context_chars 4000 --checkpoint /root/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /root/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 4 --mesh_tp 2 --restore_concurrent_gb 16 --checkpoint_dir /root/diffusion_gemma_pubmedqa_state_8gpu_remat_official_encoder_b1 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption --decoder_implementation cached_selected_canvas_slice --remat_decoder --gpu_memory_poll_seconds 2
 jl destroy <machine_id> --yes --json
 ```
 
@@ -131,23 +134,18 @@ Latest verified 4xH100 PubMedQA public-checkpoint result:
 
 Latest verified 8x RTX PRO 6000 PubMedQA public-checkpoint result:
 
-- Machine: `425063` (`RTX-PRO6000`, `IN1`, 8 GPUs, 96GB each, pytorch container), destroyed after the run. `jl status --json` reported `running_instances: 0` after destroy.
+- Machine: `425165` (`RTX-PRO6000`, `IN1`, 8 GPUs, 96GB each, pytorch container), destroyed after the run. `jl status --json` reported `running_instances: 0` after destroy.
 - H200 8-GPU creation was attempted first and failed with `H200 not available at this moment`; RTX PRO 6000 was the best available 8-GPU high-memory option returned by JarvisLabs.
-- Checkpoint mirror: `r_1955fd21`, 31 objects, 37.633 GiB, 352.3 seconds.
-- Successful run: `r_8f0ba4a1`, `mesh_fsdp=4`, `mesh_tp=2`, no decoder remat, `cached_selected_canvas_slice`, denoiser-only loss, prompt length 128, canvas size 32, one canvas, batch size 1.
-- Public checkpoint loaded, PubMedQA loss was finite, and one LoRA train step completed.
-- LoRA coverage: 366 LoRA leaves, 4,423,936 LoRA elements, 8,847,872 LoRA bytes.
-- Initial loss: total/decoder `7.667369842529297`, encoder `0.0` by configuration.
-- Final loss: total/decoder `6.19901180267334`, encoder `0.0`.
-- LoRA norm delta: `0.00029754638671875`; LoRA checksum delta: `0.032320499420166016`; sampled non-LoRA checksum delta: `0.0`.
-- Artifact: `/root/diffusion_gemma_pubmedqa_state_8gpu_slice_reduced_b1/minimal_state.json`.
-- VRAM telemetry: peak used MiB `57433` on GPU 0 and `57409-57411` on GPUs 1-7; minimum free MiB `40454`.
-- Official-shape forward/loss probes on the same machine:
-  - Full cached decoder, batch size 2, prompt 1024, 2x128 canvases: finite initial loss `13.455516815185547`, then train-step OOM at `108.19GiB`.
-  - Full cached decoder with decoder remat: finite initial loss `13.376977920532227`, then train-step OOM at `108.19GiB`.
-  - Cached selected-canvas slice, no remat, batch size 1, gradient accumulation 2, prompt 1024, 2x128 canvases, encoder AR loss enabled: finite initial loss `12.192352294921875`, LoRA coverage 366 leaves, then train-step OOM at `75.55GiB`.
-  - Cached selected-canvas slice, no remat, denoiser-only official shape: finite initial losses `5.125291347503662` and `4.881021022796631` in two attempts, LoRA coverage 366 leaves, but train-step compilation was stopped to control cost.
-- Runtime estimate: the successful reduced 1-step run includes checkpoint restore and first JIT compile, so it is not enough to extrapolate steady-state throughput. The full official PubMedQA shape still needs either encoder-loss memory reduction, finer model parallelism beyond TP2, or a dedicated fused/streamed loss path before a full 2000-step estimate is meaningful.
+- Checkpoint mirror: `r_f075dbb9`, 31 objects, 37.633 GiB, 208.567 seconds.
+- Denoiser-only official-length run: `r_4f323c33`, `mesh_fsdp=4`, `mesh_tp=2`, decoder remat, `cached_selected_canvas_slice`, prompt length 1024, canvas size 128, two canvases, batch size 1, `prefill_decode_only_last_token=true`.
+- Denoiser-only result: initial total/decoder loss `4.789341926574707`, final total/decoder loss `4.481716632843018`, LoRA norm delta `0.00029754638671875`, LoRA checksum delta `0.029350757598876953`, sampled non-LoRA checksum delta `0.0`.
+- Denoiser-only VRAM telemetry: peak used MiB `74627` on GPU 0 and `58219-58221` on GPUs 1-7; minimum free MiB `23260`.
+- Full-loss official-length run: `r_0f069fcd`, same mesh/shape/remat/slice path, encoder AR loss enabled, `prefill_decode_only_last_token=false`.
+- Full-loss result: initial total loss `12.994644165039062`, decoder `5.365616798400879`, encoder `7.629027843475342`; final total loss `11.146772384643555`, decoder `4.296473503112793`, encoder `6.850298881530762`.
+- Full-loss update proof: LoRA coverage 366 leaves / 4,423,936 elements / 8,847,872 bytes; LoRA norm delta `0.00029754638671875`; LoRA checksum delta `0.029854297637939453`; sampled non-LoRA checksum delta `0.0`.
+- Full-loss artifact: `/root/diffusion_gemma_pubmedqa_state_8gpu_remat_official_encoder_b1/minimal_state.json`.
+- Full-loss VRAM telemetry: peak used MiB `76963` on GPU 0 and `60553-60555` on GPUs 1-7; minimum free MiB `20924`.
+- First JIT compile remains expensive. The encoder-loss train step emitted XLA constant-folding warnings in `jit(_train_step)/jvp()/reduce_max` and took about 14-15 minutes wall time including restore/compile/run. Batch size 2/effective batch 2 and steady-state multi-step throughput are still separate scale-out checks.
 
 ## JarvisLabs Smoke
 

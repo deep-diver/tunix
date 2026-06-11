@@ -437,6 +437,9 @@ def _load_tiny_model(args: argparse.Namespace, vocab_size: int):
       global_key_size=max(4, args.tiny_embed_dim // 2),
       use_sliding_window_kv_cache=False,
       final_logit_softcap=None,
+      remat_config=(
+          gemma4_model.RematConfig.DECODER if args.remat_decoder else None
+      ),
       dtype=jnp.float32,
       param_dtype=jnp.float32,
   )
@@ -615,6 +618,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       tiny=args.tiny,
       lora_rank=args.lora_rank,
       lora_module_path=args.lora_module_path,
+      remat_decoder=args.remat_decoder,
   )
   trainable_summary = _state_summary(nnx.state(model, nnx.LoRAParam))
   frozen_summary = _state_summary(
@@ -754,6 +758,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
           args.batch_size * (args.gradient_accumulation_steps or 1)
       ),
       "decoder_implementation": args.decoder_implementation,
+      "remat_decoder": args.remat_decoder,
+      "prefill_decode_only_last_token": args.encoder_loss_weight == 0.0,
+      "mesh_fsdp": args.mesh_fsdp,
+      "mesh_tp": args.mesh_tp,
       "trainable_state": trainable_summary,
       "frozen_state": frozen_summary,
   }
@@ -848,10 +856,9 @@ def parse_args() -> argparse.Namespace:
       action=argparse.BooleanOptionalAction,
       default=False,
       help=(
-          "Enable decoder rematerialization. This can reduce activation memory,"
-          " but Qwix currently only materializes self-conditioner LoRA leaves"
-          " behind decoder remat, so it is disabled by default for LoRA"
-          " coverage."
+          "Enable decoder rematerialization. DiffusionGemma LoRA is"
+          " materialized with remat temporarily disabled and then restored, so"
+          " backbone LoRA coverage is preserved."
       ),
   )
   parser.add_argument("--restore_concurrent_gb", type=int, default=16)
