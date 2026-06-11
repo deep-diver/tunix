@@ -200,6 +200,14 @@ def create_tokenizer(
   return spm_processor
 
 
+def _normalise_path_for_mapping(key_path: tuple[Any, ...]) -> list[str]:
+  return list(
+      itertools.chain.from_iterable(
+          str(segment).split('/') for segment in key_path
+      )
+  )
+
+
 def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
   """Map from upstream Orbax NESTED checkpoint to Tunix NNX layout.
 
@@ -225,14 +233,16 @@ def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
     A nested dict with keys matching the Tunix NNX Gemma4 model tree.
   """
   new_params: dict[tuple[str | int, ...], Any] = {}
+  flattened_params = flax.traverse_util.flatten_dict(params)
+  is_moe_checkpoint = any(
+      'mlp2' in _normalise_path_for_mapping(key_path)
+      or 'router_logits' in _normalise_path_for_mapping(key_path)
+      for key_path in flattened_params
+  )
 
-  for key_path, value in flax.traverse_util.flatten_dict(params).items():
+  for key_path, value in flattened_params.items():
     # Normalize semi-flat or nested key_path to a flat list of components.
-    parts = list(
-        itertools.chain.from_iterable(
-            segment.split('/') for segment in key_path
-        )
-    )
+    parts = _normalise_path_for_mapping(key_path)
 
     if parts and parts[0] == 'transformer':
       parts = parts[1:]
@@ -278,6 +288,71 @@ def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
     # Bare leaf on the layer itself (e.g., skip_scale).
     if len(module_path) == 1:
       new_params[(*layer_idx, param_name)] = value
+      continue
+
+    if is_moe_checkpoint and module_path[-1] in (
+        'pre_ffw2_norm',
+        'post_ffw2_norm',
+        'post_ffw1_norm',
+    ):
+      moe_norm_map = {
+          'pre_ffw2_norm': 'pre_ffw_norm',
+          'post_ffw2_norm': 'dense_post_ffw_norm',
+          'post_ffw1_norm': 'moe_post_ffw_norm',
+      }
+      new_params[(*layer_idx, moe_norm_map[module_path[-1]], param_name)] = (
+          value
+      )
+      continue
+    if (
+        is_moe_checkpoint
+        and module_path[-1] == 'pre_ffw_norm'
+        and len(getattr(value, 'shape', ())) == 1
+    ):
+      new_params[(*layer_idx, 'moe_pre_ffw_norm', param_name)] = value
+      continue
+
+    # Gemma4 A26B/A4B checkpoints store the MoE branch under ``mlp`` and the
+    # dense shared branch under ``mlp2``. Tunix names those ``moe`` and ``mlp``.
+    if (
+        is_moe_checkpoint
+        and module_path[1:] == ['mlp', 'gating_einsum']
+        and value.ndim == 4
+    ):
+      new_params[(*layer_idx, 'moe', 'gating_einsum')] = value
+      continue
+    if (
+        is_moe_checkpoint
+        and module_path[1:] == ['mlp', 'linear']
+        and value.ndim == 3
+    ):
+      new_params[(*layer_idx, 'moe', 'linear')] = value
+      continue
+    if is_moe_checkpoint and module_path[1:] == ['mlp', 'router_logits']:
+      new_params[(*layer_idx, 'moe', 'router_logits')] = value
+      continue
+    if (
+        is_moe_checkpoint
+        and module_path[1:] == ['mlp']
+        and param_name
+        in (
+            'per_expert_scale',
+            'router_scale',
+        )
+    ):
+      new_params[(*layer_idx, 'moe', param_name)] = value
+      continue
+    if is_moe_checkpoint and module_path[1:] == ['mlp2', 'gating_einsum']:
+      if value.shape[0] != 2:
+        raise ValueError(
+            f'Expected mlp2 gating_einsum shape[0]=2, got {value.shape[0]} '
+            f'for {"/".join(parts)}'
+        )
+      new_params[(*layer_idx, 'mlp', 'gate_proj', 'kernel')] = value[0].T
+      new_params[(*layer_idx, 'mlp', 'up_proj', 'kernel')] = value[1].T
+      continue
+    if is_moe_checkpoint and module_path[1:] == ['mlp2', 'linear']:
+      new_params[(*layer_idx, 'mlp', 'down_proj', 'kernel')] = value
       continue
 
     # MLP gating_einsum -> split into gate_proj and up_proj.

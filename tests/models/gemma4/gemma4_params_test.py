@@ -111,6 +111,47 @@ def _make_upstream_nested() -> dict[str, Any]:
   return nested
 
 
+def _make_upstream_moe() -> dict[str, Any]:
+  return {
+      'transformer/layer_0/mlp/gating_einsum': {
+          'w': (
+              np.arange(128 * 2 * 4 * 3, dtype=np.float32).reshape(128, 2, 4, 3)
+          ),
+      },
+      'transformer/layer_0/mlp/linear': {
+          'w': np.arange(128 * 4 * 3, dtype=np.float32).reshape(128, 4, 3),
+      },
+      'transformer/layer_0/mlp/router_logits': {
+          'w': np.arange(3 * 128, dtype=np.float32).reshape(3, 128),
+      },
+      'transformer/layer_0/mlp': {
+          'per_expert_scale': np.arange(128, dtype=np.float32),
+          'router_scale': np.arange(3, dtype=np.float32),
+      },
+      'transformer/layer_0/mlp2/gating_einsum': {
+          'w': np.arange(2 * 5 * 3, dtype=np.float32).reshape(2, 5, 3),
+      },
+      'transformer/layer_0/mlp2/linear': {
+          'w': np.arange(5 * 3, dtype=np.float32).reshape(5, 3),
+      },
+      'transformer/layer_0/pre_ffw_norm': {
+          'scale': np.arange(3, dtype=np.float32),
+      },
+      'transformer/layer_0/pre_ffw2_norm': {
+          'scale': np.arange(3, dtype=np.float32) + 10,
+      },
+      'transformer/layer_0/post_ffw1_norm': {
+          'scale': np.arange(3, dtype=np.float32) + 20,
+      },
+      'transformer/layer_0/post_ffw2_norm': {
+          'scale': np.arange(3, dtype=np.float32) + 30,
+      },
+      'transformer/layer_0/post_ffw_norm': {
+          'scale': np.arange(3, dtype=np.float32) + 40,
+      },
+  }
+
+
 def _expected_keys_and_shapes() -> dict[tuple[str, ...], tuple[int, ...]]:
   """Returns expected output keys and shapes after mapping (both layers)."""
   result = {
@@ -219,6 +260,53 @@ class MapFromUpstreamCheckpointTest(parameterized.TestCase):
             nested_flat[key],
             err_msg=f'Value mismatch for {key} between formats',
         )
+
+  def test_moe_checkpoint_layout(self):
+    """A26B/A4B MoE checkpoints use mlp for MoE and mlp2 for dense MLP."""
+    upstream = _make_upstream_moe()
+    mapped = params.map_from_upstream_checkpoint(upstream)
+    flat = flatten_dict(mapped)
+    upstream_flat = flatten_dict(upstream)
+
+    self.assertEqual(
+        flat[('layers', 0, 'moe', 'gating_einsum')].shape, (128, 2, 4, 3)
+    )
+    self.assertEqual(flat[('layers', 0, 'moe', 'linear')].shape, (128, 4, 3))
+    self.assertEqual(
+        flat[('layers', 0, 'moe', 'router_logits')].shape, (3, 128)
+    )
+    np.testing.assert_array_equal(
+        flat[('layers', 0, 'moe', 'per_expert_scale')],
+        upstream_flat[('transformer/layer_0/mlp', 'per_expert_scale')],
+    )
+    np.testing.assert_array_equal(
+        flat[('layers', 0, 'moe', 'router_scale')],
+        upstream_flat[('transformer/layer_0/mlp', 'router_scale')],
+    )
+
+    dense_gate_up = upstream_flat[
+        ('transformer/layer_0/mlp2/gating_einsum', 'w')
+    ]
+    np.testing.assert_array_equal(
+        flat[('layers', 0, 'mlp', 'gate_proj', 'kernel')],
+        dense_gate_up[0].T,
+    )
+    np.testing.assert_array_equal(
+        flat[('layers', 0, 'mlp', 'up_proj', 'kernel')],
+        dense_gate_up[1].T,
+    )
+    np.testing.assert_array_equal(
+        flat[('layers', 0, 'mlp', 'down_proj', 'kernel')],
+        upstream_flat[('transformer/layer_0/mlp2/linear', 'w')],
+    )
+
+    self.assertIn(('layers', 0, 'moe_pre_ffw_norm', 'scale'), flat)
+    self.assertIn(('layers', 0, 'moe_post_ffw_norm', 'scale'), flat)
+    self.assertIn(('layers', 0, 'dense_post_ffw_norm', 'scale'), flat)
+    np.testing.assert_array_equal(
+        flat[('layers', 0, 'pre_ffw_norm', 'scale')],
+        upstream_flat[('transformer/layer_0/pre_ffw2_norm', 'scale')],
+    )
 
   def test_non_layer_modules_skipped(self):
 

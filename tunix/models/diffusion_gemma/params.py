@@ -21,6 +21,7 @@ import itertools
 from typing import Any
 
 from absl import logging
+from etils import epath
 import flax
 from flax import nnx
 import jax
@@ -119,11 +120,63 @@ def _merge_with_initialized_state(
   return flax.traverse_util.unflatten_dict(flat_state)
 
 
+def _load_raw_params(
+    checkpoint_path: str,
+    *,
+    restore_concurrent_gb: int | None,
+) -> Mapping[str, Any]:
+  """Restores upstream DiffusionGemma params using the public metadata tree."""
+  checkpointer_kwargs = {}
+  handler_kwargs = {}
+  if restore_concurrent_gb is not None:
+    checkpointer_kwargs["restore_concurrent_gb"] = restore_concurrent_gb
+    handler_kwargs["restore_concurrent_gb"] = restore_concurrent_gb
+  ckpt = ocp.StandardCheckpointer(**checkpointer_kwargs)
+  path = epath.Path(checkpoint_path)
+  metadata = ckpt.metadata(path)
+  if (
+      metadata.item_metadata is None
+      and path.joinpath("_CHECKPOINT_METADATA").exists()
+  ):
+    path = path / "default"
+    metadata = ckpt.metadata(path)
+  if metadata.item_metadata is None:
+    raise ValueError(f"No item metadata found in {path}")
+
+  target = jax.tree.map(
+      lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype),
+      metadata.item_metadata.tree,
+  )
+  handler = ocp.StandardCheckpointHandler(**handler_kwargs)
+  if str(path).startswith("gs://"):
+    logging.warning(
+        "Using Orbax handler-level restore for %s because this public GCS "
+        "checkpoint may not have the finalization marker required by the "
+        "Checkpointer wrapper.",
+        path,
+    )
+    return handler.restore(path, args=ocp.args.StandardRestore(target))
+
+  try:
+    return ckpt.restore(path, target)
+  except ValueError as err:
+    if "Found incomplete checkpoint" not in str(err):
+      raise
+    logging.warning(
+        "Falling back to Orbax handler-level restore for %s because the "
+        "checkpoint does not have the finalization marker required by the "
+        "Checkpointer wrapper.",
+        path,
+    )
+    return handler.restore(path, args=ocp.args.StandardRestore(target))
+
+
 def create_model_from_checkpoint(
     checkpoint_path: str,
     model_config,
     mesh: jax.sharding.Mesh | None = None,
     dtype: jnp.dtype = jnp.bfloat16,
+    restore_concurrent_gb: int | None = 16,
 ) -> model_lib.DiffusionGemma_A26B_A4B:
   """Loads a DiffusionGemma model from an upstream Orbax checkpoint.
 
@@ -135,7 +188,9 @@ def create_model_from_checkpoint(
   abs_model = nnx.eval_shape(
       lambda: model_lib.DiffusionGemma_A26B_A4B(model_config, rngs=nnx.Rngs(0))
   )
-  raw_params = ocp.StandardCheckpointer().restore(checkpoint_path)
+  raw_params = _load_raw_params(
+      checkpoint_path, restore_concurrent_gb=restore_concurrent_gb
+  )
   mapped_params = map_from_upstream_checkpoint(raw_params)
   model_state = nnx.state(abs_model)
   merged_params = _merge_with_initialized_state(model_state, mapped_params)
