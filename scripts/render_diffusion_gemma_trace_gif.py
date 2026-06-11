@@ -564,6 +564,7 @@ def render_gif(args: argparse.Namespace) -> None:
           "input_frames": len(frames),
           "gif_frames": len(images),
           "final_hold_frames": args.final_hold_frames,
+          "total_duration_ms": sum(durations),
           "bytes": output.stat().st_size,
       })
   )
@@ -576,9 +577,9 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--width", type=int, default=1280)
   parser.add_argument("--height", type=int, default=720)
   parser.add_argument("--seed", type=int, default=17)
-  parser.add_argument("--transition_frames", type=int, default=3)
-  parser.add_argument("--transition_duration_ms", type=int, default=100)
-  parser.add_argument("--hold_ms", type=int, default=580)
+  parser.add_argument("--transition_frames", type=int, default=5)
+  parser.add_argument("--transition_duration_ms", type=int, default=70)
+  parser.add_argument("--hold_ms", type=int, default=80)
   parser.add_argument("--final_hold_ms", type=int, default=850)
   parser.add_argument("--final_hold_frames", type=int, default=3)
   return parser.parse_args()
