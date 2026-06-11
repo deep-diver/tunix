@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import pathlib
 import random
 import re
@@ -40,18 +39,25 @@ AMBER = (255, 194, 84)
 RED = (255, 93, 93)
 CYAN = (88, 213, 255)
 PURPLE = (184, 125, 255)
+NOISE_LABELS = ("...", "???", "...", "???")
 
 
 def _load_font(size: int, *, mono: bool = False) -> ImageFont.FreeTypeFont:
-  candidates = [
-      "/System/Library/Fonts/Menlo.ttc" if mono else "",
-      "/System/Library/Fonts/SFNS.ttf",
-      "/System/Library/Fonts/Helvetica.ttc",
-      "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-      "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf" if mono else "",
-      "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-      "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-  ]
+  if mono:
+    candidates = [
+        "/System/Library/Fonts/Menlo.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ]
+  else:
+    candidates = [
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
   for candidate in candidates:
     if candidate and pathlib.Path(candidate).exists():
       return ImageFont.truetype(candidate, size=size)
@@ -87,6 +93,83 @@ def _draw_fit(
   while clipped and _text_size(draw, clipped + "~", font)[0] > max_width:
     clipped = clipped[:-1]
   draw.text(xy, clipped + "~", font=font, fill=fill)
+
+
+def _wrap_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    *,
+    font,
+    max_width: int,
+    max_lines: int,
+) -> list[str]:
+  """Wraps text for PIL drawing, splitting long spans when needed."""
+  words = text.split(" ")
+  lines: list[str] = []
+  current = ""
+
+  def flush_long_span(span: str) -> str:
+    nonlocal lines
+    remaining = span
+    while remaining and len(lines) < max_lines:
+      take = remaining
+      while take and _text_size(draw, take, font)[0] > max_width:
+        take = take[:-1]
+      if not take:
+        take = remaining[:1]
+      lines.append(take)
+      remaining = remaining[len(take) :]
+    return remaining
+
+  for word in words:
+    candidate = word if not current else f"{current} {word}"
+    if _text_size(draw, candidate, font)[0] <= max_width:
+      current = candidate
+      continue
+    if current:
+      lines.append(current)
+      current = ""
+      if len(lines) >= max_lines:
+        break
+    if _text_size(draw, word, font)[0] <= max_width:
+      current = word
+    else:
+      flush_long_span(word)
+      if len(lines) >= max_lines:
+        break
+
+  if current and len(lines) < max_lines:
+    lines.append(current)
+  if len(lines) == max_lines and words:
+    line = lines[-1]
+    while line and _text_size(draw, line + "~", font)[0] > max_width:
+      line = line[:-1]
+    lines[-1] = line + "~"
+  return lines
+
+
+def _draw_wrapped_text(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    *,
+    font,
+    fill: tuple[int, int, int],
+    max_width: int,
+    max_lines: int,
+    line_height: int,
+) -> None:
+  for line_index, line in enumerate(
+      _wrap_text(
+          draw, text, font=font, max_width=max_width, max_lines=max_lines
+      )
+  ):
+    draw.text(
+        (xy[0], xy[1] + line_index * line_height),
+        line,
+        font=font,
+        fill=fill,
+    )
 
 
 def _mix(
@@ -158,6 +241,151 @@ def _draw_noise_bar(
   draw.rounded_rectangle((x, y, x + fill_width, y + 12), radius=4, fill=GREEN)
 
 
+def _token_label(
+    piece: str, *, noise: float, selected: bool, rng: random.Random
+) -> str:
+  text = _clean_piece(piece, limit=28)
+  if not text:
+    text = "<empty>"
+  elif not text.strip():
+    text = "<space>"
+
+  if selected or noise < 0.24:
+    return text
+  if noise > 0.66:
+    return rng.choice(NOISE_LABELS)
+
+  keep = max(1, int(len(text) * (1.0 - noise * 0.75)))
+  return text[:keep] + rng.choice(("...", "??"))
+
+
+def _draw_token_canvas(
+    draw: ImageDraw.ImageDraw,
+    frame: dict[str, Any],
+    *,
+    rect: tuple[int, int, int, int],
+    rng: random.Random,
+    transition_phase: int,
+    transition_frames: int,
+    width: int,
+    height: int,
+) -> None:
+  x0, y0, x1, y1 = rect
+  panel_w = x1 - x0
+  header_font = _load_font(19)
+  token_size = 22
+  if len(frame["token_ids"]) > 28 or width < 1050:
+    token_size = 20
+  if height < 620:
+    token_size = 18
+  token_font = _load_font(token_size)
+  small_font = _load_font(13, mono=True)
+  chip_h = max(36, token_size + 22)
+  gap = 9
+
+  draw.rounded_rectangle(rect, radius=8, fill=PANEL, outline=GRID, width=1)
+  draw.text((x0 + 18, y0 + 15), "Denoising canvas", font=header_font, fill=TEXT)
+  draw.text(
+      (x0 + panel_w - 260, y0 + 18),
+      "green = accepted | amber = changing",
+      font=small_font,
+      fill=MUTED,
+  )
+
+  progress = (
+      1.0
+      if transition_frames <= 1
+      else transition_phase / max(1, transition_frames - 1)
+  )
+  chip_x = x0 + 18
+  chip_y = y0 + 56
+  max_chip_x = x1 - 18
+  max_chip_y = y1 - 18
+
+  for pos, _ in enumerate(frame["token_ids"]):
+    selected = frame["selected_mask"][pos]
+    changed = frame["changed_mask"][pos]
+    denoise_strength = max(0.0, frame["noise"] * (1.0 - 0.68 * progress))
+    if selected:
+      denoise_strength *= 0.28
+    elif changed:
+      denoise_strength = max(denoise_strength, 0.20 * (1.0 - progress))
+
+    label = _token_label(
+        frame["token_texts"][pos],
+        noise=denoise_strength,
+        selected=selected,
+        rng=rng,
+    )
+    label_w, _ = _text_size(draw, label, token_font)
+    chip_w = min(max(label_w + 28, 58), 230)
+    if chip_x + chip_w > max_chip_x:
+      chip_x = x0 + 18
+      chip_y += chip_h + gap
+    if chip_y + chip_h > max_chip_y:
+      remaining = len(frame["token_ids"]) - pos
+      more = f"+{remaining} more"
+      more_w = min(
+          max(_text_size(draw, more, token_font)[0] + 28, 92),
+          max_chip_x - chip_x,
+      )
+      draw.rounded_rectangle(
+          (chip_x, max_chip_y - chip_h, chip_x + more_w, max_chip_y),
+          radius=9,
+          fill=(18, 28, 40),
+          outline=GRID,
+          width=1,
+      )
+      draw.text(
+          (chip_x + 14, max_chip_y - chip_h + 10),
+          more,
+          font=token_font,
+          fill=MUTED,
+      )
+      break
+
+    fill = (17, 29, 40)
+    border = GRID
+    text_color = TEXT
+    if selected:
+      fill = (15, 42, 35)
+      border = GREEN
+      text_color = GREEN
+    elif changed:
+      fill = (39, 33, 35)
+      border = AMBER
+      text_color = AMBER
+    elif denoise_strength > 0.35:
+      fill = _mix(fill, (25, 34, 52), min(0.7, denoise_strength))
+      text_color = _mix(MUTED, TEXT, max(0.0, 1.0 - denoise_strength))
+
+    chip_rect = (chip_x, chip_y, chip_x + chip_w, chip_y + chip_h)
+    draw.rounded_rectangle(
+        chip_rect,
+        radius=9,
+        fill=fill,
+        outline=border,
+        width=2 if selected or changed else 1,
+    )
+    _draw_denoise_pixels(
+        draw,
+        (chip_x + 3, chip_y + 3, chip_x + chip_w - 3, chip_y + chip_h - 3),
+        rng=rng,
+        strength=denoise_strength,
+        selected=selected,
+        changed=changed,
+    )
+    _draw_fit(
+        draw,
+        (chip_x + 14, chip_y + (chip_h - token_size) // 2 - 2),
+        label,
+        font=token_font,
+        fill=text_color,
+        max_width=chip_w - 28,
+    )
+    chip_x += chip_w + gap
+
+
 def _frame_image(
     payload: dict[str, Any],
     frame: dict[str, Any],
@@ -173,13 +401,13 @@ def _frame_image(
   del payload
   image = Image.new("RGB", (width, height), BACKGROUND)
   draw = ImageDraw.Draw(image, "RGBA")
-  title_font = _load_font(30)
+  title_font = _load_font(32)
   ui_font = _load_font(18)
   small_font = _load_font(14, mono=True)
-  token_font = _load_font(15, mono=True)
+  body_font = _load_font(19)
 
   draw.rectangle((0, 0, width, height), fill=BACKGROUND)
-  draw.rectangle((0, 0, width, 92), fill=(10, 17, 27))
+  draw.rectangle((0, 0, width, 96), fill=(10, 17, 27))
   draw.text(
       (36, 24), "DiffusionGemma denoising trace", font=title_font, fill=TEXT
   )
@@ -216,93 +444,48 @@ def _frame_image(
   ]
   mx = 36
   for label, value, color in metrics:
-    draw.rounded_rectangle((mx, 108, mx + 182, 162), radius=8, fill=PANEL)
-    draw.text((mx + 14, 116), label, font=small_font, fill=MUTED)
-    draw.text((mx + 14, 135), value, font=ui_font, fill=color)
+    draw.rounded_rectangle((mx, 112, mx + 182, 164), radius=8, fill=PANEL)
+    draw.text((mx + 14, 119), label, font=small_font, fill=MUTED)
+    draw.text((mx + 14, 138), value, font=ui_font, fill=color)
     mx += 194
 
-  cols = min(8, max(1, int(math.ceil(math.sqrt(len(frame["token_ids"]))))))
-  rows = math.ceil(len(frame["token_ids"]) / cols)
-  grid_x = 36
-  grid_y = 190
-  cell_gap = 8
-  cell_w = (width - grid_x * 2 - cell_gap * (cols - 1)) // cols
-  cell_h = min(74, (height - grid_y - 88 - cell_gap * (rows - 1)) // rows)
-
-  for pos, token_id in enumerate(frame["token_ids"]):
-    row, col = divmod(pos, cols)
-    x = grid_x + col * (cell_w + cell_gap)
-    y = grid_y + row * (cell_h + cell_gap)
-    selected = frame["selected_mask"][pos]
-    changed = frame["changed_mask"][pos]
-    border = GREEN if selected else GRID
-    if changed:
-      border = AMBER
-    fill = (18, 28, 40) if selected else (13, 22, 32)
-    if changed:
-      fill = _mix(fill, (31, 28, 43), 0.45)
-    draw.rounded_rectangle(
-        (x, y, x + cell_w, y + cell_h),
-        radius=7,
-        fill=fill,
-        outline=border,
-        width=2,
-    )
-    progress = (
-        1.0
-        if transition_frames <= 1
-        else transition_phase / max(1, transition_frames - 1)
-    )
-    denoise_strength = max(0.0, frame["noise"] * (1.0 - 0.68 * progress))
-    if selected:
-      denoise_strength *= 0.35
-    elif changed:
-      denoise_strength = max(denoise_strength, 0.18 * (1.0 - progress))
-    _draw_denoise_pixels(
-        draw,
-        (x + 2, y + 2, x + cell_w - 2, y + cell_h - 2),
-        rng=rng,
-        strength=denoise_strength,
-        selected=selected,
-        changed=changed,
-    )
-    piece = _clean_piece(frame["token_texts"][pos])
-    color = TEXT
-    if selected:
-      color = GREEN
-    if changed:
-      color = AMBER
-    if denoise_strength > 0.55 and not selected:
-      piece = rng.choice(["...", "???", "###", ":::", "***", "~~~"])
-      color = _mix(MUTED, CYAN, 0.35)
-    _draw_fit(
-        draw,
-        (x + 10, y + 12),
-        piece,
-        font=token_font,
-        fill=color,
-        max_width=cell_w - 20,
-    )
-    draw.text(
-        (x + 10, y + cell_h - 23),
-        f"#{pos} id:{token_id}",
-        font=small_font,
-        fill=MUTED,
-    )
-
-  output = frame["text"]
-  if len(output) > 220:
-    output = output[:219] + "~"
-  draw.rounded_rectangle(
-      (36, height - 72, width - 36, height - 26), radius=8, fill=PANEL
-  )
-  _draw_fit(
+  output_panel_h = max(132, min(170, height // 4))
+  canvas_rect = (36, 186, width - 36, height - output_panel_h - 28)
+  _draw_token_canvas(
       draw,
-      (52, height - 59),
-      _clean_piece(output, limit=170),
+      frame,
+      rect=canvas_rect,
+      rng=rng,
+      transition_phase=transition_phase,
+      transition_frames=transition_frames,
+      width=width,
+      height=height,
+  )
+
+  output = _clean_piece(frame["text"], limit=520)
+  output_y = height - output_panel_h + 8
+  draw.rounded_rectangle(
+      (36, output_y, width - 36, height - 24),
+      radius=8,
+      fill=PANEL,
+      outline=GRID,
+      width=1,
+  )
+  draw.text(
+      (54, output_y + 14),
+      "Current decoded text",
       font=small_font,
+      fill=MUTED,
+  )
+  _draw_wrapped_text(
+      draw,
+      (54, output_y + 40),
+      output,
+      font=body_font,
       fill=TEXT,
-      max_width=width - 104,
+      max_width=width - 108,
+      max_lines=max(2, (output_panel_h - 66) // 25),
+      line_height=26,
   )
 
   return image
@@ -348,6 +531,22 @@ def render_gif(args: argparse.Namespace) -> None:
     durations.append(
         args.hold_ms if index < len(frames) - 1 else args.final_hold_ms
     )
+    if index == len(frames) - 1:
+      for _ in range(max(0, args.final_hold_frames - 1)):
+        images.append(
+            _frame_image(
+                payload,
+                frame,
+                index=index,
+                total=len(frames),
+                width=args.width,
+                height=args.height,
+                rng=rng,
+                transition_phase=args.transition_frames,
+                transition_frames=args.transition_frames + 1,
+            ).convert("P", palette=Image.Palette.ADAPTIVE, colors=192)
+        )
+        durations.append(args.final_hold_ms)
 
   output = pathlib.Path(args.output)
   output.parent.mkdir(parents=True, exist_ok=True)
@@ -364,6 +563,7 @@ def render_gif(args: argparse.Namespace) -> None:
           "output": str(output),
           "input_frames": len(frames),
           "gif_frames": len(images),
+          "final_hold_frames": args.final_hold_frames,
           "bytes": output.stat().st_size,
       })
   )
@@ -378,8 +578,9 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--seed", type=int, default=17)
   parser.add_argument("--transition_frames", type=int, default=3)
   parser.add_argument("--transition_duration_ms", type=int, default=100)
-  parser.add_argument("--hold_ms", type=int, default=620)
-  parser.add_argument("--final_hold_ms", type=int, default=1600)
+  parser.add_argument("--hold_ms", type=int, default=580)
+  parser.add_argument("--final_hold_ms", type=int, default=850)
+  parser.add_argument("--final_hold_frames", type=int, default=3)
   return parser.parse_args()
 
 
