@@ -360,8 +360,17 @@ def _write_json(path: str | None, payload: dict[str, Any]) -> str | None:
   return str(output_path)
 
 
+def _json_for_script_tag(payload: dict[str, Any]) -> str:
+  return (
+      json.dumps(payload, ensure_ascii=False)
+      .replace("&", "\\u0026")
+      .replace("<", "\\u003c")
+      .replace(">", "\\u003e")
+  )
+
+
 def _render_animation_html(payload: dict[str, Any]) -> str:
-  data_json = html_lib.escape(json.dumps(payload, ensure_ascii=False))
+  data_json = _json_for_script_tag(payload)
   title = html_lib.escape(f"DiffusionGemma trace: {payload['prompt']}")
   return f"""<!doctype html>
 <html lang="en">
