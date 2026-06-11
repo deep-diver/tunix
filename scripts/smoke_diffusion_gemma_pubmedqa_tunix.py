@@ -197,6 +197,37 @@ def _mesh(fsdp: int, tp: int) -> jax.sharding.Mesh:
   )
 
 
+def _resolve_mesh_axes(args: argparse.Namespace) -> tuple[int, int]:
+  """Resolves mesh axes, defaulting to official-style FSDP first."""
+  if args.tiny:
+    return 1, 1
+  device_count = jax.device_count()
+  fsdp = args.mesh_fsdp
+  tp = args.mesh_tp
+  if fsdp is None and tp is None:
+    return device_count, 1
+  if fsdp is None:
+    if device_count % tp != 0:
+      raise ValueError(
+          f"jax.device_count()={device_count} must be divisible by"
+          f" mesh_tp={tp}."
+      )
+    return device_count // tp, tp
+  if tp is None:
+    if device_count % fsdp != 0:
+      raise ValueError(
+          f"jax.device_count()={device_count} must be divisible by"
+          f" mesh_fsdp={fsdp}."
+      )
+    return fsdp, device_count // fsdp
+  if fsdp * tp != device_count:
+    raise ValueError(
+        "mesh_fsdp * mesh_tp must equal jax.device_count(). Got "
+        f"{fsdp} * {tp} != {device_count}."
+    )
+  return fsdp, tp
+
+
 def _format_pubmedqa_prompt(question: str, contexts: list[str], max_chars: int):
   context_text = "\n".join(contexts)
   if len(context_text) > max_chars:
@@ -447,12 +478,8 @@ def _load_tiny_model(args: argparse.Namespace, vocab_size: int):
 
 
 def _load_real_model(args: argparse.Namespace):
-  if args.mesh_fsdp * args.mesh_tp != jax.device_count():
-    raise ValueError(
-        "mesh_fsdp * mesh_tp must equal jax.device_count(). Got "
-        f"{args.mesh_fsdp} * {args.mesh_tp} != {jax.device_count()}."
-    )
-  mesh = _mesh(args.mesh_fsdp, args.mesh_tp)
+  mesh_fsdp, mesh_tp = _resolve_mesh_axes(args)
+  mesh = _mesh(mesh_fsdp, mesh_tp)
   remat_config = (
       gemma4_model.RematConfig.DECODER if args.remat_decoder else None
   )
@@ -561,10 +588,13 @@ def _make_train_batches(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+  mesh_fsdp, mesh_tp = _resolve_mesh_axes(args)
   _log(
       "devices",
       devices=[str(d) for d in jax.devices()],
       backend=jax.default_backend(),
+      mesh_fsdp=mesh_fsdp,
+      mesh_tp=mesh_tp,
   )
   gpu_memory_monitor = _GpuMemoryMonitor(args.gpu_memory_poll_seconds)
   gpu_memory_monitor.start()
@@ -760,8 +790,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       "decoder_implementation": args.decoder_implementation,
       "remat_decoder": args.remat_decoder,
       "prefill_decode_only_last_token": args.encoder_loss_weight == 0.0,
-      "mesh_fsdp": args.mesh_fsdp,
-      "mesh_tp": args.mesh_tp,
+      "mesh_fsdp": mesh_fsdp,
+      "mesh_tp": mesh_tp,
       "trainable_state": trainable_summary,
       "frozen_state": frozen_summary,
   }
@@ -871,8 +901,25 @@ def parse_args() -> argparse.Namespace:
           "the final train_complete JSON. Disabled when set to 0."
       ),
   )
-  parser.add_argument("--mesh_fsdp", type=int, default=1)
-  parser.add_argument("--mesh_tp", type=int, default=1)
+  parser.add_argument(
+      "--mesh_fsdp",
+      type=int,
+      default=None,
+      help=(
+          "FSDP mesh axis. Defaults to jax.device_count() when --mesh_tp is "
+          "also omitted, matching the official PubMedQA recipe's FSDP-first "
+          "layout. If only --mesh_tp is set, inferred from device count."
+      ),
+  )
+  parser.add_argument(
+      "--mesh_tp",
+      type=int,
+      default=None,
+      help=(
+          "Tensor-parallel mesh axis. Defaults to 1 when --mesh_fsdp is also "
+          "omitted. If only --mesh_fsdp is set, inferred from device count."
+      ),
+  )
   parser.add_argument("--lora_rank", type=int, default=4)
   parser.add_argument("--lora_alpha", type=float, default=8.0)
   parser.add_argument(
