@@ -89,37 +89,60 @@ def _draw_fit(
   draw.text(xy, clipped + "~", font=font, fill=fill)
 
 
-def _draw_scanlines(draw: ImageDraw.ImageDraw, width: int, height: int) -> None:
-  for y in range(0, height, 4):
-    draw.line((0, y, width, y), fill=(255, 255, 255, 13), width=1)
+def _mix(
+    left: tuple[int, int, int],
+    right: tuple[int, int, int],
+    amount: float,
+) -> tuple[int, int, int]:
+  amount = max(0.0, min(1.0, amount))
+  return tuple(int(a + (b - a) * amount) for a, b in zip(left, right))
 
 
-def _glitch_overlay(
-    image: Image.Image,
+def _draw_denoise_pixels(
+    draw: ImageDraw.ImageDraw,
+    rect: tuple[int, int, int, int],
     *,
     rng: random.Random,
     strength: float,
-) -> Image.Image:
+    selected: bool,
+    changed: bool,
+) -> None:
+  """Draws local pixel noise inside one token cell.
+
+  The noise is intentionally clipped to token cells so the overall screen stays
+  still while the canvas appears to denoise.
+  """
   if strength <= 0:
-    return image
-  out = image.copy()
-  width, height = out.size
-  draw = ImageDraw.Draw(out, "RGBA")
-  for _ in range(int(8 + 20 * strength)):
-    y = rng.randrange(70, height - 20)
-    h = rng.randrange(2, 8)
-    dx = rng.randrange(-18, 19)
-    band = out.crop((0, y, width, min(height, y + h)))
-    out.paste(band, (dx, y))
-    color = rng.choice([(GREEN, 35), (CYAN, 30), (RED, 30), (PURPLE, 28)])
-    draw.rectangle(
-        (0, y, width, min(height, y + h)), fill=(*color[0], color[1])
+    return
+  x0, y0, x1, y1 = rect
+  width = x1 - x0
+  height = y1 - y0
+  palette = [CYAN, PURPLE, GREEN, AMBER, RED, (230, 240, 255), (38, 51, 68)]
+  block = max(2, int(12 * strength))
+  count = int((10 + width * height / 260) * strength)
+  alpha_base = int(35 + 150 * strength)
+  if changed:
+    count = int(count * 1.25)
+  if selected:
+    count = int(count * 0.55)
+    alpha_base = int(alpha_base * 0.65)
+
+  for _ in range(max(1, count)):
+    bw = rng.randint(2, block)
+    bh = rng.randint(2, block)
+    x = rng.randint(x0 + 2, max(x0 + 2, x1 - bw - 2))
+    y = rng.randint(y0 + 2, max(y0 + 2, y1 - bh - 2))
+    color = rng.choice(palette)
+    alpha = rng.randint(max(18, alpha_base // 2), min(220, alpha_base))
+    draw.rectangle((x, y, x + bw, y + bh), fill=(*color, alpha))
+
+  haze = int(75 * strength)
+  if haze:
+    draw.rounded_rectangle(
+        rect,
+        radius=7,
+        fill=(226, 242, 235, haze if not selected else haze // 2),
     )
-  for _ in range(int(20 + 80 * strength)):
-    x = rng.randrange(width)
-    y = rng.randrange(height)
-    draw.point((x, y), fill=(*rng.choice([GREEN, CYAN, RED, TEXT]), 120))
-  return out
 
 
 def _draw_noise_bar(
@@ -144,7 +167,8 @@ def _frame_image(
     width: int,
     height: int,
     rng: random.Random,
-    glitch_phase: int,
+    transition_phase: int,
+    transition_frames: int,
 ) -> Image.Image:
   del payload
   image = Image.new("RGB", (width, height), BACKGROUND)
@@ -213,10 +237,10 @@ def _frame_image(
     changed = frame["changed_mask"][pos]
     border = GREEN if selected else GRID
     if changed:
-      border = RED if glitch_phase % 2 == 0 else AMBER
+      border = AMBER
     fill = (18, 28, 40) if selected else (13, 22, 32)
-    if changed and glitch_phase:
-      fill = (36, 18, 29)
+    if changed:
+      fill = _mix(fill, (31, 28, 43), 0.45)
     draw.rounded_rectangle(
         (x, y, x + cell_w, y + cell_h),
         radius=7,
@@ -224,14 +248,33 @@ def _frame_image(
         outline=border,
         width=2,
     )
+    progress = (
+        1.0
+        if transition_frames <= 1
+        else transition_phase / max(1, transition_frames - 1)
+    )
+    denoise_strength = max(0.0, frame["noise"] * (1.0 - 0.68 * progress))
+    if selected:
+      denoise_strength *= 0.35
+    elif changed:
+      denoise_strength = max(denoise_strength, 0.18 * (1.0 - progress))
+    _draw_denoise_pixels(
+        draw,
+        (x + 2, y + 2, x + cell_w - 2, y + cell_h - 2),
+        rng=rng,
+        strength=denoise_strength,
+        selected=selected,
+        changed=changed,
+    )
     piece = _clean_piece(frame["token_texts"][pos])
-    if changed and glitch_phase == 1 and rng.random() < 0.45:
-      piece = rng.choice(["////", "::::", "0x??", "zzzt", "####", "<<>>"])
     color = TEXT
     if selected:
       color = GREEN
     if changed:
-      color = RED if glitch_phase != 2 else AMBER
+      color = AMBER
+    if denoise_strength > 0.55 and not selected:
+      piece = rng.choice(["...", "???", "###", ":::", "***", "~~~"])
+      color = _mix(MUTED, CYAN, 0.35)
     _draw_fit(
         draw,
         (x + 10, y + 12),
@@ -262,14 +305,7 @@ def _frame_image(
       max_width=width - 104,
   )
 
-  _draw_scanlines(draw, width, height)
-  return _glitch_overlay(
-      image,
-      rng=rng,
-      strength=(
-          0.18 if frame["phase"] == "initial" else 0.10 + 0.03 * glitch_phase
-      ),
-  )
+  return image
 
 
 def render_gif(args: argparse.Namespace) -> None:
@@ -281,7 +317,7 @@ def render_gif(args: argparse.Namespace) -> None:
   images = []
   durations = []
   for index, frame in enumerate(frames):
-    for phase in range(args.glitch_frames):
+    for phase in range(args.transition_frames):
       images.append(
           _frame_image(
               payload,
@@ -291,10 +327,11 @@ def render_gif(args: argparse.Namespace) -> None:
               width=args.width,
               height=args.height,
               rng=rng,
-              glitch_phase=phase,
+              transition_phase=phase,
+              transition_frames=args.transition_frames,
           ).convert("P", palette=Image.Palette.ADAPTIVE, colors=192)
       )
-      durations.append(args.glitch_duration_ms)
+      durations.append(args.transition_duration_ms)
     images.append(
         _frame_image(
             payload,
@@ -304,7 +341,8 @@ def render_gif(args: argparse.Namespace) -> None:
             width=args.width,
             height=args.height,
             rng=rng,
-            glitch_phase=0,
+            transition_phase=args.transition_frames,
+            transition_frames=args.transition_frames + 1,
         ).convert("P", palette=Image.Palette.ADAPTIVE, colors=192)
     )
     durations.append(
@@ -338,8 +376,8 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--width", type=int, default=1280)
   parser.add_argument("--height", type=int, default=720)
   parser.add_argument("--seed", type=int, default=17)
-  parser.add_argument("--glitch_frames", type=int, default=2)
-  parser.add_argument("--glitch_duration_ms", type=int, default=90)
+  parser.add_argument("--transition_frames", type=int, default=3)
+  parser.add_argument("--transition_duration_ms", type=int, default=100)
   parser.add_argument("--hold_ms", type=int, default=620)
   parser.add_argument("--final_hold_ms", type=int, default=1600)
   return parser.parse_args()
