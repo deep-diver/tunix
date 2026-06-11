@@ -51,6 +51,7 @@ class DiffusionGemmaSFTConfig:
   encoder_loss_weight: float = 1.0
   stop_gradient_from_denoiser_to_encoder: bool = False
   decoder_implementation: str = "full_sequence"
+  fast_uniform_corruption: bool = False
 
   @property
   def total_canvas_len(self) -> int:
@@ -261,15 +262,26 @@ def _corrupt_tokens(
     x0_tokens: jax.Array,
     time: jax.Array,
     vocab_size: int,
+    *,
+    fast_uniform: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
   rng_mask, rng_noise = jax.random.split(rng)
-  random_tokens = jax.random.choice(
-      rng_noise,
-      a=vocab_size,
-      shape=x0_tokens.shape,
-      p=jnp.full((vocab_size,), 1.0 / vocab_size, dtype=jnp.float32),
-      mode="high",
-  ).astype(x0_tokens.dtype)
+  if fast_uniform:
+    random_tokens = jax.random.randint(
+        rng_noise,
+        shape=x0_tokens.shape,
+        minval=0,
+        maxval=vocab_size,
+        dtype=x0_tokens.dtype,
+    )
+  else:
+    random_tokens = jax.random.choice(
+        rng_noise,
+        a=vocab_size,
+        shape=x0_tokens.shape,
+        p=jnp.full((vocab_size,), 1.0 / vocab_size, dtype=jnp.float32),
+        mode="high",
+    ).astype(x0_tokens.dtype)
   corrupt_prob = jnp.broadcast_to(time, x0_tokens.shape)
   is_not_corrupted = jax.random.bernoulli(
       rng_mask, p=1.0 - corrupt_prob, shape=x0_tokens.shape, mode="high"
@@ -321,7 +333,11 @@ def diffusion_gemma_sft_loss(
       dtype=jnp.float32,
   )
   xt, is_corrupted = _corrupt_tokens(
-      rng_corrupt, x0_tokens, time, config.vocab_size
+      rng_corrupt,
+      x0_tokens,
+      time,
+      config.vocab_size,
+      fast_uniform=config.fast_uniform_corruption,
   )
   selected_canvas_idx = _sample_selected_canvas(rng_canvas, canvas_mask, config)
 

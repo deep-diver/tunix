@@ -253,6 +253,18 @@ class DiffusionGemmaTest(absltest.TestCase):
     np.testing.assert_array_equal(actual_xt, expected_xt)
     np.testing.assert_array_equal(actual_is_corrupted, expected_is_corrupted)
 
+    fast_xt, fast_is_corrupted = diffusion_sft._corrupt_tokens(  # pylint: disable=protected-access
+        jax.random.PRNGKey(23),
+        x0_tokens,
+        time,
+        cfg.vocab_size,
+        fast_uniform=True,
+    )
+    self.assertEqual(fast_xt.shape, x0_tokens.shape)
+    self.assertEqual(fast_is_corrupted.shape, x0_tokens.shape)
+    self.assertTrue(bool(jnp.all(fast_xt >= 0)))
+    self.assertTrue(bool(jnp.all(fast_xt < cfg.vocab_size)))
+
     logits = jnp.arange(
         x0_tokens.size * cfg.vocab_size, dtype=jnp.float32
     ).reshape(x0_tokens.shape + (cfg.vocab_size,))

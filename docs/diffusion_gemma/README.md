@@ -11,6 +11,7 @@ This directory is the runbook for the Tunix DiffusionGemma MVP integration.
 - Matches official helper semantics for positions, prefill/decoder masks, cache `end_index`, `SafeSpan(1e-4)` timestep sampling, categorical corruption, selected-canvas sampling, unweighted discrete loss normalization, and unscaled self-conditioning post-norm.
 - Matches official full-model logits on a tiny non-MoE DiffusionGemma config by copying official Flax/Linen weights into the Tunix NNX model and comparing complete-sequence plain logits plus self-conditioning logits.
 - Includes a tiny synthetic smoke script that checks finite loss, LoRA-only updates, and checkpoint directory creation.
+- Includes a PubMedQA real-data LoRA SFT smoke script that mirrors the official DeepMind PubMedQA split and prompt/answer formatting without importing Kauldron or Grain.
 - Includes a no-tuning generation demo with official-style confidence selection, annealed temperature, token-stability plus entropy early stopping, JSON trace export, and a self-contained HTML animation of every denoising frame.
 
 ## Current Limitations
@@ -19,6 +20,8 @@ This directory is the runbook for the Tunix DiffusionGemma MVP integration.
 - The full-model logits parity script covers the direct transformer forward path without cache. The cached official SFT decoder path is still distinct from the MVP full-sequence denoising compatibility path because Tunix Gemma4 cache updates do not yet implement the official multi-token canvas write-at-`end_index` behavior.
 - Upstream Orbax checkpoint loading maps the Gemma4-compatible backbone and known `self_conditioner` leaves. The public `diffusiongemma-26B-A4B-it` checkpoint has been loaded successfully on a 4xH100 JAX mesh.
 - The no-tuning generation demo uses the full-sequence no-cache path covered by logits parity, not the official cached production sampler. Treat it as a load/denoise visibility smoke test, not a quality benchmark.
+- Public 26B PubMedQA training is not yet passing on the current `PeftTrainer` JIT path. A 4xH100 smoke reaches finite PubMedQA loss with the public checkpoint, but the LoRA train step OOMs while compiling/executing `jit__train_step` even with `prompt_len=64`, `canvas_size=8`, and one canvas.
+- For public 26B smoke runs, `scripts/smoke_diffusion_gemma_pubmedqa_tunix.py` defaults to a minimal `minimal_state.json` proof artifact instead of Tunix/Orbax optimizer checkpointing. Use `--orbax_checkpoint` only when the shape is known to fit; the public 26B optimizer checkpoint path can exceed memory.
 
 ## Local Commands
 
@@ -29,6 +32,7 @@ python scripts/verify_diffusion_gemma_official_parity.py
 python scripts/verify_diffusion_gemma_official_logits.py
 python scripts/generate_diffusion_gemma_tunix.py --tiny --max_new_tokens 4 --canvas_length 4 --denoising_steps 3 --prompt "Hi" --animation_output /tmp/diffusion_gemma_tiny_trace.html --trace_json /tmp/diffusion_gemma_tiny_trace.json
 python scripts/render_diffusion_gemma_trace_gif.py /tmp/diffusion_gemma_tiny_trace.json --output /tmp/diffusion_gemma_tiny_trace.gif --width 900 --height 520
+python scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --tiny --steps 2 --batch_size 1 --prompt_len 128 --canvas_size 32 --num_canvases 1 --max_examples 4 --max_context_chars 600 --tiny_vocab_size 256
 python -m pytest tests/models/registry_test.py -q --import-mode=importlib
 python -m pytest tests/models/naming_test.py -q --import-mode=importlib -k 'not model_id_exists_on_huggingface'
 python scripts/smoke_diffusion_gemma_tunix.py --steps 3 --use_lora
@@ -63,6 +67,49 @@ run reached `1528 passed`, `34 failed`, and `105 errors`; the remaining failures
 are unrelated optional-backend imports, JAX CPU-device ordering setup, and
 pre-existing sampler/SFT/RL/smoke-test environment failures. The
 DiffusionGemma-specific tests and parity scripts above pass.
+
+## PubMedQA SFT Smoke
+
+The official DeepMind DiffusionGemma SFT recipe includes PubMedQA data setup in
+`gemma/diffusion/hackable_diffusion_adapter/configs/sft_pubmedqa.py` and
+`.../data/pubmedqa`. The Tunix smoke mirrors the relevant pieces:
+
+- data source: `pubmedqa/pubmedqa`
+- train split: `ori_pqal.json` minus IDs in `test_ground_truth.json`
+- train examples: 500; test examples: 500
+- prompt: official medical research assistant system prompt plus PubMedQA context/question
+- target: long answer by default, ending with `The answer is: yes|no|maybe<turn|>`
+- tokenization/canvas layout: Gemma4 tokenizer, BOS prompt token, response chunks, EOS-filled final valid canvas, `canvas_id`, `canvas_mask`, and shifted encoder target
+
+Local tiny real-data command:
+
+```bash
+python scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --tiny --steps 2 --batch_size 1 --prompt_len 128 --canvas_size 32 --num_canvases 1 --max_examples 4 --max_context_chars 600 --tiny_vocab_size 256
+```
+
+Latest verified local tiny PubMedQA result:
+
+- selected examples: 4 from official train split; first PubMed ID `24785562`
+- initial loss: `11.092823028564453`
+- final loss after 2 LoRA steps: `11.08835220336914`
+- LoRA norm delta: `5.340576171875e-05`
+- sampled non-LoRA checksum delta: `0.0`
+- artifact: `minimal_state.json` in the run checkpoint directory
+
+Public 26B PubMedQA GPU command used for the latest H100 attempt:
+
+```bash
+jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/ubuntu/tunix-dg-pubmedqa && . .venv/bin/activate && python scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --steps 1 --batch_size 1 --prompt_len 64 --canvas_size 8 --num_canvases 1 --max_examples 2 --max_context_chars 300 --no-use_long_answer --checkpoint /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 4 --mesh_tp 1 --restore_concurrent_gb 16 --checkpoint_dir /home/ubuntu/diffusion_gemma_pubmedqa_state_short_v2 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption'
+```
+
+Latest verified 4xH100 PubMedQA public-checkpoint result:
+
+- Machine: `424974` (`H100`, `IN2`, 4 GPUs, VM), destroyed after the run.
+- Checkpoint mirror: `r_027dbcd5`, 31 objects, 37.633 GiB.
+- Run: `r_64b7e672`.
+- Public checkpoint loaded and PubMedQA loss was finite: total `17.086498260498047`, decoder `8.215320587158203`, encoder `8.871176719665527`.
+- Train step failed: XLA reported `RESOURCE_EXHAUSTED` while allocating `88.20GiB` in `jit__train_step` after rematerialization reduced the module only to about `100.75GiB`.
+- Verdict: this proves real PubMedQA preprocessing and public-checkpoint forward/loss compatibility, but not usable 26B LoRA tuning yet. The next required work is a lower-memory train path, likely by avoiding the full-sequence compatibility decoder path during SFT and implementing the official cached selected-canvas decoder update in Tunix Gemma4.
 
 ## JarvisLabs Smoke
 
