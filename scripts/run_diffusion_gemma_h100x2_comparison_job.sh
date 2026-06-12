@@ -55,21 +55,40 @@ LORA_RANK="${LORA_RANK:-4}"
 GPU_POLL_SECONDS="${GPU_POLL_SECONDS:-60}"
 JAX_CUDA_EXTRA="${JAX_CUDA_EXTRA:-cuda12}"
 
-if [[ -z "${PYTHON_BIN:-}" && -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
-  PYTHON_BIN="${VIRTUAL_ENV}/bin/python"
+python_version_ok() {
+  "$1" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 12) else 1)
+PY
+}
+
+if [[ -n "${PYTHON_BIN:-}" ]] && ! python_version_ok "${PYTHON_BIN}"; then
+  PYTHON_BIN=""
 fi
 
 if [[ -z "${PYTHON_BIN:-}" ]]; then
-  if command -v python3.13 >/dev/null 2>&1; then
+  if command -v python3.13 >/dev/null 2>&1 && python_version_ok "$(command -v python3.13)"; then
     PYTHON_BIN="$(command -v python3.13)"
-  elif command -v python3.12 >/dev/null 2>&1; then
+  elif command -v python3.12 >/dev/null 2>&1 && python_version_ok "$(command -v python3.12)"; then
     PYTHON_BIN="$(command -v python3.12)"
+  elif [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -x "${VIRTUAL_ENV}/bin/python" ]] && python_version_ok "${VIRTUAL_ENV}/bin/python"; then
+    PYTHON_BIN="${VIRTUAL_ENV}/bin/python"
+  elif command -v uv >/dev/null 2>&1; then
+    uv python install 3.13
+    PYTHON_BIN="$(uv python find 3.13)"
   else
-    PYTHON_BIN="$(command -v python3)"
+    echo "Python >=3.12 is required for official DiffusionGemma packages." >&2
+    exit 1
   fi
 fi
 
-VENV="${VENV:-${VIRTUAL_ENV:-${HOME_DIR}/.venvs/diffusion_gemma_${MODE}}}"
+if [[ -z "${VENV:-}" ]]; then
+  if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ "${PYTHON_BIN}" == "${VIRTUAL_ENV}/bin/python" ]]; then
+    VENV="${VIRTUAL_ENV}"
+  else
+    VENV="${HOME_DIR}/.venvs/diffusion_gemma_${MODE}"
+  fi
+fi
 mkdir -p "${WORKDIR}" "$(dirname "${RESULT_JSON}")"
 
 json_event() {
@@ -92,8 +111,13 @@ json_event comparison_job_start \
   dataset_batch_size="${DATASET_BATCH_SIZE}" \
   lora_rank="${LORA_RANK}"
 
-if [[ ! -d "${VENV}" ]]; then
-  "${PYTHON_BIN}" -m venv "${VENV}"
+if [[ ! -x "${VENV}/bin/python" ]] || ! python_version_ok "${VENV}/bin/python"; then
+  rm -rf "${VENV}"
+  if command -v uv >/dev/null 2>&1; then
+    uv venv --python "${PYTHON_BIN}" --seed "${VENV}"
+  else
+    "${PYTHON_BIN}" -m venv "${VENV}"
+  fi
 fi
 # shellcheck disable=SC1091
 source "${VENV}/bin/activate"
