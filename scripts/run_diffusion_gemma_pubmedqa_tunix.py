@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from typing import Any
 
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
@@ -590,7 +591,8 @@ def _train_with_separate_loss_jits(
     trainer: diffusion_sft.DiffusionGemmaTrainer,
     train_batches: list[dict[str, jax.Array]],
     diffusion_config: diffusion_sft.DiffusionGemmaSFTConfig,
-) -> None:
+    max_runtime_seconds: float = 0.0,
+) -> bool:
   """Runs exact split-gradient training with separate JAX executables."""
   if trainer.config.gradient_accumulation_steps not in (None, 1):
     raise ValueError(
@@ -698,6 +700,8 @@ def _train_with_separate_loss_jits(
   apply_grad_step = nnx.jit(apply_grad_step, donate_argnames=("optimizer",))
 
   max_steps = trainer.config.max_steps or len(train_batches)
+  start_time = time.monotonic()
+  timed_out = False
   for step in range(max_steps):
     batch = train_batches[step % len(train_batches)]
     sc_prefill = precompute_self_conditioning_prefill_step(trainer.model, batch)
@@ -720,16 +724,41 @@ def _train_with_separate_loss_jits(
     aux = dict(decoder_aux)
     aux["encoder_loss"] = encoder_aux["encoder_loss"]
     trainer.last_train_aux = aux
+    trainer.last_train_loss = loss
     trainer._iter_steps += 1
     trainer._train_steps += 1
+    total_value = float(jax.device_get(loss))
+    decoder_value = float(jax.device_get(decoder_aux["decoder_loss"]))
+    encoder_value = float(jax.device_get(encoder_aux["encoder_loss"]))
     _log(
         "separate_loss_jit_step",
         step=step + 1,
-        loss=float(jax.device_get(loss)),
-        decoder_loss=float(jax.device_get(decoder_aux["decoder_loss"])),
-        encoder_loss=float(jax.device_get(encoder_aux["encoder_loss"])),
+        loss=total_value,
+        decoder_loss=decoder_value,
+        encoder_loss=encoder_value,
         grad_norm=float(jax.device_get(grad_norm)),
     )
+    for metric, value in (
+        ("losses/diffusion_loss", decoder_value),
+        ("losses/encoder_loss", encoder_value),
+        ("losses/total", total_value),
+    ):
+      _log(
+          "diffusion_gemma_native_loss",
+          metric=metric,
+          value=value,
+          step=trainer.train_steps,
+          loop_step=step,
+      )
+    if max_runtime_seconds and time.monotonic() - start_time >= max_runtime_seconds:
+      timed_out = True
+      _log(
+          "native_max_runtime_reached",
+          step=trainer.train_steps,
+          max_runtime_seconds=max_runtime_seconds,
+      )
+      break
+  return timed_out
 
 
 def _make_train_batches(
@@ -1032,10 +1061,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       diffusion_config,
       split_loss_gradients=args.split_loss_gradients,
   )
+  timed_out = False
+  if args.max_runtime_seconds and not args.separate_loss_jits:
+    raise ValueError("--max_runtime_seconds requires --separate_loss_jits.")
   if args.separate_loss_jits:
     if not args.split_loss_gradients:
       raise ValueError("--separate_loss_jits requires --split_loss_gradients.")
-    _train_with_separate_loss_jits(trainer, train_batches, diffusion_config)
+    timed_out = _train_with_separate_loss_jits(
+        trainer,
+        train_batches,
+        diffusion_config,
+        max_runtime_seconds=args.max_runtime_seconds,
+    )
   else:
     trainer.train(train_batches, cache_nnx_graph=False)
   final_loss, final_aux = diffusion_sft.make_loss_fn(diffusion_config)(
@@ -1085,12 +1122,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       "split_loss_gradients": args.split_loss_gradients,
       "separate_loss_jits": args.separate_loss_jits,
       "precomputed_self_conditioning": args.separate_loss_jits,
+      "max_runtime_seconds": args.max_runtime_seconds,
+      "timed_out": timed_out,
       "mesh_fsdp": mesh_fsdp,
       "mesh_tp": mesh_tp,
       "trainable_state": trainable_summary,
       "frozen_state": frozen_summary,
   }
-  if trainer.train_steps < args.steps:
+  if trainer.train_steps < args.steps and not timed_out:
     raise RuntimeError(
         f"Expected {args.steps} train steps, got {trainer.train_steps}"
     )
@@ -1136,6 +1175,15 @@ def parse_args() -> argparse.Namespace:
       ),
   )
   parser.add_argument("--steps", type=int, default=2)
+  parser.add_argument(
+      "--max_runtime_seconds",
+      type=float,
+      default=0.0,
+      help=(
+          "Stop cleanly after this many seconds in --separate_loss_jits mode. "
+          "Use with a large --steps value for timed comparison runs."
+      ),
+  )
   parser.add_argument("--batch_size", type=int, default=1)
   parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
   parser.add_argument("--prompt_len", type=int, default=1024)
