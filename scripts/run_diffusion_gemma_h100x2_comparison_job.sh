@@ -18,6 +18,8 @@ set -euo pipefail
 MODE=""
 CLI_MAX_RUNTIME_SECONDS=""
 CLI_NUM_TRAIN_STEPS=""
+CLI_RUN_STEPS=""
+CLI_LOG_LOSSES=""
 CLI_RUN_NAME=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -31,6 +33,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --num_train_steps)
       CLI_NUM_TRAIN_STEPS="$2"
+      shift 2
+      ;;
+    --run_steps)
+      CLI_RUN_STEPS="$2"
+      shift 2
+      ;;
+    --log_losses)
+      CLI_LOG_LOSSES="$2"
       shift 2
       ;;
     --run_name)
@@ -64,6 +74,7 @@ HACKABLE_DIFFUSION_REF="${HACKABLE_DIFFUSION_REF:-${HOME_DIR}/hackable_diffusion
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-${HOME_DIR}/checkpoints/diffusiongemma-26B-A4B-it}"
 MAX_RUNTIME_SECONDS="${CLI_MAX_RUNTIME_SECONDS:-${MAX_RUNTIME_SECONDS:-10800}}"
 NUM_TRAIN_STEPS="${CLI_NUM_TRAIN_STEPS:-${NUM_TRAIN_STEPS:-2000}}"
+RUN_STEPS="${CLI_RUN_STEPS:-${RUN_STEPS:-}}"
 CHECKPOINT_EVERY_N_STEPS="${CHECKPOINT_EVERY_N_STEPS:-1000}"
 DATASET_BATCH_SIZE="${DATASET_BATCH_SIZE:-2}"
 LORA_RANK="${LORA_RANK:-4}"
@@ -71,6 +82,7 @@ GPU_POLL_SECONDS="${GPU_POLL_SECONDS:-60}"
 JAX_CUDA_EXTRA="${JAX_CUDA_EXTRA:-cuda12}"
 XLA_FLAGS="${XLA_FLAGS:---xla_disable_hlo_passes=constant_folding}"
 TRAIN_LOOP="${TRAIN_LOOP:-hybrid}"
+LOG_LOSSES="${CLI_LOG_LOSSES:-${LOG_LOSSES:-true}}"
 
 python_version_ok() {
   "$1" - <<'PY' >/dev/null 2>&1
@@ -125,9 +137,11 @@ json_event comparison_job_start \
   workdir="${WORKDIR}" \
   max_runtime_seconds="${MAX_RUNTIME_SECONDS}" \
   num_train_steps="${NUM_TRAIN_STEPS}" \
+  run_steps="${RUN_STEPS:-}" \
   dataset_batch_size="${DATASET_BATCH_SIZE}" \
   lora_rank="${LORA_RANK}" \
   train_loop="${TRAIN_LOOP}" \
+  log_losses="${LOG_LOSSES}" \
   xla_flags="${XLA_FLAGS}"
 
 if [[ ! -x "${VENV}/bin/python" ]] || ! python_version_ok "${VENV}/bin/python"; then
@@ -232,6 +246,16 @@ COMMON_ARGS=(
   --module_override "PUBMEDQA_TEST_PATH=${GEMMA_REF}/gemma/diffusion/hackable_diffusion_adapter/data/pubmedqa/pubmedqa_test.jsonl"
 )
 
+if [[ -n "${RUN_STEPS}" ]]; then
+  COMMON_ARGS+=(--run_steps "${RUN_STEPS}")
+fi
+
+if [[ "${LOG_LOSSES}" == "false" || "${LOG_LOSSES}" == "0" ]]; then
+  COMMON_ARGS+=(--no-log_losses)
+else
+  COMMON_ARGS+=(--log_losses)
+fi
+
 if [[ "${MODE}" == "upstream" ]]; then
   RUNNER=(
     python "${REPO_ROOT}/scripts/run_diffusion_gemma_official_reference.py"
@@ -290,6 +314,7 @@ payload = {
     "gemma_revision": "$(git -C "${GEMMA_REF}" rev-parse HEAD)",
     "hackable_diffusion_revision": "$(git -C "${HACKABLE_DIFFUSION_REF}" rev-parse HEAD)",
     "train_loop": "${TRAIN_LOOP}",
+    "log_losses": "${LOG_LOSSES}",
     "xla_flags": "${XLA_FLAGS}",
 }
 path = pathlib.Path("${RESULT_JSON}")

@@ -2,7 +2,7 @@
 
 Date: 2026-06-12
 
-Goal: compare the same official DeepMind DiffusionGemma PubMedQA Kauldron smoke
+Goal: compare the same official DeepMind DiffusionGemma PubMedQA Kauldron validation
 on RTX PRO 6000 x2 and H100 x2 after A100-80GB x2 showed fatal NCCL final-sync
 failures.
 
@@ -44,6 +44,6 @@ Both machines were destroyed after the run. Final `jl status --json` reported
 ## Conclusion
 
 The A100-80GB x2 fatal final-sync failure is not universal. The same official
-backend smoke completes on RTX PRO 6000 x2 and H100 x2. The likely culprit is
+backend validation completes on RTX PRO 6000 x2 and H100 x2. The likely culprit is
 the A100 container runtime/JAX-NCCL combination, not the official DiffusionGemma
 implementation in general.

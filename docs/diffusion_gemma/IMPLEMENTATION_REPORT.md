@@ -4,168 +4,117 @@ Date: 2026-06-12
 
 Branch: `codex/diffusion-gemma-integration`
 
-Wrapper implementation baseline: `0faad277`
+## Scope
 
-## Claim
+This report covers only the current Hackable Diffusion backend wrapper in this
+fork. The wrapper keeps the official DeepMind Gemma Diffusion, Hackable
+Diffusion, and Kauldron SFT implementation as the source of truth, and exposes
+it through Tunix-side entrypoints for controlled configuration and validation.
 
-This fork provides a Tunix-hosted wrapper for the official DeepMind
-DiffusionGemma SFT recipe. The wrapper keeps the official Gemma Diffusion,
-Hackable Diffusion, and Kauldron training implementation as the source of
-truth, while adding a Tunix-side entrypoint for setup, configuration overrides,
-controlled runs, and repeatable GPU validation.
+It does not claim that the native Tunix NNX/Qwix DiffusionGemma path is a
+drop-in replacement for the official recipe.
 
-This report is intentionally scoped to the current Hackable Diffusion backend
-wrapper. It does not claim that the native Tunix NNX/Qwix implementation is a
-production-ready replacement for the official recipe.
-
-## Files
-
-The relevant implementation files are:
+## Relevant Files
 
 - `tunix/models/diffusion_gemma/hackable_adapter.py`
 - `scripts/run_diffusion_gemma_official_backend.py`
-- `scripts/setup_diffusion_gemma_official_backend.sh`
+- `scripts/run_diffusion_gemma_official_reference.py`
+- `scripts/run_diffusion_gemma_h100x2_comparison_job.sh`
+- `scripts/summarize_diffusion_gemma_training.py`
 
-The wrapper entrypoint can be inspected with:
+## What The Wrapper Does
 
-```bash
-python scripts/run_diffusion_gemma_official_backend.py --help
-```
+The official backend remains responsible for model construction, PubMedQA/Sudoku
+recipe construction, token corruption, diffusion timestep sampling, denoising
+loss, self-conditioning, encoder loss, LoRA wrapping, optimizer construction,
+and sharding.
 
-## Integration Shape
+The Tunix wrapper is responsible for importing that backend inside this fork,
+applying run-environment overrides, launching comparable official-vs-wrapper
+runs, and collecting concise logs plus GPU memory telemetry.
 
-The official implementation remains responsible for:
+## Local Parity Evidence
 
-- DiffusionGemma model construction.
-- Hackable Diffusion SFT model and loss.
-- PubMedQA/Sudoku recipe config construction.
-- Token corruption, diffusion timestep sampling, denoising loss, and
-  self-conditioning behavior.
-- LoRA wrapping.
-- Optimizer and sharding setup.
-- Kauldron training loop.
+The local parity checks pass against official source checkouts:
 
-The Tunix fork is responsible for:
+- `scripts/verify_diffusion_gemma_official_parity.py`
+  - positions: max diff `0.0`
+  - causal prefill mask: max diff `0.0`
+  - decoder attention mask: max diff `0.0`
+  - cache `end_index`: max diff `0.0`
+  - uniform time sampling: max diff `0.0`
+  - categorical corruption tokens/mask: max diff `0.0`
+  - unweighted discrete loss mean: max diff `0.0`
+- `scripts/verify_diffusion_gemma_official_logits.py`
+  - official Gemma revision: `682e412`
+  - copied tiny-model parameter leaves: `19`, all copied with max diff `0.0`
+  - `encode_logits`: max diff `0.0`
+  - plain logits: max diff `2.8405338525772095e-08`
+  - self-conditioned logits: max diff `0.0`
 
-- Importing and launching the official recipe from inside the Tunix repository.
-- Installing or preparing the official backend dependencies.
-- Overriding work directories, checkpoint paths, step counts, LoRA rank, batch
-  size, and selected recipe constants for validation runs.
-- Exposing a stable script interface for GPU validation.
-- Capturing concise run output that can be compared across GPU environments.
+These checks validate the deterministic helper and tiny-model math paths. They
+do not prove full 26B training completion.
 
-This means the wrapper is not a reimplementation of the official algorithm. It
-is an adapter that lets Tunix run the official DiffusionGemma SFT backend in a
-controlled, reproducible way.
+## H100 x2 Comparison
 
-## Supported Modes
+Two H100 x2 JarvisLabs VMs were used for side-by-side validation:
 
-The wrapper currently exposes two execution modes:
+- Official reference VM: `425566`
+- Tunix wrapper VM: `425567`
+- Both VMs were destroyed after the run. Final `jl status --json` reported
+  `running_instances: 0` and `running_vms: 0`.
 
-- `kauldron`: calls the official Kauldron trainer loop.
-- `hybrid`: reuses official model, data, loss, and train-step objects while
-  giving Tunix more control over selected validation mechanics.
+Both runs used the same public DiffusionGemma checkpoint, official PubMedQA
+recipe geometry, LoRA rank `4`, batch size `2`, JAX `0.10.1`, CUDA 12 wheels,
+and NCCL `2.30.7`.
 
-The main compatibility signal is the `kauldron` mode, because it exercises the
-official training loop directly.
+The official reference runner and the Tunix wrapper both reached dependency
+setup, dataset preparation, JAX two-device visibility, `pmap` psum validation,
+config construction, checkpoint restore, and model load. Both discarded the
+same 17 checkpoint-only vision/mm keys.
 
-## Validation Summary
+An asynchronous 1-step hybrid run returned completion markers for both sides:
 
-The wrapper was validated with the official PubMedQA LoRA configuration:
+- Official reference: `r_be358b08`
+- Tunix wrapper: `r_3f109764`
 
-- Recipe: `pubmedqa`
-- Train loop: `kauldron`
-- LoRA rank: 4
-- Dataset batch size: 2
-- Prompt length: official recipe shape
-- Canvas layout: official recipe shape
-- Training length: 2 validation steps
-- Step metrics: skipped for validation-run stability
+That is not sufficient proof of completed training, because JAX execution is
+asynchronous. A stricter rerun forced synchronization after the train step:
 
-Passing GPU validation results:
+- Official reference strict sync: `r_3b9a2ca7`
+- Tunix wrapper strict sync: `r_b4405817`
 
-| GPU runtime | Result |
-| --- | --- |
-| H100 x2 | Completed `2/2` training steps and exited with status `0` |
-| RTX PRO 6000 x2 | Completed `2/2` training steps and exited with status `0` |
-
-Both passing runs reached the wrapper completion marker:
+Both strict-sync runs failed at the same point:
 
 ```text
-official_backend_train_complete
+jax.errors.JaxRuntimeError: INTERNAL: NCCL operation ncclAllGather(...) failed:
+invalid argument ... 'lib wrapper not initialized.' [executable_name='jit_step']
 ```
 
-This is the strongest current evidence that the fork can launch and complete
-the official DiffusionGemma Hackable Diffusion SFT path through the Tunix
-wrapper on real multi-GPU machines.
+The failing call was train-step synchronization, not Tunix-native NNX code. The
+same failure appeared in the standalone official-reference runner and in the
+Tunix wrapper that delegates to the official backend.
 
-## Example Commands
+## Current Verdict
 
-Prepare the official backend environment:
+The wrapper correctly imports and configures the official DiffusionGemma backend
+and matches official helper/logit parity checks, but the H100 x2 synchronized
+26B training step is not verified in the current JarvisLabs runtime.
 
-```bash
-bash scripts/setup_diffusion_gemma_official_backend.sh
-```
+This is not evidence that the Tunix wrapper has diverged from the official
+backend. It is evidence that the official Hackable Diffusion train step, when
+driven under this H100 x2 JAX/NCCL setup and forced to synchronize, fails inside
+`jit_step` NCCL `allGather`.
 
-Build the official recipe config without launching training:
+Treat this integration as a reference wrapper and parity scaffold, not as a
+ready H100 x2 training path.
 
-```bash
-python scripts/run_diffusion_gemma_official_backend.py \
-  --recipe pubmedqa \
-  --build_config_only \
-  --workdir /tmp/diffusion_gemma_official_backend
-```
+## Next Work
 
-Run a short official-backend validation:
-
-```bash
-python scripts/run_diffusion_gemma_official_backend.py \
-  --recipe pubmedqa \
-  --train_loop kauldron \
-  --num_train_steps 2 \
-  --dataset_batch_size 2 \
-  --lora_rank 4 \
-  --skip_step_metrics \
-  --workdir /tmp/diffusion_gemma_official_backend
-```
-
-For JarvisLabs, the same script was launched through `jl run` on the selected
-GPU machine, with the repository as the run directory.
-
-## What This Proves
-
-The current fork demonstrates that:
-
-- Tunix can host a stable entrypoint for the official DiffusionGemma SFT recipe.
-- The official Hackable Diffusion and Kauldron backend can be imported,
-  configured, and launched from the Tunix repository.
-- The official PubMedQA LoRA path completes on real 2-GPU H100 and RTX
-  PRO 6000 runtimes.
-- The integration preserves the official backend as the behavioral authority
-  instead of silently replacing it with a partial native rewrite.
-
-## What This Does Not Claim
-
-This report does not claim:
-
-- Full native Tunix NNX/Qwix parity with the official implementation.
-- Long training convergence.
-- Full fine-tuning instead of LoRA validation.
-- Serving support.
-- DPO, GRPO, or other post-training methods beyond the official SFT path.
-
-## Why This Wrapper Is Useful
-
-The wrapper gives Tunix a practical bridge to DiffusionGemma today:
-
-- It provides a known-good official reference path inside the Tunix fork.
-- It makes GPU validation repeatable with one script.
-- It gives future native Tunix work a concrete oracle for behavior and resource
-  comparison.
-- It keeps the current integration honest: the official backend is still doing
-  the model and training work, while Tunix supplies orchestration and
-  compatibility glue.
-
-The next engineering step is to use this wrapper as the reference while
-incrementally moving more behavior into native Tunix only when parity and
-memory behavior can be proven.
+- Re-run the strict official reference with a JAX/NCCL version matrix instead of
+  only `jax[cuda12]==0.10.1`.
+- Compare against the official Kauldron loop with an explicit synchronization
+  point that cannot be satisfied by asynchronous dispatch alone.
+- Keep loss/metric logging separate from train-step completion checks, because
+  host loss materialization can trigger additional collectives.
+- Use this official wrapper as the oracle while native NNX/Qwix work continues.

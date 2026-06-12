@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Mapping, MutableMapping, Sequence
 import contextlib
 import dataclasses
+import functools
 import importlib
 import json
 import pathlib
@@ -41,6 +42,8 @@ _RECIPE_MODULES = {
         "gemma.diffusion.hackable_diffusion_adapter.configs.sft_sudoku_full"
     ),
 }
+
+_LOGGED_DEVICE_LOSS_KEYS: set[tuple[str, int]] = set()
 
 
 class OfficialBackendDependencyError(ImportError):
@@ -62,6 +65,8 @@ class OfficialSFTConfig:
     workdir: Optional Kauldron workdir override.
     checkpoint_path: Optional public or local DiffusionGemma checkpoint path.
     num_train_steps: Optional train step override for controlled runs.
+    run_steps: Optional hybrid-loop step limit. This leaves the official
+      recipe schedule length unchanged while allowing short validation runs.
     checkpoint_every_n_steps: Optional checkpointer interval override.
     lora_rank: Optional LoRA rank override. This is applied before the official
       config factory is called so the official LoRA wrapper is constructed with
@@ -73,6 +78,9 @@ class OfficialSFTConfig:
       per-step metric materialization. This is intended only for controlled GPU
       runs on environments where the official multi-GPU metric all-gather fails
       after the train step has run.
+    log_losses: If true, the hybrid loop requests and logs official loss states
+      from each train step. Disable this to isolate train-step execution from
+      host-side loss materialization.
     train_loop: Training loop implementation. `kauldron` delegates to the
       official `Trainer.train()`. `hybrid` uses the official resolved model,
       data, checkpoint loader, sharding, train step, optimizer, and LoRA mask,
@@ -94,10 +102,12 @@ class OfficialSFTConfig:
   workdir: str | pathlib.Path | None = None
   checkpoint_path: str | pathlib.Path | None = None
   num_train_steps: int | None = None
+  run_steps: int | None = None
   checkpoint_every_n_steps: int | None = None
   lora_rank: int | None = None
   dataset_batch_size: int | None = None
   skip_step_metrics: bool = False
+  log_losses: bool = True
   train_loop: str = "kauldron"
   use_early_stopping: bool | None = None
   disable_evals: bool = False
@@ -190,7 +200,8 @@ class OfficialDiffusionGemmaTrainer:
     if self.config.train_loop == "hybrid":
       return run_hybrid_official_loop(
           trainer,
-          num_steps=self.config.num_train_steps or 1,
+          num_steps=self.config.run_steps or self.config.num_train_steps or 1,
+          log_losses=self.config.log_losses,
       )
     if self.config.train_loop != "kauldron":
       raise ValueError(
@@ -202,7 +213,9 @@ class OfficialDiffusionGemmaTrainer:
     return trainer.train()
 
 
-def run_hybrid_official_loop(trainer: Any, *, num_steps: int) -> dict[str, Any]:
+def run_hybrid_official_loop(
+    trainer: Any, *, num_steps: int, log_losses: bool = True
+) -> dict[str, Any]:
   """Runs official DiffusionGemma train steps without Kauldron loop syncs."""
   if num_steps < 1:
     raise ValueError(f"num_steps must be positive, got {num_steps}.")
@@ -250,21 +263,28 @@ def run_hybrid_official_loop(trainer: Any, *, num_steps: int) -> dict[str, Any]:
     state, aux = trainstep.step(
         state,
         batch,
-        return_losses=True,
+        return_losses=log_losses,
         return_metrics=False,
         return_summaries=False,
         checkify_error_categories=trainer.checkify_error_categories,
     )
+    _block_first_array(state)
     if trainer.checkify_error_categories:
       jax.device_get(aux.error).throw()
 
-    losses = _safe_average_loss_values(getattr(aux, "loss_states", None))
+    logged_losses = []
+    if log_losses:
+      logged_losses = _emit_device_loss_values(
+          getattr(aux, "loss_states", None),
+          loop_step=loop_step,
+          state_step=loop_step + 1,
+      )
     print(
         _json_dumps({
             "event": "official_backend_hybrid_step_complete",
             "loop_step": loop_step,
             "state_step": loop_step + 1,
-            "losses": losses,
+            "logged_losses": logged_losses,
         }),
         flush=True,
     )
@@ -405,6 +425,106 @@ def _safe_average_loss_values(loss_states: Any) -> dict[str, float]:
   return values
 
 
+def _emit_device_loss_values(
+    loss_states: Any,
+    *,
+    loop_step: int,
+    state_step: int,
+) -> list[str]:
+  """Logs loss scalars through partitioned device callbacks."""
+  if loss_states is None:
+    return []
+
+  try:
+    import jax  # pylint: disable=g-import-not-at-top
+    import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    raise OfficialBackendDependencyError(
+        "Device loss logging requires jax."
+    ) from exc
+
+  metric_names: list[str] = []
+  leaves = jax.tree_util.tree_flatten_with_path(
+      loss_states,
+      is_leaf=_is_loss_average_state,
+  )[0]
+  for path, state in leaves:
+    if not _is_loss_average_state(state):
+      continue
+    metric_name = f"losses/{_jax_path_to_string(path)}"
+    total = getattr(state, "total", getattr(state, "value", 0.0))
+    count = state.count
+    done = _device_loss_emitter(metric_name)(
+        total,
+        count,
+        jnp.asarray(loop_step, dtype=jnp.int32),
+        jnp.asarray(state_step, dtype=jnp.int32),
+    )
+    done.block_until_ready()
+    if hasattr(jax, "effects_barrier"):
+      jax.effects_barrier()
+    metric_names.append(metric_name)
+  return metric_names
+
+
+@functools.lru_cache(maxsize=None)
+def _device_loss_emitter(metric_name: str):
+  import jax  # pylint: disable=g-import-not-at-top
+  import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+
+  def emit(total, count, loop_step, state_step):
+    total = jnp.asarray(total)
+    count = jnp.asarray(count)
+    value = jnp.where(count == 0, jnp.zeros_like(total), total / count)
+    jax.debug.callback(
+        functools.partial(_log_device_loss, metric_name),
+        value,
+        total,
+        count,
+        loop_step,
+        state_step,
+        ordered=False,
+        partitioned=True,
+    )
+    return jnp.zeros_like(total)
+
+  return jax.jit(emit)
+
+
+def _log_device_loss(
+    metric_name: str,
+    value: Any,
+    total: Any,
+    count: Any,
+    loop_step: Any,
+    state_step: Any,
+) -> None:
+  try:
+    import numpy as np  # pylint: disable=g-import-not-at-top
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    raise OfficialBackendDependencyError(
+        "Device loss logging requires numpy."
+    ) from exc
+
+  step = int(np.asarray(state_step).reshape(-1)[0])
+  key = (metric_name, step)
+  if key in _LOGGED_DEVICE_LOSS_KEYS:
+    return
+  _LOGGED_DEVICE_LOSS_KEYS.add(key)
+  print(
+      _json_dumps({
+          "event": "diffusion_gemma_hybrid_loss",
+          "metric": metric_name,
+          "step": step,
+          "loop_step": int(np.asarray(loop_step).reshape(-1)[0]),
+          "value": float(np.asarray(value).reshape(-1)[0]),
+          "total": float(np.asarray(total).reshape(-1)[0]),
+          "count": float(np.asarray(count).reshape(-1)[0]),
+      }),
+      flush=True,
+  )
+
+
 def _addressable_param_checksum(
     tree: Any,
     predicate,
@@ -432,13 +552,13 @@ def _addressable_param_checksum(
       break
 
     if isinstance(leaf, jax.Array):
-      if hasattr(leaf, "addressable_data"):
+      if getattr(leaf, "addressable_shards", None):
+        shard_arrays = [shard.data for shard in leaf.addressable_shards]
+      elif hasattr(leaf, "addressable_data"):
         shard_arrays = [
             leaf.addressable_data(i)
             for i in range(len(leaf.addressable_shards))
         ]
-      else:
-        shard_arrays = [shard.data for shard in leaf.addressable_shards]
     else:
       shard_arrays = [leaf]
     for shard_array in shard_arrays:
@@ -461,6 +581,15 @@ def _is_loss_average_state(value: Any) -> bool:
   )
 
 
+def _block_first_array(tree: Any) -> None:
+  import jax  # pylint: disable=g-import-not-at-top
+
+  for leaf in jax.tree_util.tree_leaves(tree):
+    if isinstance(leaf, jax.Array):
+      leaf.block_until_ready()
+      return
+
+
 def _safe_array_scalar(value: Any) -> float:
   try:
     import jax  # pylint: disable=g-import-not-at-top
@@ -471,10 +600,10 @@ def _safe_array_scalar(value: Any) -> float:
     ) from exc
 
   if isinstance(value, jax.Array):
-    if hasattr(value, "addressable_data"):
-      value = value.addressable_data(0)
-    elif getattr(value, "addressable_shards", None):
+    if getattr(value, "addressable_shards", None):
       value = value.addressable_shards[0].data
+    elif hasattr(value, "addressable_data"):
+      value = value.addressable_data(0)
   host_value = np.asarray(jax.device_get(value))
   if host_value.size == 0:
     return 0.0

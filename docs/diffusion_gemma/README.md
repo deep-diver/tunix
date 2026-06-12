@@ -46,6 +46,13 @@ and trainstep objects but drives the step loop from the Tunix wrapper. It is a
 compatibility validation path, not a replacement for the long-term NNX/Qwix model
 family integration.
 
+Current H100 x2 status: the official-reference runner and the Tunix wrapper both
+load the public 26B checkpoint and enter the official PubMedQA LoRA train step,
+but strict post-step synchronization fails for both with the same JAX/NCCL
+`ncclAllGather ... invalid argument` error inside `jit_step`. Treat older
+completion markers that did not force synchronization as asynchronous dispatch
+evidence, not as proof of completed training.
+
 Example PubMedQA validation command on a machine where the official repos are
 available:
 

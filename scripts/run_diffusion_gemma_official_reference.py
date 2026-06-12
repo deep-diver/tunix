@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping, Sequence
 import contextlib
+import functools
 import importlib
 import json
 import pathlib
@@ -36,6 +37,8 @@ _RECIPE_MODULES = {
         "gemma.diffusion.hackable_diffusion_adapter.configs.sft_sudoku_full"
     ),
 }
+
+_LOGGED_DEVICE_LOSS_KEYS: set[tuple[str, int]] = set()
 
 
 def _parse_key_value(items: list[str]) -> dict[str, Any]:
@@ -63,6 +66,15 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--workdir", default=None)
   parser.add_argument("--checkpoint_path", default=None)
   parser.add_argument("--num_train_steps", type=int, default=None)
+  parser.add_argument(
+      "--run_steps",
+      type=int,
+      default=None,
+      help=(
+          "Limit the hybrid loop to this many local steps without changing "
+          "the official recipe's num_train_steps schedule."
+      ),
+  )
   parser.add_argument("--checkpoint_every_n_steps", type=int, default=None)
   parser.add_argument("--lora_rank", type=int, default=None)
   parser.add_argument("--dataset_batch_size", type=int, default=None)
@@ -89,6 +101,16 @@ def parse_args() -> argparse.Namespace:
           "Use the upstream Kauldron Trainer loop, or a minimal loop that "
           "reuses upstream model/data/loss/trainstep objects and logs losses "
           "from addressable shards."
+      ),
+  )
+  parser.add_argument(
+      "--log_losses",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help=(
+          "In the hybrid loop, request and log loss states from the official "
+          "train step. Disable this to isolate train-step execution from "
+          "host-side loss materialization."
       ),
   )
   parser.add_argument("--config_override", action="append", default=[])
@@ -142,7 +164,11 @@ def main() -> None:
       return
     trainer = konfig.resolve(cfg)
     if args.train_loop == "hybrid":
-      _run_hybrid_official_loop(trainer, num_steps=args.num_train_steps or 1)
+      _run_hybrid_official_loop(
+          trainer,
+          num_steps=args.run_steps or args.num_train_steps or 1,
+          log_losses=args.log_losses,
+      )
     else:
       trainer.train()
   _json_event(
@@ -150,11 +176,15 @@ def main() -> None:
       recipe=args.recipe,
       workdir=args.workdir,
       num_train_steps=args.num_train_steps,
+      run_steps=args.run_steps,
       train_loop=args.train_loop,
+      log_losses=args.log_losses,
   )
 
 
-def _run_hybrid_official_loop(trainer: Any, *, num_steps: int) -> None:
+def _run_hybrid_official_loop(
+    trainer: Any, *, num_steps: int, log_losses: bool
+) -> None:
   """Runs upstream train steps while extracting losses without all-gathers."""
   import jax  # pylint: disable=g-import-not-at-top
   from kauldron.train import train_loop  # pylint: disable=g-import-not-at-top
@@ -194,20 +224,27 @@ def _run_hybrid_official_loop(trainer: Any, *, num_steps: int) -> None:
     state, aux = trainstep.step(
         state,
         batch,
-        return_losses=True,
+        return_losses=log_losses,
         return_metrics=False,
         return_summaries=False,
         checkify_error_categories=trainer.checkify_error_categories,
     )
+    _block_first_array(state)
     if trainer.checkify_error_categories:
       jax.device_get(aux.error).throw()
 
-    losses = _safe_average_loss_values(getattr(aux, "loss_states", None))
+    logged_losses = []
+    if log_losses:
+      logged_losses = _emit_device_loss_values(
+          getattr(aux, "loss_states", None),
+          loop_step=loop_step,
+          state_step=loop_step + 1,
+      )
     _json_event(
         event="official_reference_hybrid_step_complete",
         loop_step=loop_step,
         state_step=loop_step + 1,
-        losses=losses,
+        logged_losses=logged_losses,
     )
 
   result = {
@@ -322,6 +359,93 @@ def _safe_average_loss_values(loss_states: Any) -> dict[str, float]:
   return values
 
 
+def _emit_device_loss_values(
+    loss_states: Any,
+    *,
+    loop_step: int,
+    state_step: int,
+) -> list[str]:
+  """Logs loss scalars through partitioned device callbacks."""
+  if loss_states is None:
+    return []
+
+  import jax  # pylint: disable=g-import-not-at-top
+  import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+
+  metric_names: list[str] = []
+  leaves = jax.tree_util.tree_flatten_with_path(
+      loss_states,
+      is_leaf=_is_loss_average_state,
+  )[0]
+  for path, state in leaves:
+    if not _is_loss_average_state(state):
+      continue
+    metric_name = f"losses/{_jax_path_to_string(path)}"
+    total = getattr(state, "total", getattr(state, "value", 0.0))
+    count = state.count
+    done = _device_loss_emitter(metric_name)(
+        total,
+        count,
+        jnp.asarray(loop_step, dtype=jnp.int32),
+        jnp.asarray(state_step, dtype=jnp.int32),
+    )
+    done.block_until_ready()
+    if hasattr(jax, "effects_barrier"):
+      jax.effects_barrier()
+    metric_names.append(metric_name)
+  return metric_names
+
+
+@functools.lru_cache(maxsize=None)
+def _device_loss_emitter(metric_name: str):
+  import jax  # pylint: disable=g-import-not-at-top
+  import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+
+  def emit(total, count, loop_step, state_step):
+    total = jnp.asarray(total)
+    count = jnp.asarray(count)
+    value = jnp.where(count == 0, jnp.zeros_like(total), total / count)
+    jax.debug.callback(
+        functools.partial(_log_device_loss, metric_name),
+        value,
+        total,
+        count,
+        loop_step,
+        state_step,
+        ordered=False,
+        partitioned=True,
+    )
+    return jnp.zeros_like(total)
+
+  return jax.jit(emit)
+
+
+def _log_device_loss(
+    metric_name: str,
+    value: Any,
+    total: Any,
+    count: Any,
+    loop_step: Any,
+    state_step: Any,
+) -> None:
+  import numpy as np  # pylint: disable=g-import-not-at-top
+
+  step = int(np.asarray(state_step).reshape(-1)[0])
+  key = (metric_name, step)
+  if key in _LOGGED_DEVICE_LOSS_KEYS:
+    return
+  _LOGGED_DEVICE_LOSS_KEYS.add(key)
+  _json_event(
+      event="diffusion_gemma_hybrid_loss",
+      metric=metric_name,
+      step=step,
+      loop_step=int(np.asarray(loop_step).reshape(-1)[0]),
+      value=float(np.asarray(value).reshape(-1)[0]),
+      total=float(np.asarray(total).reshape(-1)[0]),
+      count=float(np.asarray(count).reshape(-1)[0]),
+  )
+
+
 def _is_loss_average_state(value: Any) -> bool:
   return (
       hasattr(value, "count")
@@ -329,15 +453,24 @@ def _is_loss_average_state(value: Any) -> bool:
   )
 
 
+def _block_first_array(tree: Any) -> None:
+  import jax  # pylint: disable=g-import-not-at-top
+
+  for leaf in jax.tree_util.tree_leaves(tree):
+    if isinstance(leaf, jax.Array):
+      leaf.block_until_ready()
+      return
+
+
 def _safe_array_scalar(value: Any) -> float:
   import jax  # pylint: disable=g-import-not-at-top
   import numpy as np  # pylint: disable=g-import-not-at-top
 
   if isinstance(value, jax.Array):
-    if hasattr(value, "addressable_data"):
-      value = value.addressable_data(0)
-    elif getattr(value, "addressable_shards", None):
+    if getattr(value, "addressable_shards", None):
       value = value.addressable_shards[0].data
+    elif hasattr(value, "addressable_data"):
+      value = value.addressable_data(0)
   host_value = np.asarray(jax.device_get(value))
   if host_value.size == 0:
     return 0.0

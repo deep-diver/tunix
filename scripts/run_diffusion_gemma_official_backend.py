@@ -78,6 +78,15 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--workdir", default=None)
   parser.add_argument("--checkpoint_path", default=None)
   parser.add_argument("--num_train_steps", type=int, default=1)
+  parser.add_argument(
+      "--run_steps",
+      type=int,
+      default=None,
+      help=(
+          "Limit the hybrid loop to this many local steps without changing "
+          "the official recipe's num_train_steps schedule."
+      ),
+  )
   parser.add_argument("--checkpoint_every_n_steps", type=int, default=None)
   parser.add_argument("--lora_rank", type=int, default=None)
   parser.add_argument(
@@ -120,6 +129,16 @@ def parse_args() -> argparse.Namespace:
       ),
   )
   parser.add_argument(
+      "--log_losses",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help=(
+          "In the hybrid loop, request and log loss states from the official "
+          "train step. Disable this to isolate train-step execution from "
+          "host-side loss materialization."
+      ),
+  )
+  parser.add_argument(
       "--train_loop",
       choices=["kauldron", "hybrid"],
       default="kauldron",
@@ -159,10 +178,12 @@ def main() -> None:
       workdir=args.workdir,
       checkpoint_path=args.checkpoint_path,
       num_train_steps=args.num_train_steps,
+      run_steps=args.run_steps,
       checkpoint_every_n_steps=args.checkpoint_every_n_steps,
       lora_rank=args.lora_rank,
       dataset_batch_size=args.dataset_batch_size,
       skip_step_metrics=args.skip_step_metrics,
+      log_losses=args.log_losses,
       train_loop=args.train_loop,
       use_early_stopping=args.use_early_stopping,
       disable_evals=args.disable_evals,
@@ -227,7 +248,9 @@ def main() -> None:
           "recipe": args.recipe,
           "workdir": args.workdir,
           "num_train_steps": args.num_train_steps,
+          "run_steps": args.run_steps,
           "skip_step_metrics": args.skip_step_metrics,
+          "log_losses": args.log_losses,
           "train_loop": args.train_loop,
       }),
       flush=True,

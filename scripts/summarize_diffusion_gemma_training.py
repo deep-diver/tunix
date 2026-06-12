@@ -51,6 +51,7 @@ def main() -> None:
       "log_scalars": (
           _read_log_scalars(pathlib.Path(args.log)) if args.log else {}
       ),
+      "log_events": _read_log_events(pathlib.Path(args.log)) if args.log else {},
       "gpu_memory": (
           _read_gpu_csv(pathlib.Path(args.gpu_csv)) if args.gpu_csv else {}
       ),
@@ -120,6 +121,49 @@ def _read_log_scalars(log_path: pathlib.Path) -> dict[str, Any]:
   }
 
 
+def _read_log_events(log_path: pathlib.Path) -> dict[str, Any]:
+  if not log_path.exists():
+    return {"error": f"log not found: {log_path}", "events": {}}
+
+  events: dict[str, dict[str, Any]] = {}
+  for line_no, line in enumerate(
+      log_path.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+  ):
+    line = line.strip()
+    if not line.startswith("{"):
+      continue
+    try:
+      payload = json.loads(line)
+    except json.JSONDecodeError:
+      continue
+    if not isinstance(payload, dict):
+      continue
+    event_name = payload.get("event")
+    if not isinstance(event_name, str):
+      continue
+    entry = events.setdefault(
+        event_name,
+        {
+            "count": 0,
+            "first": None,
+            "last": None,
+            "last_state_step": None,
+        },
+    )
+    record = {"line": line_no, **payload}
+    entry["count"] += 1
+    if entry["first"] is None:
+      entry["first"] = record
+    entry["last"] = record
+    step = payload.get("state_step", payload.get("step"))
+    if isinstance(step, int):
+      entry["last_state_step"] = step
+  return {
+      "path": str(log_path),
+      "events": events,
+  }
+
+
 def _read_json_line_scalars(
     line: str,
     line_no: int,
@@ -155,6 +199,15 @@ def _read_json_line_scalars(
           "line": line_no,
           "value": float(value),
       })
+
+  metric_name = payload.get("metric")
+  value = payload.get("value")
+  if isinstance(metric_name, str) and isinstance(value, (int, float)):
+    metrics.setdefault(metric_name, []).append({
+        "step": step,
+        "line": line_no,
+        "value": float(value),
+    })
 
 
 def _read_gpu_csv(path: pathlib.Path) -> dict[str, Any]:
