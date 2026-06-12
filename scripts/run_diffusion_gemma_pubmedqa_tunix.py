@@ -743,6 +743,7 @@ def _train_with_separate_loss_jits(
         trainer.model, batch, sc_logits, do_self_cond
     )
     _block_until_ready_first(decoder_loss)
+    _block_until_ready_state(decoder_grads)
     del sc_prefill, sc_logits, do_self_cond
     if step == 0 or (step + 1) % 50 == 0:
       _log(
@@ -756,6 +757,7 @@ def _train_with_separate_loss_jits(
         trainer.model, batch
     )
     _block_until_ready_first(encoder_loss)
+    _block_until_ready_state(encoder_grads)
     if step == 0 or (step + 1) % 50 == 0:
       _log(
           "separate_loss_jit_phase",
