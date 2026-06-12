@@ -569,6 +569,12 @@ def _block_until_ready_first(value: Any) -> None:
     leaves[0].block_until_ready()
 
 
+def _base_param_state(model: nnx.Module) -> Any:
+  return nnx.state(
+      model, nnx.filterlib.All(nnx.Param, nnx.filterlib.Not(nnx.LoRAParam))
+  )
+
+
 def _checkpoint_dir(args: argparse.Namespace, *, prefix: str) -> str:
   ckpt_dir = args.checkpoint_dir or tempfile.mkdtemp(prefix=prefix)
   pathlib.Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
@@ -1092,9 +1098,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
   lora_before_checksums = _small_leaf_checksums(
       nnx.state(model, nnx.LoRAParam), limit=32, max_size=262144
   )
-  base_before_checksums = _small_leaf_checksums(
-      nnx.state(model, nnx.filterlib.Not(nnx.LoRAParam))
-  )
+  base_before_checksums = _small_leaf_checksums(_base_param_state(model))
   ckpt_dir = _checkpoint_dir(args, prefix="diffusion_gemma_pubmedqa_ckpt_")
   optimizer = optax.chain(
       optax.clip_by_global_norm(args.max_grad_norm),
@@ -1149,7 +1153,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       lora_before_checksums, nnx.state(model, nnx.LoRAParam)
   )
   base_checksum_delta = _max_checksum_delta(
-      base_before_checksums, nnx.state(model, nnx.filterlib.Not(nnx.LoRAParam))
+      base_before_checksums, _base_param_state(model)
   )
   result = {
       "steps": trainer.train_steps,
