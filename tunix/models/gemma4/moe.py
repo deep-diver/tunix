@@ -241,7 +241,7 @@ class MoERagged(nnx.Module):
     )
     return out
 
-  def __call__(self, x):
+  def __call__(self, x, *, unnormalized_x=None):
     var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
     router_input = x * jax.lax.rsqrt(var + 1e-06).astype(x.dtype)
 
@@ -275,5 +275,7 @@ class MoERagged(nnx.Module):
           router_delta * _moe_lora_scale(self)
       ).astype(logits.dtype)
     weights, choices = self._router(logits)
-    out = self._run_ffw_and_routing(x, choices, weights)
+    if unnormalized_x is None:
+      unnormalized_x = x
+    out = self._run_ffw_and_routing(unnormalized_x, choices, weights)
     return out

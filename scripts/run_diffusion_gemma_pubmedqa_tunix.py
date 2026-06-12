@@ -471,6 +471,7 @@ def _load_tiny_model(args: argparse.Namespace, vocab_size: int):
       use_sliding_window_kv_cache=False,
       final_logit_softcap=None,
       remat_config=_remat_config_from_args(args),
+      attention_implementation=_attention_implementation_from_args(args),
       dtype=jnp.float32,
       param_dtype=jnp.float32,
   )
@@ -503,16 +504,31 @@ def _remat_policy_name(args: argparse.Namespace) -> str:
   return policy
 
 
+def _attention_implementation_from_args(args: argparse.Namespace) -> str | None:
+  if args.attention_implementation == "default":
+    return None
+  return args.attention_implementation
+
+
+def _attention_implementation_name(args: argparse.Namespace) -> str:
+  return args.attention_implementation
+
+
 def _load_real_model(args: argparse.Namespace):
   mesh_fsdp, mesh_tp = _resolve_mesh_axes(args)
   mesh = _mesh(mesh_fsdp, mesh_tp)
   remat_config = _remat_config_from_args(args)
+  model_config = diffusion_model.ModelConfig.diffusion_gemma_a26b_a4b(
+      remat_config=remat_config
+  )
+  model_config = dataclasses.replace(
+      model_config,
+      attention_implementation=_attention_implementation_from_args(args),
+  )
   with mesh:
     return diffusion_params.create_model_from_checkpoint(
         args.checkpoint,
-        diffusion_model.ModelConfig.diffusion_gemma_a26b_a4b(
-            remat_config=remat_config
-        ),
+        model_config,
         mesh=mesh,
         dtype=_dtype_from_name(args.dtype),
         restore_concurrent_gb=args.restore_concurrent_gb,
@@ -1037,6 +1053,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         moe_lora=args.moe_lora,
         remat_decoder=args.remat_decoder,
         remat_policy=_remat_policy_name(args),
+        attention_implementation=_attention_implementation_name(args),
         load_only=True,
     )
     trainable_summary = _state_summary(nnx.state(model, nnx.LoRAParam))
@@ -1073,6 +1090,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "moe_lora": args.moe_lora,
         "remat_decoder": args.remat_decoder,
         "remat_policy": _remat_policy_name(args),
+        "attention_implementation": _attention_implementation_name(args),
         "mesh_fsdp": mesh_fsdp,
         "mesh_tp": mesh_tp,
         "restore_concurrent_gb": args.restore_concurrent_gb,
@@ -1141,6 +1159,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       moe_lora=args.moe_lora,
       remat_decoder=args.remat_decoder,
       remat_policy=_remat_policy_name(args),
+      attention_implementation=_attention_implementation_name(args),
   )
   trainable_summary = _state_summary(nnx.state(model, nnx.LoRAParam))
   frozen_summary = _state_summary(
@@ -1249,6 +1268,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "moe_lora": args.moe_lora,
         "remat_decoder": args.remat_decoder,
         "remat_policy": _remat_policy_name(args),
+        "attention_implementation": _attention_implementation_name(args),
         "encoder_loss_chunk_size": args.encoder_loss_chunk_size,
         "mesh_fsdp": mesh_fsdp,
         "mesh_tp": mesh_tp,
@@ -1373,6 +1393,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       "moe_lora": args.moe_lora,
       "remat_decoder": args.remat_decoder,
       "remat_policy": _remat_policy_name(args),
+      "attention_implementation": _attention_implementation_name(args),
       "prefill_decode_only_last_token": args.encoder_loss_weight == 0.0,
       "encoder_loss_chunk_size": args.encoder_loss_chunk_size,
       "split_loss_gradients": args.split_loss_gradients,
@@ -1576,6 +1597,16 @@ def parse_args() -> argparse.Namespace:
           "Explicit Gemma4 rematerialization policy. Overrides"
           " --remat_decoder when set. Use 'block', 'full', or 'full_offload'"
           " for lower peak memory on long prompt encoder-gradient runs."
+      ),
+  )
+  parser.add_argument(
+      "--attention_implementation",
+      choices=["default", "cudnn"],
+      default="default",
+      help=(
+          "Attention implementation for long GPU prefill. 'default' keeps the "
+          "existing explicit softmax path; 'cudnn' uses JAX cuDNN flash "
+          "attention where supported."
       ),
   )
   parser.add_argument("--restore_concurrent_gb", type=int, default=16)

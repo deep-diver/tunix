@@ -158,6 +158,7 @@ class ModelConfig:
   dtype: jnp.dtype = jnp.float32
   use_flash_attention: bool = False
   flash_attention_block_size: int = 1024
+  attention_implementation: str | None = None
   use_sliding_window_kv_cache: bool = True
 
   # MoE config
@@ -789,7 +790,24 @@ class Attention(nnx.Module):
 
     _, _, qh, _ = query_proj.shape
 
-    if self.config.use_flash_attention and seq_len > 1:
+    if (
+        self.config.attention_implementation == 'cudnn'
+        and seq_len > 1
+        and key_proj.shape[1] == seq_len
+    ):
+      local_window_size = None
+      if self.attn_type == AttentionType.LOCAL_SLIDING:
+        local_window_size = (self.config.sliding_window_size - 1, 0)
+      encoded = jax.nn.dot_product_attention(
+          query_proj,
+          key_proj,
+          value_proj,
+          mask=attn_mask[:, None, :, :],
+          scale=1.0,
+          local_window_size=local_window_size,
+          implementation='cudnn',
+      )
+    elif self.config.use_flash_attention and seq_len > 1:
       query_proj = query_proj.transpose(0, 2, 1, 3)
       key_proj = key_proj.transpose(0, 2, 1, 3)
       value_proj = value_proj.transpose(0, 2, 1, 3)
@@ -1206,7 +1224,7 @@ class DecoderLayer(nnx.Module):
     if self.config.enable_moe:
       ffw = self.dense_post_ffw_norm(ffw)
       moe_norm_ffw = self.moe_pre_ffw_norm(attn)
-      moe_out = self.moe(moe_norm_ffw)
+      moe_out = self.moe(moe_norm_ffw, unnormalized_x=attn)
       moe_out = self.moe_post_ffw_norm(moe_out)
       ffw += moe_out
     ffw = self.post_ffw_norm(ffw)
