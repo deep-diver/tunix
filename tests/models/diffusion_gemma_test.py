@@ -26,9 +26,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from tunix.models import automodel
+from tunix.models import low_peak_params
 from tunix.models import naming
 from tunix.models.diffusion_gemma import hackable_adapter
 from tunix.models.diffusion_gemma import model as diffusion_model
+from tunix.models.diffusion_gemma import params as diffusion_params
 from tunix.models.diffusion_gemma import sft as diffusion_sft
 from tunix.models.gemma4 import model as gemma4_model
 from tunix.sft import peft_trainer
@@ -124,6 +126,147 @@ def _official_reference_masked_ce(logits, targets, mask):
 
 
 class DiffusionGemmaTest(absltest.TestCase):
+
+  def test_low_peak_restore_target_excludes_adapter_leaves(self):
+    initialized = {
+        "layers": {
+            0: {
+                "attn": {
+                    "q_einsum": {"kernel": jnp.zeros((2, 3))},
+                    "q_einsum_lora": {
+                        "lora_a": jnp.ones((2, 1)),
+                        "lora_b": jnp.ones((1, 3)),
+                    },
+                }
+            }
+        },
+        "self_conditioner": {"ffw": {"down_proj": {"kernel": jnp.zeros((3, 2))}}},
+    }
+
+    info = low_peak_params.build_restore_target(
+        initialized,
+        preserve_predicate=low_peak_params.path_contains_lora,
+        dtype=jnp.bfloat16,
+    )
+    flat_target = jax.tree_util.tree_flatten_with_path(info.target)[0]
+    target_paths = {
+        tuple(part.key for part in path)
+        for path, _ in flat_target
+    }
+
+    self.assertIn(
+        ("layers", 0, "attn", "q_einsum", "kernel"), target_paths
+    )
+    self.assertIn(
+        ("self_conditioner", "ffw", "down_proj", "kernel"), target_paths
+    )
+    self.assertNotIn(
+        ("layers", 0, "attn", "q_einsum_lora", "lora_a"), target_paths
+    )
+    self.assertEqual(
+        info.preserved_paths,
+        (
+            ("layers", 0, "attn", "q_einsum_lora", "lora_a"),
+            ("layers", 0, "attn", "q_einsum_lora", "lora_b"),
+        ),
+    )
+    self.assertEqual(
+        info.target["layers"][0]["attn"]["q_einsum"]["kernel"].dtype,
+        jnp.bfloat16,
+    )
+
+  def test_low_peak_merge_restores_base_and_preserves_adapters(self):
+    initialized = {
+        "base": {"kernel": jnp.zeros((2, 2))},
+        "block_lora": {
+            "lora_a": jnp.full((2, 1), 7.0),
+            "lora_b": jnp.full((1, 2), 9.0),
+        },
+    }
+    restored = {
+        "base": {"kernel": jnp.full((2, 2), 3.0)},
+        "block_lora": {
+            "lora_a": jnp.full((2, 1), 100.0),
+        },
+        "unused": {"kernel": jnp.ones((1,))},
+    }
+
+    result = low_peak_params.merge_restored_state(
+        initialized,
+        restored,
+        preserve_predicate=low_peak_params.path_contains_lora,
+        strict=False,
+    )
+
+    np.testing.assert_array_equal(
+        result.tree["base"]["kernel"], jnp.full((2, 2), 3.0)
+    )
+    np.testing.assert_array_equal(
+        result.tree["block_lora"]["lora_a"], jnp.full((2, 1), 7.0)
+    )
+    np.testing.assert_array_equal(
+        result.tree["block_lora"]["lora_b"], jnp.full((1, 2), 9.0)
+    )
+    self.assertEqual(result.report.restored_paths, (("base", "kernel"),))
+    self.assertEqual(
+        result.report.skipped_preserved_restore_paths,
+        (("block_lora", "lora_a"),),
+    )
+    self.assertEqual(result.report.extra_paths, (("unused", "kernel"),))
+
+  def test_low_peak_checkpoint_mapper_rejects_collisions(self):
+    checkpoint = {
+        "transformer/layer_0/attn/q_einsum": {"w": jnp.ones((2, 2))},
+        "layer_0": {"attn": {"q_einsum": {"w": jnp.zeros((2, 2))}}},
+    }
+
+    def mapper(path, _value):
+      parts = []
+      for part in path:
+        parts.extend(str(part).split("/"))
+      if parts[0] == "transformer":
+        parts = parts[1:]
+      return tuple(parts)
+
+    with self.assertRaisesRegex(ValueError, "Multiple checkpoint leaves map"):
+      low_peak_params.map_checkpoint_tree(checkpoint, mapper)
+
+  def test_diffusion_gemma_merge_can_preserve_lora_leaves(self):
+    initialized = {
+        "layers": {
+            0: {
+                "mlp": {
+                    "gate_proj": {"kernel": jnp.zeros((2, 3))},
+                    "gate_proj_lora": {"lora_a": jnp.full((2, 1), 5.0)},
+                }
+            }
+        }
+    }
+    mapped = {
+        "layers": {
+            0: {
+                "mlp": {
+                    "gate_proj": {"kernel": jnp.ones((2, 3))},
+                    "gate_proj_lora": {"lora_a": jnp.full((2, 1), 99.0)},
+                }
+            }
+        }
+    }
+
+    merged = diffusion_params._merge_with_initialized_state(  # pylint: disable=protected-access
+        initialized,
+        mapped,
+        preserve_predicate=low_peak_params.path_contains_lora,
+    )
+
+    np.testing.assert_array_equal(
+        merged["layers"][0]["mlp"]["gate_proj"]["kernel"],
+        jnp.ones((2, 3)),
+    )
+    np.testing.assert_array_equal(
+        merged["layers"][0]["mlp"]["gate_proj_lora"]["lora_a"],
+        jnp.full((2, 1), 5.0),
+    )
 
   def test_official_backend_dependency_probe_is_non_throwing(self):
     report = hackable_adapter.check_dependencies()
@@ -273,6 +416,58 @@ class DiffusionGemmaTest(absltest.TestCase):
     no_remat_leaves = jax.tree.leaves(nnx.state(no_remat, nnx.LoRAParam))
     remat_leaves = jax.tree.leaves(nnx.state(remat, nnx.LoRAParam))
     self.assertEqual(len(no_remat_leaves), len(remat_leaves))
+
+  def test_lora_targets_moe_params_used_by_official_all_linear(self):
+    base_cfg = diffusion_model.ModelConfig.tiny(
+        vocab_size=32,
+        num_layers=1,
+        embed_dim=16,
+        hidden_dim=32,
+        num_heads=2,
+        head_dim=8,
+        num_kv_heads=1,
+    )
+    cfg = dataclasses.replace(
+        base_cfg,
+        enable_moe=True,
+        num_experts=4,
+        num_experts_per_tok=2,
+        expert_dim=8,
+        moe_dense_hidden_dim=16,
+    )
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        cfg,
+        rngs=nnx.Rngs(0),
+    )
+    model = diffusion_sft.apply_lora(model, rank=2, alpha=4.0)
+    lora_paths = {
+        "/".join(str(part.key) for part in path)
+        for path, _ in jax.tree_util.tree_flatten_with_path(
+            nnx.to_pure_dict(nnx.state(model, nnx.LoRAParam))
+        )[0]
+    }
+
+    for suffix in (
+        "router_logits_lora_a",
+        "router_logits_lora_b",
+        "gating_einsum_lora_a",
+        "gating_einsum_lora_b",
+        "linear_lora_a",
+        "linear_lora_b",
+    ):
+      self.assertIn(f"layers/0/moe/{suffix}", lora_paths)
+
+    moe = model.layers[0].moe
+    x = jax.random.normal(jax.random.PRNGKey(0), (1, 3, cfg.embed_dim))
+    before = moe(x)
+    moe.gating_einsum_lora_b.value = (
+        jnp.ones_like(moe.gating_einsum_lora_b.value) * 0.01
+    )
+    moe.linear_lora_b.value = (
+        jnp.ones_like(moe.linear_lora_b.value) * 0.01
+    )
+    after = moe(x)
+    self.assertTrue(bool(jnp.any(before != after)))
 
   def test_sft_loss_is_finite(self):
     vocab_size = 32

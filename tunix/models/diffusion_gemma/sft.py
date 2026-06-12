@@ -25,13 +25,15 @@ import jax
 import jax.numpy as jnp
 import optax
 import qwix
+from tunix.models.gemma4 import moe as gemma4_moe
 from tunix.sft import peft_trainer
 
 
 PAD_TOKEN = 0
 DEFAULT_LORA_MODULE_PATH = (
     r".*q_einsum|.*kv_einsum|.*k_einsum|.*attn_vec_einsum|"
-    r".*gate_proj|.*up_proj|.*down_proj"
+    r".*gate_proj|.*up_proj|.*down_proj|.*moe.*|"
+    r".*router_logits|.*gating_einsum|.*linear"
 )
 
 
@@ -882,6 +884,68 @@ def gen_model_input_fn(batch: Any) -> dict[str, jax.Array]:
   return vars(batch)
 
 
+def _init_lora_param(
+    rngs: nnx.Rngs,
+    shape: tuple[int, ...],
+    dtype: jnp.dtype,
+    *,
+    zeros: bool = False,
+) -> nnx.LoRAParam:
+  if zeros:
+    value = jnp.zeros(shape, dtype=dtype)
+  else:
+    value = nnx.initializers.normal(stddev=0.01, dtype=dtype)(
+        rngs.params(), shape
+    )
+  return nnx.LoRAParam(value)
+
+
+def _ensure_moe_lora_param(
+    module: gemma4_moe.MoERagged,
+    name: str,
+    *,
+    rank: int,
+    rngs: nnx.Rngs,
+) -> None:
+  if hasattr(module, f"{name}_lora_a") and hasattr(module, f"{name}_lora_b"):
+    return
+  weight = getattr(module, name).value
+  dtype = getattr(weight, "dtype", jnp.float32)
+  setattr(
+      module,
+      f"{name}_lora_a",
+      _init_lora_param(rngs, (*weight.shape[:-1], rank), dtype),
+  )
+  setattr(
+      module,
+      f"{name}_lora_b",
+      _init_lora_param(rngs, (rank, weight.shape[-1]), dtype, zeros=True),
+  )
+
+
+def apply_moe_lora(
+    model: nnx.Module,
+    *,
+    rank: int,
+    alpha: float,
+    rng_seed: int,
+) -> nnx.Module:
+  """Adds LoRA leaves for Gemma4 MoE params used by DiffusionGemma 26B.
+
+  Qwix covers the ordinary Linear/Einsum modules. Gemma4 MoE expert weights are
+  bare ``nnx.Param`` leaves consumed by ragged_dot, so they need explicit LoRA
+  leaves plus the optional forward hook in ``gemma4.moe``.
+  """
+  rngs = nnx.Rngs(rng_seed)
+  for _path, module in nnx.iter_modules(model):
+    if not isinstance(module, gemma4_moe.MoERagged):
+      continue
+    module.moe_lora_scale = alpha / rank
+    for name in ("router_logits", "gating_einsum", "linear"):
+      _ensure_moe_lora_param(module, name, rank=rank, rngs=rngs)
+  return model
+
+
 def apply_lora(
     model: nnx.Module,
     *,
@@ -913,6 +977,9 @@ def apply_lora(
         provider,
         **model.get_model_input(),
         rngs=nnx.Rngs(rng_seed),
+    )
+    model = apply_moe_lora(
+        model, rank=rank, alpha=alpha, rng_seed=rng_seed + 1
     )
     model.set_attributes(qwix_rngs=nnx.Rngs(rng_seed))
   finally:

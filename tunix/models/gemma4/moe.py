@@ -19,6 +19,16 @@ import jax
 import jax.numpy as jnp
 
 
+def _maybe_lora_weight(module: nnx.Module, name: str, weight: jax.Array):
+  lora_a = getattr(module, f'{name}_lora_a', None)
+  lora_b = getattr(module, f'{name}_lora_b', None)
+  if lora_a is None or lora_b is None:
+    return weight
+  scale = getattr(module, 'moe_lora_scale', 1.0)
+  delta = jnp.tensordot(lora_a.value, lora_b.value, axes=([-1], [0]))
+  return weight + delta.astype(weight.dtype) * scale
+
+
 def _renormalization_factor(router_probs: jax.Array, choices: jax.Array):
   """Computes the renormalization factor for routing weights."""
   indicator = jax.nn.one_hot(
@@ -139,7 +149,9 @@ class MoERagged(nnx.Module):
         xs_combine_weights,
     ) = _expert_dispatch(x, expert_choices, expert_weights)
 
-    w_gate = self.gating_einsum.value
+    w_gate = _maybe_lora_weight(
+        self, 'gating_einsum', self.gating_einsum.value
+    )
     w_gate = jnp.transpose(w_gate, (0, 3, 1, 2))
     w_gate = w_gate.reshape(
         self.num_experts, self.features, 2 * self.hidden_dim
@@ -158,7 +170,9 @@ class MoERagged(nnx.Module):
 
     expert_outputs = jax.lax.ragged_dot(
         activation,
-        self.linear.value.astype(self.config.dtype),
+        _maybe_lora_weight(self, 'linear', self.linear.value).astype(
+            self.config.dtype
+        ),
         group_sizes=xs_tokens_per_expert,
     )
 
@@ -199,7 +213,9 @@ class MoERagged(nnx.Module):
     logits = jnp.einsum(
         'gsd,de->gse',
         router_input,
-        self.router_logits.value.astype(router_input.dtype),
+        _maybe_lora_weight(
+            self, 'router_logits', self.router_logits.value
+        ).astype(router_input.dtype),
     )
     weights, choices = self._router(logits)
     out = self._run_ffw_and_routing(x, choices, weights)

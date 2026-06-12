@@ -27,6 +27,7 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 from orbax import checkpoint as ocp
+from tunix.models import low_peak_params
 from tunix.models.diffusion_gemma import model as model_lib
 from tunix.models.gemma4 import params as gemma4_params
 
@@ -85,39 +86,44 @@ def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
 def _merge_with_initialized_state(
     initialized_state: Any,
     mapped_params: Mapping[str, Any],
+    *,
+    preserve_predicate: low_peak_params.LeafPredicate | None = None,
 ) -> dict[str, Any]:
-  state_dict = nnx.to_pure_dict(initialized_state)
-  flat_state = flax.traverse_util.flatten_dict(state_dict)
-  flat_mapped = flax.traverse_util.flatten_dict(mapped_params)
-  usable = {}
-  skipped = []
-  for key, value in flat_mapped.items():
-    if key not in flat_state:
-      skipped.append(key)
-      continue
-    if getattr(value, "shape", None) != getattr(flat_state[key], "shape", None):
-      raise ValueError(
-          f"Shape mismatch for {key}: checkpoint={value.shape}, "
-          f"model={flat_state[key].shape}"
-      )
-    usable[key] = value
-  if skipped:
+  if hasattr(initialized_state, "_mapping"):
+    state_dict = nnx.to_pure_dict(initialized_state)
+  else:
+    state_dict = initialized_state
+  preserve_predicate = preserve_predicate or (lambda _path, _value: False)
+  result = low_peak_params.merge_restored_state(
+      state_dict,
+      mapped_params,
+      preserve_predicate=preserve_predicate,
+      strict=False,
+  )
+  if result.report.extra_paths:
     logging.info(
         "Skipping %d DiffusionGemma checkpoint keys not present in the NNX "
         "model: %s",
-        len(skipped),
-        sorted(str(k) for k in skipped)[:20],
+        len(result.report.extra_paths),
+        sorted(str(k) for k in result.report.extra_paths)[:20],
     )
-  missing = set(flat_state) - set(usable)
-  if missing:
+  if result.report.skipped_preserved_restore_paths:
+    logging.info(
+        "Preserved %d initialized adapter leaves instead of overwriting them "
+        "from the DiffusionGemma checkpoint. First paths: %s",
+        len(result.report.skipped_preserved_restore_paths),
+        sorted(str(k) for k in result.report.skipped_preserved_restore_paths)[
+            :20
+        ],
+    )
+  if result.report.missing_paths:
     logging.warning(
         "DiffusionGemma checkpoint did not provide %d NNX parameters. They "
         "remain randomly initialized. First missing keys: %s",
-        len(missing),
-        sorted(str(k) for k in missing)[:20],
+        len(result.report.missing_paths),
+        sorted(str(k) for k in result.report.missing_paths)[:20],
     )
-  flat_state.update(usable)
-  return flax.traverse_util.unflatten_dict(flat_state)
+  return result.tree
 
 
 def _load_raw_params(
