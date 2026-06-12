@@ -1,0 +1,13 @@
+{
+  "run_id": "r_afe850d5",
+  "machine_id": 425838,
+  "target_kind": "command",
+  "started_at": "2026-06-12T11:56:44.429673+00:00",
+  "state": "succeeded",
+  "instance_status": "Running",
+  "exit_code": 0,
+  "remote_log": "/home/ubuntu/jl-runs/r_afe850d5/output.log",
+  "lifecycle_policy": "none",
+  "instance_cost": 17.441,
+  "launch_command": "if [ -x \"$HOME/.venv/bin/python\" ]; then export PATH=\"$HOME/.venv/bin:$PATH\"; fi && bash -lc 'export PATH=$HOME/.local/bin:$PATH; cd /home/ubuntu/tunix-dg-long && GPU_POLL_SECONDS=10 NCCL_DEBUG=WARN NCCL_DEBUG_SUBSYS=INIT,COLL,GRAPH TRAIN_LOOP=hybrid bash scripts/run_diffusion_gemma_h100x2_comparison_job.sh --mode upstream --run_name official_reference_h100x2_3h_20260612T115600Z --num_train_steps 2000 --run_steps 100000 --max_runtime_seconds 10800 --log_losses true --sync_after_step losses --jax_package_spec '\"'\"'jax[cuda13]==0.10.1'\"'\"''"
+}

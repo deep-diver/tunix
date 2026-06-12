@@ -1,0 +1,13 @@
+{
+  "run_id": "r_8c0fa74b",
+  "machine_id": 425839,
+  "target_kind": "command",
+  "started_at": "2026-06-12T11:58:59.156808+00:00",
+  "state": "succeeded",
+  "instance_status": "Running",
+  "exit_code": 0,
+  "remote_log": "/home/ubuntu/jl-runs/r_8c0fa74b/output.log",
+  "lifecycle_policy": "none",
+  "instance_cost": 17.441,
+  "launch_command": "if [ -x \"$HOME/.venv/bin/python\" ]; then export PATH=\"$HOME/.venv/bin:$PATH\"; fi && bash -lc 'export PATH=$HOME/.local/bin:$PATH; cd /home/ubuntu/tunix-dg-long && GPU_POLL_SECONDS=10 NCCL_DEBUG=WARN NCCL_DEBUG_SUBSYS=INIT,COLL,GRAPH TRAIN_LOOP=hybrid bash scripts/run_diffusion_gemma_h100x2_comparison_job.sh --mode tunix --run_name tunix_wrapper_h100x2_3h_20260612T120200Z --num_train_steps 2000 --run_steps 100000 --max_runtime_seconds 10800 --log_losses true --sync_after_step losses --jax_package_spec '\"'\"'jax[cuda13]==0.10.1'\"'\"''"
+}

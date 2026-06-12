@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DiffusionGemma trace: Summarize the PubMedQA answer:</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f7f5ef;
+  --panel: #ffffff;
+  --ink: #1c2430;
+  --muted: #627084;
+  --line: #d8d4c8;
+  --accepted: #2f8f6b;
+  --changed: #c85739;
+  --token: #f2eee4;
+  --token-dark: #232b36;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418;
+    --panel: #171c22;
+    --ink: #eef2f4;
+    --muted: #aab4bf;
+    --line: #323943;
+    --token: #222832;
+    --token-dark: #2b3340;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+main {
+  width: min(1120px, calc(100vw - 32px));
+  margin: 28px auto;
+}
+h1 {
+  margin: 0 0 6px;
+  font-size: 24px;
+  letter-spacing: 0;
+}
+.subhead, .meta {
+  color: var(--muted);
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  margin-top: 14px;
+}
+.controls {
+  display: grid;
+  grid-template-columns: auto auto 1fr auto;
+  align-items: center;
+  gap: 10px;
+}
+button {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  border-radius: 6px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+input[type="range"] {
+  width: 100%;
+}
+.stats {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+.stat {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+}
+.stat b {
+  display: block;
+  font-size: 18px;
+}
+.canvas-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-height: 62px;
+  border-left: 4px solid var(--accepted);
+  padding-left: 12px;
+  margin-top: 12px;
+}
+.tokens {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(86px, 1fr));
+  gap: 8px;
+  margin-top: 14px;
+}
+.token {
+  min-height: 54px;
+  border: 1px solid var(--line);
+  background: var(--token);
+  border-radius: 6px;
+  padding: 7px;
+  overflow: hidden;
+  transition: transform 180ms ease, border-color 180ms ease, background 180ms ease;
+}
+.token.changed {
+  border-color: var(--changed);
+  transform: translateY(-2px);
+}
+.token.accepted {
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accepted) 70%, transparent);
+}
+.piece {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+.id {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.legend {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  color: var(--muted);
+}
+.swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  margin-right: 5px;
+  vertical-align: -1px;
+}
+.swatch.accepted { border: 2px solid var(--accepted); }
+.swatch.changed { border: 2px solid var(--changed); }
+@media (max-width: 720px) {
+  .controls { grid-template-columns: 1fr 1fr; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+</style>
+</head>
+<body>
+<main>
+  <h1>DiffusionGemma Denoising Trace</h1>
+  <div class="subhead"></div>
+  <section class="panel">
+    <div class="controls">
+      <button id="play" type="button">Play</button>
+      <button id="prev" type="button">Prev</button>
+      <input id="slider" type="range" min="0" value="0" step="1">
+      <button id="next" type="button">Next</button>
+    </div>
+    <div class="stats">
+      <div class="stat"><span>Frame</span><b id="frame"></b></div>
+      <div class="stat"><span>Canvas</span><b id="canvas"></b></div>
+      <div class="stat"><span>Noise</span><b id="noise"></b></div>
+      <div class="stat"><span>Accepted</span><b id="accepted"></b></div>
+      <div class="stat"><span>Entropy</span><b id="entropy"></b></div>
+    </div>
+    <div class="legend">
+      <span><span class="swatch accepted"></span>selected by confidence</span>
+      <span><span class="swatch changed"></span>changed this step</span>
+      <span id="stop"></span>
+    </div>
+    <div id="text" class="canvas-text"></div>
+    <div id="tokens" class="tokens"></div>
+  </section>
+  <section class="panel">
+    <div class="meta" id="meta"></div>
+  </section>
+</main>
+<script type="application/json" id="trace-data">{"prompt": "Summarize the PubMedQA answer:", "formatted_prompt": "\u003c|turn\u003euser\nSummarize the PubMedQA answer:\u003cturn|\u003e\n\u003c|turn\u003emodel\n", "tiny": true, "checkpoint": null, "output_text": "\r\u0002\u0002\u003cunused24\u003e\u003ctfoot\u003e\u003cunused34\u003e\u003cbbox\u003e\u003cunused49\u003e\u003c/html\u003e\u003cunused85\u003e             \n\n\n\u003c/h4\u003e\u003c/ul\u003e\u003cunused64\u003e\u003ctool|\u003e\u003cunused46\u003e\n\n\n\n\n\n\n\n\u003cunused34\u003e\u003cbody\u003e\u003ctd\u003e\u003c/h5\u003e\u003csub\u003e\f\u003c/sub\u003e\u0011\u003cunused31\u003e\u003cbbox\u003e[multimodal]                           \u003ctable\u003e", "output_token_ids": [251, 240, 240, 30, 172, 40, 221, 62, 228, 99, 149, 109, 194, 233, 77, 47, 59, 114, 40, 218, 175, 195, 204, 250, 213, 255, 37, 221, 5, 157, 142, 168], "settings": {"max_new_tokens": 32, "canvas_length": 16, "denoising_steps": 10, "entropy_bound": 0.1, "min_temperature": 0.4, "max_temperature": 0.8, "temperature_exponent": 1.0, "early_stop": true, "entropy_stop_threshold": 0.005, "seed": 0}, "frames": [{"canvas": 0, "step": 0, "phase": "initial", "noise": 1.0, "target_noise": 1.0, "changed_tokens": 0, "accepted_tokens": 0, "mean_entropy": null, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003cunused8\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused2\u003e\u0001\u003cunused37\u003e\u003cunused74\u003e\u003cunused26\u003e\u003ccode\u003e       \u003cdiv\u003e\u003cunused81\u003e\u003cunused2\u003e\u003cunused46\u003e\u003cunused39\u003e\u003c/sub\u003e\n\n\n", "token_ids": [14, 134, 8, 239, 43, 87, 32, 206, 143, 224, 94, 8, 59, 45, 213, 109], "token_texts": ["\u003cunused8\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003cunused2\u003e", "\u0001", "\u003cunused37\u003e", "\u003cunused74\u003e", "\u003cunused26\u003e", "\u003ccode\u003e", "       ", "\u003cdiv\u003e", "\u003cunused81\u003e", "\u003cunused2\u003e", "\u003cunused46\u003e", "\u003cunused39\u003e", "\u003c/sub\u003e", "\n\n\n"], "selected_mask": [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false], "changed_mask": [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]}, {"canvas": 0, "step": 1, "phase": "denoise", "noise": 1.0, "target_noise": 0.9, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.543890476226807, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n     \u003cunused11\u003e\u003cpad\u003e\u003cunused48\u003e\u003c/a\u003e                               [multimodal]\u003cunused9\u003e\u003c/code\u003e                          \u003cunused78\u003e\u003cunused61\u003e                        \u003cunused45\u003e\u003cunused45\u003e", "token_ids": [131, 141, 17, 0, 61, 227, 167, 5, 15, 215, 162, 91, 74, 160, 58, 58], "token_texts": ["\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "     ", "\u003cunused11\u003e", "\u003cpad\u003e", "\u003cunused48\u003e", "\u003c/a\u003e", "                               ", "[multimodal]", "\u003cunused9\u003e", "\u003c/code\u003e", "                          ", "\u003cunused78\u003e", "\u003cunused61\u003e", "                        ", "\u003cunused45\u003e", "\u003cunused45\u003e"], "selected_mask": [false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 0, "step": 2, "phase": "denoise", "noise": 0.9, "target_noise": 0.8, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.5437517166137695, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003cunused74\u003e\u003cunused21\u003e\u003c/th\u003e                           \u003ch2\u003e\u003cspan\u003e\u003cunused29\u003e                         \u003cunused71\u003e                \u0007\u003ccaption\u003e\u003cunused7\u003e\u003c/tr\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "token_ids": [87, 27, 182, 163, 185, 220, 35, 161, 84, 152, 245, 169, 13, 181, 131, 107], "token_texts": ["\u003cunused74\u003e", "\u003cunused21\u003e", "\u003c/th\u003e", "                           ", "\u003ch2\u003e", "\u003cspan\u003e", "\u003cunused29\u003e", "                         ", "\u003cunused71\u003e", "                ", "\u0007", "\u003ccaption\u003e", "\u003cunused7\u003e", "\u003c/tr\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\n"], "selected_mask": [false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 0, "step": 3, "phase": "denoise", "noise": 0.8, "target_noise": 0.7, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.543558120727539, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003cchannel|\u003e\u003cth\u003e\u003cunused1\u003e\u003ch6\u003e\u003cunused63\u003e\u0004\u003cunused67\u003e\u003cunused72\u003e\u003ctool_response|\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003c/html\u003e\u003ch2\u003e\u003cunused46\u003e\u003cunused15\u003e\u003c|turn\u003e   ", "token_ids": [101, 174, 7, 189, 76, 242, 80, 85, 51, 120, 228, 185, 59, 21, 105, 139], "token_texts": ["\u003cchannel|\u003e", "\u003cth\u003e", "\u003cunused1\u003e", "\u003ch6\u003e", "\u003cunused63\u003e", "\u0004", "\u003cunused67\u003e", "\u003cunused72\u003e", "\u003ctool_response|\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003c/html\u003e", "\u003ch2\u003e", "\u003cunused46\u003e", "\u003cunused15\u003e", "\u003c|turn\u003e", "   "], "selected_mask": [false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 0, "step": 4, "phase": "denoise", "noise": 0.7, "target_noise": 0.6, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.543458938598633, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003cth\u003e\u003cunused76\u003e\u003cunused27\u003e\u003c|think|\u003e\u003cunused19\u003e\u003cunused86\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003c/thead\u003e\u003cunused54\u003e\u003c/div\u003e\u003cspan\u003e\u003cunused50\u003e\u003cunused19\u003e\u003cunused83\u003e\u003cunused53\u003e\u003cunused9\u003e", "token_ids": [174, 89, 33, 98, 25, 102, 124, 178, 67, 235, 220, 63, 25, 96, 66, 15], "token_texts": ["\u003cth\u003e", "\u003cunused76\u003e", "\u003cunused27\u003e", "\u003c|think|\u003e", "\u003cunused19\u003e", "\u003cunused86\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003c/thead\u003e", "\u003cunused54\u003e", "\u003c/div\u003e", "\u003cspan\u003e", "\u003cunused50\u003e", "\u003cunused19\u003e", "\u003cunused83\u003e", "\u003cunused53\u003e", "\u003cunused9\u003e"], "selected_mask": [false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 0, "step": 5, "phase": "denoise", "noise": 0.6, "target_noise": 0.5, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.543182373046875, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003ctd\u003e\u003cunused63\u003e\u003cunused3\u003e\u003c/sup\u003e\u003cunused26\u003e\u003c/footer\u003e\u003cul\u003e\u003csub\u003e\u003cunused13\u003e\u003cli\u003e\u003cunused35\u003e\u003cchannel|\u003e\u003cunused79\u003e           \u003cunused4\u003e\u0010", "token_ids": [175, 76, 9, 214, 32, 237, 222, 204, 19, 223, 41, 101, 92, 147, 10, 254], "token_texts": ["\u003ctd\u003e", "\u003cunused63\u003e", "\u003cunused3\u003e", "\u003c/sup\u003e", "\u003cunused26\u003e", "\u003c/footer\u003e", "\u003cul\u003e", "\u003csub\u003e", "\u003cunused13\u003e", "\u003cli\u003e", "\u003cunused35\u003e", "\u003cchannel|\u003e", "\u003cunused79\u003e", "           ", "\u003cunused4\u003e", "\u0010"], "selected_mask": [false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 0, "step": 6, "phase": "denoise", "noise": 0.5, "target_noise": 0.4, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.542844772338867, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003cunused82\u003e\u003c/body\u003e\r\u003c/ul\u003e\u003cunused82\u003e\u003cunused4\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused37\u003e\u003cunused84\u003e\u003cth\u003e\u003cunused75\u003e\u003c/footer\u003e\u003ctool_call|\u003e\u003c|tool\u003e\u003cunused37\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "token_ids": [95, 229, 251, 233, 95, 10, 125, 43, 97, 174, 88, 237, 49, 46, 43, 129], "token_texts": ["\u003cunused82\u003e", "\u003c/body\u003e", "\r", "\u003c/ul\u003e", "\u003cunused82\u003e", "\u003cunused4\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003cunused37\u003e", "\u003cunused84\u003e", "\u003cth\u003e", "\u003cunused75\u003e", "\u003c/footer\u003e", "\u003ctool_call|\u003e", "\u003c|tool\u003e", "\u003cunused37\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"], "selected_mask": [false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 0, "step": 7, "phase": "denoise", "noise": 0.4, "target_noise": 0.30000000000000004, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.542459487915039, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003cunused43\u003e\u003cunused0\u003e\u003cunused60\u003e\u003cunused40\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused16\u003e\u0005\u003c/b\u003e\u003c/bbox\u003e\u003cunused10\u003e\u003cu\u003e\u003ca\u003e\u003c|tool_response\u003e\u0006\u003ch6\u003e      ", "token_ids": [56, 6, 73, 53, 132, 22, 243, 209, 232, 16, 202, 216, 50, 244, 189, 142], "token_texts": ["\u003cunused43\u003e", "\u003cunused0\u003e", "\u003cunused60\u003e", "\u003cunused40\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003cunused16\u003e", "\u0005", "\u003c/b\u003e", "\u003c/bbox\u003e", "\u003cunused10\u003e", "\u003cu\u003e", "\u003ca\u003e", "\u003c|tool_response\u003e", "\u0006", "\u003ch6\u003e", "      "], "selected_mask": [false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 0, "step": 8, "phase": "denoise", "noise": 0.30000000000000004, "target_noise": 0.19999999999999996, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.542052268981934, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003cunused0\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n[multimodal]\u003cfooter\u003e\u003cunused70\u003e                                   \u003cunused79\u003e\u003cbbox\u003e\u003c|turn\u003e\u003cunused73\u003e\u003cunused66\u003e            \u003cunused57\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused1\u003e", "token_ids": [6, 126, 5, 226, 83, 140, 167, 92, 221, 105, 86, 79, 148, 70, 130, 7], "token_texts": ["\u003cunused0\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "[multimodal]", "\u003cfooter\u003e", "\u003cunused70\u003e", "    ", "                               ", "\u003cunused79\u003e", "\u003cbbox\u003e", "\u003c|turn\u003e", "\u003cunused73\u003e", "\u003cunused66\u003e", "            ", "\u003cunused57\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003cunused1\u003e"], "selected_mask": [false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 0, "step": 9, "phase": "denoise", "noise": 0.19999999999999996, "target_noise": 0.09999999999999998, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.54151725769043, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003ch5\u003e        \u003cunused59\u003e                    \u003c/li\u003e        \u003cunused42\u003e[multimodal]\u003c/h1\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003c/h6\u003e\u003c|turn\u003e\u003cspan\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\r\u003cunused74\u003e", "token_ids": [188, 144, 72, 156, 234, 144, 55, 5, 191, 133, 196, 105, 220, 121, 251, 87], "token_texts": ["\u003ch5\u003e", "        ", "\u003cunused59\u003e", "                    ", "\u003c/li\u003e", "        ", "\u003cunused42\u003e", "[multimodal]", "\u003c/h1\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003c/h6\u003e", "\u003c|turn\u003e", "\u003cspan\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\r", "\u003cunused74\u003e"], "selected_mask": [false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 0, "step": 10, "phase": "denoise", "noise": 0.09999999999999998, "target_noise": 0.0, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.540982723236084, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\r\u0002\u0002\u003cunused24\u003e\u003ctfoot\u003e\u003cunused34\u003e\u003cbbox\u003e\u003cunused49\u003e\u003c/html\u003e\u003cunused85\u003e             \n\n\n\u003c/h4\u003e\u003c/ul\u003e\u003cunused64\u003e\u003ctool|\u003e", "token_ids": [251, 240, 240, 30, 172, 40, 221, 62, 228, 99, 149, 109, 194, 233, 77, 47], "token_texts": ["\r", "\u0002", "\u0002", "\u003cunused24\u003e", "\u003ctfoot\u003e", "\u003cunused34\u003e", "\u003cbbox\u003e", "\u003cunused49\u003e", "\u003c/html\u003e", "\u003cunused85\u003e", "             ", "\n\n\n", "\u003c/h4\u003e", "\u003c/ul\u003e", "\u003cunused64\u003e", "\u003ctool|\u003e"], "selected_mask": [false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 1, "step": 0, "phase": "initial", "noise": 1.0, "target_noise": 1.0, "changed_tokens": 0, "accepted_tokens": 0, "mean_entropy": null, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003cunused83\u003e                                            \n\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused71\u003e\u003cunused21\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n              \u003c/em\u003e\n\n\n\n\u003cunused14\u003e                 \u003cunused77\u003e\u003cunused78\u003e             \u003cunused6\u003e", "token_ids": [96, 157, 159, 119, 84, 27, 131, 150, 208, 110, 20, 153, 90, 91, 149, 12], "token_texts": ["\u003cunused83\u003e", "                     ", "                       ", "\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003cunused71\u003e", "\u003cunused21\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "              ", "\u003c/em\u003e", "\n\n\n\n", "\u003cunused14\u003e", "                 ", "\u003cunused77\u003e", "\u003cunused78\u003e", "             ", "\u003cunused6\u003e"], "selected_mask": [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false], "changed_mask": [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]}, {"canvas": 1, "step": 1, "phase": "denoise", "noise": 1.0, "target_noise": 0.9, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.543912887573242, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003cfooter\u003e\u003cunused48\u003e\u003ctable\u003e\b\u003cunused12\u003e\u003cunused50\u003e\u003cunused56\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n          \u000f\u0004              \u003cunused14\u003e\u003cunused70\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused50\u003e", "token_ids": [226, 61, 168, 246, 18, 63, 69, 136, 146, 253, 242, 150, 20, 83, 132, 63], "token_texts": ["\u003cfooter\u003e", "\u003cunused48\u003e", "\u003ctable\u003e", "\b", "\u003cunused12\u003e", "\u003cunused50\u003e", "\u003cunused56\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "          ", "\u000f", "\u0004", "              ", "\u003cunused14\u003e", "\u003cunused70\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003cunused50\u003e"], "selected_mask": [false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 1, "step": 2, "phase": "denoise", "noise": 0.9, "target_noise": 0.8, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.54374885559082, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003cunused80\u003e\u003cunused38\u003e                         \u003cunused37\u003e\u003cunused1\u003e\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused61\u003e  \u003cunused36\u003e\u003cunused79\u003e\u003ch5\u003e\n\n\n\n\n\n\n\n\n\n\n\n\u003c/sub\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused43\u003e", "token_ids": [93, 44, 161, 43, 7, 107, 117, 74, 138, 42, 92, 188, 118, 213, 121, 56], "token_texts": ["\u003cunused80\u003e", "\u003cunused38\u003e", "                         ", "\u003cunused37\u003e", "\u003cunused1\u003e", "\n", "\n\n\n\n\n\n\n\n\n\n\n", "\u003cunused61\u003e", "  ", "\u003cunused36\u003e", "\u003cunused79\u003e", "\u003ch5\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n", "\u003c/sub\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003cunused43\u003e"], "selected_mask": [false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 1, "step": 3, "phase": "denoise", "noise": 0.8, "target_noise": 0.7, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.543576717376709, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003ctr\u003e\u003cunused55\u003e\u0010                        \u003ctr\u003e                                          \u003cunused75\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused11\u003e\u003cunused61\u003e\u003cunused7\u003e\n\n\u003cunused16\u003e                             \u003c/em\u003e", "token_ids": [173, 68, 254, 160, 173, 158, 156, 88, 126, 17, 74, 13, 108, 22, 165, 208], "token_texts": ["\u003ctr\u003e", "\u003cunused55\u003e", "\u0010", "                        ", "\u003ctr\u003e", "                      ", "                    ", "\u003cunused75\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003cunused11\u003e", "\u003cunused61\u003e", "\u003cunused7\u003e", "\n\n", "\u003cunused16\u003e", "                             ", "\u003c/em\u003e"], "selected_mask": [false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 1, "step": 4, "phase": "denoise", "noise": 0.7, "target_noise": 0.6, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.5434064865112305, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "            \u003cunused78\u003e                                     \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused35\u003e\u003c|tool_response\u003e\u003cblockquote\u003e              \u003ch4\u003e\u000b\u000f\u003cunused0\u003e\u003cunused27\u003e\u003cunused66\u003e\u003c/h3\u003e", "token_ids": [148, 91, 159, 150, 124, 41, 50, 190, 150, 187, 249, 253, 6, 33, 79, 193], "token_texts": ["            ", "\u003cunused78\u003e", "                       ", "              ", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003cunused35\u003e", "\u003c|tool_response\u003e", "\u003cblockquote\u003e", "              ", "\u003ch4\u003e", "\u000b", "\u000f", "\u003cunused0\u003e", "\u003cunused27\u003e", "\u003cunused66\u003e", "\u003c/h3\u003e"], "selected_mask": [false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 1, "step": 5, "phase": "denoise", "noise": 0.6, "target_noise": 0.5, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.543118476867676, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003ceos\u003e\u003cunused36\u003e\u003cunused67\u003e\r\b\u003cunused43\u003e\u003cunused46\u003e\u003cunused22\u003e\u003cunused76\u003e\u003cunused19\u003e\u003c/tbody\u003e\u003cunused3\u003e\u003cunused49\u003e\u003c|turn\u003e\u003c/i\u003e\u0010", "token_ids": [1, 42, 80, 251, 246, 56, 59, 28, 89, 25, 179, 9, 62, 105, 210, 254], "token_texts": ["\u003ceos\u003e", "\u003cunused36\u003e", "\u003cunused67\u003e", "\r", "\b", "\u003cunused43\u003e", "\u003cunused46\u003e", "\u003cunused22\u003e", "\u003cunused76\u003e", "\u003cunused19\u003e", "\u003c/tbody\u003e", "\u003cunused3\u003e", "\u003cunused49\u003e", "\u003c|turn\u003e", "\u003c/i\u003e", "\u0010"], "selected_mask": [false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 1, "step": 6, "phase": "denoise", "noise": 0.5, "target_noise": 0.4, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.542832851409912, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "          \u003c|think|\u003e\u000f\u003cturn|\u003e\u003cli\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused6\u003e                             \u003cfooter\u003e\n\n\u003c/div\u003e                             \u003cunused13\u003e\r\u003cunused35\u003e", "token_ids": [146, 98, 253, 106, 223, 136, 110, 12, 165, 226, 108, 235, 165, 19, 251, 41], "token_texts": ["          ", "\u003c|think|\u003e", "\u000f", "\u003cturn|\u003e", "\u003cli\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\n\n\n\n", "\u003cunused6\u003e", "                             ", "\u003cfooter\u003e", "\n\n", "\u003c/div\u003e", "                             ", "\u003cunused13\u003e", "\r", "\u003cunused35\u003e"], "selected_mask": [false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 1, "step": 7, "phase": "denoise", "noise": 0.4, "target_noise": 0.30000000000000004, "changed_tokens": 15, "accepted_tokens": 1, "mean_entropy": 5.542470932006836, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003c/ul\u003e\u003cpad\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused81\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003c/tbody\u003e\u003cunused67\u003e\u003cunused64\u003e\u003c/h3\u003e\u003c/th\u003e\u003ctbody\u003e\u003cunused22\u003e\u003c/a\u003e\u003c/th\u003e\u003ctr\u003e", "token_ids": [233, 0, 129, 94, 124, 136, 179, 80, 77, 193, 182, 171, 28, 227, 182, 173], "token_texts": ["\u003c/ul\u003e", "\u003cpad\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003cunused81\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003c/tbody\u003e", "\u003cunused67\u003e", "\u003cunused64\u003e", "\u003c/h3\u003e", "\u003c/th\u003e", "\u003ctbody\u003e", "\u003cunused22\u003e", "\u003c/a\u003e", "\u003c/th\u003e", "\u003ctr\u003e"], "selected_mask": [false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false], "changed_mask": [true, true, true, true, true, false, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 1, "step": 8, "phase": "denoise", "noise": 0.30000000000000004, "target_noise": 0.19999999999999996, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.541980743408203, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "             \u003cbbox\u003e\u003cunused0\u003e\u003cunused70\u003e\f\u003cunused57\u003e\u003cunused49\u003e\n\u003cblockquote\u003e\u003c/h6\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused57\u003e\u003c/th\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003cunused66\u003e", "token_ids": [149, 221, 6, 83, 250, 70, 62, 248, 190, 196, 133, 128, 70, 182, 137, 79], "token_texts": ["             ", "\u003cbbox\u003e", "\u003cunused0\u003e", "\u003cunused70\u003e", "\f", "\u003cunused57\u003e", "\u003cunused49\u003e", "\n", "\u003cblockquote\u003e", "\u003c/h6\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003cunused57\u003e", "\u003c/th\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "\u003cunused66\u003e"], "selected_mask": [false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 1, "step": 9, "phase": "denoise", "noise": 0.19999999999999996, "target_noise": 0.09999999999999998, "changed_tokens": 16, "accepted_tokens": 1, "mean_entropy": 5.541677474975586, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003cunused49\u003e\u003c/div\u003e\u003cunused38\u003e          \u003cunused51\u003e\u003cunused51\u003e\u003cunused81\u003e\u003cunused61\u003e\u003cunused65\u003e\u003c/h2\u003e\u003ch1\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n                     \u003cunused29\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", "token_ids": [62, 235, 44, 146, 64, 64, 94, 74, 78, 192, 184, 113, 114, 157, 35, 126], "token_texts": ["\u003cunused49\u003e", "\u003c/div\u003e", "\u003cunused38\u003e", "          ", "\u003cunused51\u003e", "\u003cunused51\u003e", "\u003cunused81\u003e", "\u003cunused61\u003e", "\u003cunused65\u003e", "\u003c/h2\u003e", "\u003ch1\u003e", "\n\n\n\n\n\n\n", "\n\n\n\n\n\n\n\n", "                     ", "\u003cunused29\u003e", "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"], "selected_mask": [false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]}, {"canvas": 1, "step": 10, "phase": "denoise", "noise": 0.09999999999999998, "target_noise": 0.0, "changed_tokens": 15, "accepted_tokens": 1, "mean_entropy": 5.540919780731201, "stable_tokens": false, "low_entropy": false, "early_stop": false, "text": "\u003cunused46\u003e\n\n\n\n\n\n\n\n\u003cunused34\u003e\u003cbody\u003e\u003ctd\u003e\u003c/h5\u003e\u003csub\u003e\f\u003c/sub\u003e\u0011\u003cunused31\u003e\u003cbbox\u003e[multimodal]                           \u003ctable\u003e", "token_ids": [59, 114, 40, 218, 175, 195, 204, 250, 213, 255, 37, 221, 5, 157, 142, 168], "token_texts": ["\u003cunused46\u003e", "\n\n\n\n\n\n\n\n", "\u003cunused34\u003e", "\u003cbody\u003e", "\u003ctd\u003e", "\u003c/h5\u003e", "\u003csub\u003e", "\f", "\u003c/sub\u003e", "\u0011", "\u003cunused31\u003e", "\u003cbbox\u003e", "[multimodal]", "                     ", "      ", "\u003ctable\u003e"], "selected_mask": [false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false], "changed_mask": [true, true, true, true, true, true, true, true, true, true, true, true, true, false, true, true]}]}</script>
+<script>
+const payload = JSON.parse(document.getElementById('trace-data').textContent);
+const frames = payload.frames || [];
+const slider = document.getElementById('slider');
+const play = document.getElementById('play');
+let index = 0;
+let timer = null;
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function fmt(v, digits = 3) {
+  return v === null || v === undefined ? '-' : Number(v).toFixed(digits);
+}
+
+function render(i) {
+  if (!frames.length) return;
+  index = Math.max(0, Math.min(i, frames.length - 1));
+  const f = frames[index];
+  slider.value = String(index);
+  document.getElementById('frame').textContent = `${index + 1}/${frames.length}`;
+  document.getElementById('canvas').textContent = `${f.canvas}:${f.step}`;
+  document.getElementById('noise').textContent = `${fmt(f.noise, 2)} -> ${fmt(f.target_noise, 2)}`;
+  document.getElementById('accepted').textContent = `${f.accepted_tokens}/${f.token_ids.length}`;
+  document.getElementById('entropy').textContent = fmt(f.mean_entropy, 4);
+  document.getElementById('stop').textContent = f.early_stop
+    ? 'early stop: token-stable and low entropy'
+    : '';
+  document.getElementById('text').textContent = f.text || '';
+  const tokens = document.getElementById('tokens');
+  tokens.innerHTML = '';
+  f.token_ids.forEach((id, pos) => {
+    const cell = document.createElement('div');
+    cell.className = 'token';
+    if (f.selected_mask[pos]) cell.classList.add('accepted');
+    if (f.changed_mask[pos]) cell.classList.add('changed');
+    const piece = f.token_texts[pos] ?? '';
+    cell.innerHTML = `<span class="piece">${esc(piece)}</span><span class="id">#${pos} - ${id}</span>`;
+    tokens.appendChild(cell);
+  });
+}
+
+function stopTimer() {
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+    play.textContent = 'Play';
+  }
+}
+
+slider.max = String(Math.max(frames.length - 1, 0));
+document.querySelector('.subhead').textContent = payload.prompt || '';
+document.getElementById('meta').textContent =
+  `output: ${payload.output_text || ''} | frames: ${frames.length} | settings: ${JSON.stringify(payload.settings || {})}`;
+document.getElementById('prev').addEventListener('click', () => { stopTimer(); render(index - 1); });
+document.getElementById('next').addEventListener('click', () => { stopTimer(); render(index + 1); });
+slider.addEventListener('input', (event) => { stopTimer(); render(Number(event.target.value)); });
+play.addEventListener('click', () => {
+  if (timer) { stopTimer(); return; }
+  play.textContent = 'Pause';
+  timer = setInterval(() => {
+    if (index >= frames.length - 1) {
+      stopTimer();
+      return;
+    }
+    render(index + 1);
+  }, 900);
+});
+render(0);
+</script>
+</body>
+</html>

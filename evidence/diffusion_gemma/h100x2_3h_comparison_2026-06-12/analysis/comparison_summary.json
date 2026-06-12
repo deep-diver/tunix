@@ -1,0 +1,241 @@
+{
+  "animation": "../animation/diffusion_gemma_readable_denoising.gif",
+  "generated_at_utc": "2026-06-12T15:08:28.802180+00:00",
+  "plots": {
+    "gpu_memory": "analysis/gpu_memory.png",
+    "loss_curve": "analysis/loss_curve.png"
+  },
+  "revision_match": {
+    "gemma": true,
+    "hackable_diffusion": true
+  },
+  "rows": [
+    {
+      "diffusion_last_50_mean": 0.767880859375,
+      "encoder_last_50_mean": 1.2137890625,
+      "exit_code": 0,
+      "gpu_min_free_mib": 15421.0,
+      "gpu_peak_used_mib": 65659.0,
+      "label": "official",
+      "mean_gpu_util_percent": 94.79275092936803,
+      "state": "succeeded",
+      "steps": 4602,
+      "steps_per_hour_by_gpu_window": 1534.4483999213105,
+      "timed_out": true,
+      "total_first": 13.71875,
+      "total_last": 1.29052734375,
+      "total_last_50_mean": 1.981669921875
+    },
+    {
+      "diffusion_last_50_mean": 0.769765625,
+      "encoder_last_50_mean": 1.201796875,
+      "exit_code": 0,
+      "gpu_min_free_mib": 15419.0,
+      "gpu_peak_used_mib": 65661.0,
+      "label": "tunix",
+      "mean_gpu_util_percent": 94.5478624535316,
+      "state": "succeeded",
+      "steps": 4591,
+      "steps_per_hour_by_gpu_window": 1530.8124209243263,
+      "timed_out": true,
+      "total_first": 13.71875,
+      "total_last": 1.05029296875,
+      "total_last_50_mean": 1.9715625
+    }
+  ],
+  "runs": {
+    "official": {
+      "exit_code": 0,
+      "gemma_revision": "a7e33454206ca24984565992f5c903191baecc22",
+      "gpu": {
+        "duration_seconds": 10796.844,
+        "max_peak_used_mib": 65659.0,
+        "mean_power_w": 656.8874999999999,
+        "mean_util_percent": 94.79275092936803,
+        "min_free_mib": 15421.0,
+        "per_gpu": {
+          "0": {
+            "mean_power_w": 662.8211710037174,
+            "mean_util_percent": 94.78903345724908,
+            "median_used_mib": 65659.0,
+            "min_free_mib": 15421.0,
+            "peak_used_mib": 65659.0,
+            "samples": 1076
+          },
+          "1": {
+            "mean_power_w": 650.9538289962825,
+            "mean_util_percent": 94.79646840148699,
+            "median_used_mib": 65629.0,
+            "min_free_mib": 15451.0,
+            "peak_used_mib": 65629.0,
+            "samples": 1076
+          }
+        },
+        "samples": 2152
+      },
+      "hackable_diffusion_revision": "03ce88ed0acec3b17f4f284502a6053c5f2b3a15",
+      "jax_package_spec": "jax[cuda13]==0.10.1",
+      "losses/diffusion_loss": {
+        "count": 4602,
+        "finite": true,
+        "first": 6.46875,
+        "first_50_mean": 5.7678125,
+        "first_step": 1,
+        "inf_count": 0,
+        "last": 0.04443359375,
+        "last_50_mean": 0.767880859375,
+        "last_step": 4602,
+        "max": 8.71875,
+        "mean": 0.8596694860081214,
+        "min": 0.0009765625,
+        "nan_count": 0
+      },
+      "losses/encoder_loss": {
+        "count": 4602,
+        "finite": true,
+        "first": 7.25,
+        "first_50_mean": 6.9778125,
+        "first_step": 1,
+        "inf_count": 0,
+        "last": 1.24609375,
+        "last_50_mean": 1.2137890625,
+        "last_step": 4602,
+        "max": 8.875,
+        "mean": 1.339969374728379,
+        "min": 0.693359375,
+        "nan_count": 0
+      },
+      "losses/total": {
+        "count": 4602,
+        "finite": true,
+        "first": 13.71875,
+        "first_50_mean": 12.745625,
+        "first_step": 1,
+        "inf_count": 0,
+        "last": 1.29052734375,
+        "last_50_mean": 1.981669921875,
+        "last_step": 4602,
+        "max": 16.796875,
+        "mean": 2.1996388607365005,
+        "min": 0.83349609375,
+        "nan_count": 0
+      },
+      "state": "succeeded",
+      "steps_per_hour_by_gpu_window": 1534.4483999213105,
+      "sync_after_step": "losses",
+      "timed_out": true,
+      "train_loop": "hybrid",
+      "train_status": 143
+    },
+    "tunix": {
+      "exit_code": 0,
+      "gemma_revision": "a7e33454206ca24984565992f5c903191baecc22",
+      "gpu": {
+        "duration_seconds": 10796.62,
+        "max_peak_used_mib": 65661.0,
+        "mean_power_w": 657.0432434944239,
+        "mean_util_percent": 94.5478624535316,
+        "min_free_mib": 15419.0,
+        "per_gpu": {
+          "0": {
+            "mean_power_w": 663.8972211895912,
+            "mean_util_percent": 94.62267657992565,
+            "median_used_mib": 65661.0,
+            "min_free_mib": 15419.0,
+            "peak_used_mib": 65661.0,
+            "samples": 1076
+          },
+          "1": {
+            "mean_power_w": 650.1892657992565,
+            "mean_util_percent": 94.47304832713755,
+            "median_used_mib": 65629.0,
+            "min_free_mib": 15451.0,
+            "peak_used_mib": 65629.0,
+            "samples": 1076
+          }
+        },
+        "samples": 2152
+      },
+      "hackable_diffusion_revision": "03ce88ed0acec3b17f4f284502a6053c5f2b3a15",
+      "jax_package_spec": "jax[cuda13]==0.10.1",
+      "losses/diffusion_loss": {
+        "count": 4591,
+        "finite": true,
+        "first": 6.46875,
+        "first_50_mean": 5.70203125,
+        "first_step": 1,
+        "inf_count": 0,
+        "last": 0.14208984375,
+        "last_50_mean": 0.769765625,
+        "last_step": 4591,
+        "max": 8.625,
+        "mean": 0.8478556678487802,
+        "min": 0.00048828125,
+        "nan_count": 0
+      },
+      "losses/encoder_loss": {
+        "count": 4591,
+        "finite": true,
+        "first": 7.25,
+        "first_50_mean": 6.979375,
+        "first_step": 1,
+        "inf_count": 0,
+        "last": 0.908203125,
+        "last_50_mean": 1.201796875,
+        "last_step": 4591,
+        "max": 8.875,
+        "mean": 1.3411204496569376,
+        "min": 0.693359375,
+        "nan_count": 0
+      },
+      "losses/total": {
+        "count": 4591,
+        "finite": true,
+        "first": 13.71875,
+        "first_50_mean": 12.68140625,
+        "first_step": 1,
+        "inf_count": 0,
+        "last": 1.05029296875,
+        "last_50_mean": 1.9715625,
+        "last_step": 4591,
+        "max": 16.71875,
+        "mean": 2.188976117505718,
+        "min": 0.8330078125,
+        "nan_count": 0
+      },
+      "state": "succeeded",
+      "steps_per_hour_by_gpu_window": 1530.8124209243263,
+      "sync_after_step": "losses",
+      "timed_out": true,
+      "train_loop": "hybrid",
+      "train_status": 143
+    }
+  },
+  "title": "DiffusionGemma H100x2 comparison",
+  "warnings": {
+    "official": {
+      "CUDA_ERROR_NOT_PERMITTED": 2648,
+      "Could not find cuda drivers": 0,
+      "NCCL": 2,
+      "OutOfMemory": 0,
+      "RESOURCE_EXHAUSTED": 0,
+      "RuntimeError": 0,
+      "TF-TRT Warning": 0,
+      "Traceback": 0,
+      "Unable to register": 0,
+      "nan": 0
+    },
+    "tunix": {
+      "CUDA_ERROR_NOT_PERMITTED": 2648,
+      "Could not find cuda drivers": 0,
+      "NCCL": 2,
+      "OutOfMemory": 0,
+      "RESOURCE_EXHAUSTED": 0,
+      "RuntimeError": 0,
+      "TF-TRT Warning": 0,
+      "Traceback": 0,
+      "Unable to register": 0,
+      "nan": 0
+    }
+  }
+}

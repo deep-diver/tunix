@@ -1,0 +1,6 @@
+official_run_id=r_afe850d5
+official_machine_id=425838
+official_run_name=official_reference_h100x2_3h_20260612T115600Z
+tunix_run_id=r_8c0fa74b
+tunix_machine_id=425839
+tunix_run_name=tunix_wrapper_h100x2_3h_20260612T120200Z

@@ -261,6 +261,19 @@ def _run_hybrid_official_loop(
         logged_losses=logged_losses,
         sync_after_step=sync_after_step,
     )
+    if loop_step == 0 or (loop_step + 1) % 10 == 0:
+      _write_json(
+          workdir / "hybrid_loop_progress.json",
+          {
+              "event": "official_reference_hybrid_loop_progress",
+              "loop_step": loop_step,
+              "state_step": loop_step + 1,
+              "num_steps": num_steps,
+              "logged_losses": logged_losses,
+              "sync_after_step": sync_after_step,
+              "workdir": str(workdir),
+          },
+      )
 
   result = {
       "event": "official_reference_hybrid_train_complete",

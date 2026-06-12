@@ -1,0 +1,17 @@
+{
+  "event": "comparison_job_complete",
+  "gemma_revision": "a7e33454206ca24984565992f5c903191baecc22",
+  "gpu_csv": "/home/ubuntu/diffusion_gemma_compare/official_reference_h100x2_3h_20260612T115600Z/workdir/gpu_memory.csv",
+  "hackable_diffusion_revision": "03ce88ed0acec3b17f4f284502a6053c5f2b3a15",
+  "jax_package_spec": "jax[cuda13]==0.10.1",
+  "log_losses": "true",
+  "mode": "upstream",
+  "summary_json": "/home/ubuntu/diffusion_gemma_compare/official_reference_h100x2_3h_20260612T115600Z/workdir/run_summary.json",
+  "sync_after_step": "losses",
+  "timed_out": true,
+  "train_log": "/home/ubuntu/diffusion_gemma_compare/official_reference_h100x2_3h_20260612T115600Z/workdir/train.log",
+  "train_loop": "hybrid",
+  "train_status": 143,
+  "workdir": "/home/ubuntu/diffusion_gemma_compare/official_reference_h100x2_3h_20260612T115600Z/workdir",
+  "xla_flags": "--xla_disable_hlo_passes=constant_folding"
+}
