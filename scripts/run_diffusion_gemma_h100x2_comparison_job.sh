@@ -55,6 +55,10 @@ LORA_RANK="${LORA_RANK:-4}"
 GPU_POLL_SECONDS="${GPU_POLL_SECONDS:-60}"
 JAX_CUDA_EXTRA="${JAX_CUDA_EXTRA:-cuda12}"
 
+if [[ -z "${PYTHON_BIN:-}" && -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
+  PYTHON_BIN="${VIRTUAL_ENV}/bin/python"
+fi
+
 if [[ -z "${PYTHON_BIN:-}" ]]; then
   if command -v python3.13 >/dev/null 2>&1; then
     PYTHON_BIN="$(command -v python3.13)"
@@ -65,7 +69,7 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   fi
 fi
 
-VENV="${VENV:-${HOME_DIR}/.venvs/diffusion_gemma_${MODE}}"
+VENV="${VENV:-${VIRTUAL_ENV:-${HOME_DIR}/.venvs/diffusion_gemma_${MODE}}}"
 mkdir -p "${WORKDIR}" "$(dirname "${RESULT_JSON}")"
 
 json_event() {
