@@ -469,21 +469,39 @@ def _load_tiny_model(args: argparse.Namespace, vocab_size: int):
       global_key_size=max(4, args.tiny_embed_dim // 2),
       use_sliding_window_kv_cache=False,
       final_logit_softcap=None,
-      remat_config=(
-          gemma4_model.RematConfig.DECODER if args.remat_decoder else None
-      ),
+      remat_config=_remat_config_from_args(args),
       dtype=jnp.float32,
       param_dtype=jnp.float32,
   )
   return diffusion_model.DiffusionGemma_A26B_A4B(config, rngs=nnx.Rngs(0))
 
 
+def _remat_config_from_args(
+    args: argparse.Namespace,
+) -> gemma4_model.RematConfig | None:
+  policy = args.remat_policy
+  if policy is None:
+    policy = "decoder" if args.remat_decoder else "none"
+  if policy == "none":
+    return None
+  if policy == "decoder":
+    return gemma4_model.RematConfig.DECODER
+  if policy == "block":
+    return gemma4_model.RematConfig.BLOCK
+  raise ValueError(f"Unsupported remat policy: {policy}")
+
+
+def _remat_policy_name(args: argparse.Namespace) -> str:
+  policy = args.remat_policy
+  if policy is None:
+    return "decoder" if args.remat_decoder else "none"
+  return policy
+
+
 def _load_real_model(args: argparse.Namespace):
   mesh_fsdp, mesh_tp = _resolve_mesh_axes(args)
   mesh = _mesh(mesh_fsdp, mesh_tp)
-  remat_config = (
-      gemma4_model.RematConfig.DECODER if args.remat_decoder else None
-  )
+  remat_config = _remat_config_from_args(args)
   with mesh:
     return diffusion_params.create_model_from_checkpoint(
         args.checkpoint,
@@ -894,6 +912,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         lora_rank=args.lora_rank,
         lora_module_path=args.lora_module_path,
         remat_decoder=args.remat_decoder,
+        remat_policy=_remat_policy_name(args),
         load_only=True,
     )
     trainable_summary = _state_summary(nnx.state(model, nnx.LoRAParam))
@@ -928,6 +947,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "lora_alpha": args.lora_alpha,
         "lora_module_path": args.lora_module_path,
         "remat_decoder": args.remat_decoder,
+        "remat_policy": _remat_policy_name(args),
         "mesh_fsdp": mesh_fsdp,
         "mesh_tp": mesh_tp,
         "restore_concurrent_gb": args.restore_concurrent_gb,
@@ -993,6 +1013,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       lora_rank=args.lora_rank,
       lora_module_path=args.lora_module_path,
       remat_decoder=args.remat_decoder,
+      remat_policy=_remat_policy_name(args),
   )
   trainable_summary = _state_summary(nnx.state(model, nnx.LoRAParam))
   frozen_summary = _state_summary(
@@ -1080,6 +1101,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": args.batch_size,
         "decoder_implementation": args.decoder_implementation,
         "remat_decoder": args.remat_decoder,
+        "remat_policy": _remat_policy_name(args),
         "encoder_loss_chunk_size": args.encoder_loss_chunk_size,
         "mesh_fsdp": mesh_fsdp,
         "mesh_tp": mesh_tp,
@@ -1181,6 +1203,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       ),
       "decoder_implementation": args.decoder_implementation,
       "remat_decoder": args.remat_decoder,
+      "remat_policy": _remat_policy_name(args),
       "prefill_decode_only_last_token": args.encoder_loss_weight == 0.0,
       "encoder_loss_chunk_size": args.encoder_loss_chunk_size,
       "split_loss_gradients": args.split_loss_gradients,
@@ -1342,6 +1365,16 @@ def parse_args() -> argparse.Namespace:
           "Enable decoder rematerialization. DiffusionGemma LoRA is"
           " materialized with remat temporarily disabled and then restored, so"
           " backbone LoRA coverage is preserved."
+      ),
+  )
+  parser.add_argument(
+      "--remat_policy",
+      choices=["none", "decoder", "block"],
+      default=None,
+      help=(
+          "Explicit Gemma4 rematerialization policy. Overrides"
+          " --remat_decoder when set. Use 'block' for lower peak memory on"
+          " long prompt encoder-gradient runs."
       ),
   )
   parser.add_argument("--restore_concurrent_gb", type=int, default=16)
