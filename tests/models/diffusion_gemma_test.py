@@ -417,7 +417,7 @@ class DiffusionGemmaTest(absltest.TestCase):
     remat_leaves = jax.tree.leaves(nnx.state(remat, nnx.LoRAParam))
     self.assertEqual(len(no_remat_leaves), len(remat_leaves))
 
-  def test_lora_targets_moe_params_used_by_official_all_linear(self):
+  def test_lora_targets_official_ragged_moe_router_by_default(self):
     base_cfg = diffusion_model.ModelConfig.tiny(
         vocab_size=32,
         num_layers=1,
@@ -447,6 +447,66 @@ class DiffusionGemmaTest(absltest.TestCase):
         )[0]
     }
 
+    for suffix in ("router_logits_lora_a", "router_logits_lora_b"):
+      self.assertIn(f"layers/0/moe/{suffix}", lora_paths)
+    for suffix in (
+        "gating_einsum_lora_a",
+        "gating_einsum_lora_b",
+        "linear_lora_a",
+        "linear_lora_b",
+    ):
+      self.assertNotIn(f"layers/0/moe/{suffix}", lora_paths)
+    self.assertFalse(any("_lora_a_lora_" in path for path in lora_paths))
+    self.assertFalse(any("_lora_b_lora_" in path for path in lora_paths))
+
+    moe = model.layers[0].moe
+    x = jnp.ones((1, 3, cfg.embed_dim), dtype=jnp.float32)
+    before = moe(x)
+    moe.router_logits_lora_a.value = (
+        jnp.ones_like(moe.router_logits_lora_a.value) * 0.5
+    )
+    moe.router_logits_lora_b.value = jnp.arange(
+        moe.router_logits_lora_b.value.size,
+        dtype=moe.router_logits_lora_b.value.dtype,
+    ).reshape(moe.router_logits_lora_b.value.shape)
+    after = moe(x)
+    self.assertTrue(bool(jnp.any(before != after)))
+
+  def test_lora_raw_expert_targets_are_opt_in(self):
+    base_cfg = diffusion_model.ModelConfig.tiny(
+        vocab_size=32,
+        num_layers=1,
+        embed_dim=16,
+        hidden_dim=32,
+        num_heads=2,
+        head_dim=8,
+        num_kv_heads=1,
+    )
+    cfg = dataclasses.replace(
+        base_cfg,
+        enable_moe=True,
+        num_experts=4,
+        num_experts_per_tok=2,
+        expert_dim=8,
+        moe_dense_hidden_dim=16,
+    )
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        cfg,
+        rngs=nnx.Rngs(0),
+    )
+    model = diffusion_sft.apply_lora(
+        model,
+        rank=2,
+        alpha=4.0,
+        moe_target_names=("router_logits", "gating_einsum", "linear"),
+    )
+    lora_paths = {
+        "/".join(str(part.key) for part in path)
+        for path, _ in jax.tree_util.tree_flatten_with_path(
+            nnx.to_pure_dict(nnx.state(model, nnx.LoRAParam))
+        )[0]
+    }
+
     for suffix in (
         "router_logits_lora_a",
         "router_logits_lora_b",
@@ -463,9 +523,7 @@ class DiffusionGemmaTest(absltest.TestCase):
     moe.gating_einsum_lora_b.value = (
         jnp.ones_like(moe.gating_einsum_lora_b.value) * 0.01
     )
-    moe.linear_lora_b.value = (
-        jnp.ones_like(moe.linear_lora_b.value) * 0.01
-    )
+    moe.linear_lora_b.value = jnp.ones_like(moe.linear_lora_b.value) * 0.01
     after = moe(x)
     self.assertTrue(bool(jnp.any(before != after)))
 

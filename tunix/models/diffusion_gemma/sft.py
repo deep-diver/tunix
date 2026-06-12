@@ -31,9 +31,8 @@ from tunix.sft import peft_trainer
 
 PAD_TOKEN = 0
 DEFAULT_LORA_MODULE_PATH = (
-    r".*q_einsum|.*kv_einsum|.*k_einsum|.*attn_vec_einsum|"
-    r".*gate_proj|.*up_proj|.*down_proj|.*moe.*|"
-    r".*router_logits|.*gating_einsum|.*linear"
+    r".*(q_einsum|kv_einsum|k_einsum|attn_vec_einsum|"
+    r"gate_proj|up_proj|down_proj)$"
 )
 
 
@@ -929,13 +928,16 @@ def apply_moe_lora(
     rank: int,
     alpha: float,
     rng_seed: int,
-    target_names: tuple[str, ...] = ("router_logits", "gating_einsum", "linear"),
+    target_names: tuple[str, ...] = ("router_logits",),
 ) -> nnx.Module:
   """Adds LoRA leaves for Gemma4 MoE params used by DiffusionGemma 26B.
 
-  Qwix covers the ordinary Linear/Einsum modules. Gemma4 MoE expert weights are
-  bare ``nnx.Param`` leaves consumed by ragged_dot, so they need explicit LoRA
-  leaves plus the optional forward hook in ``gemma4.moe``.
+  Qwix covers the ordinary Linear/Einsum modules. The official Gemma4 ragged
+  MoE router is an Einsum in Flax/Linen, but it is a bare ``nnx.Param`` in
+  Tunix, so the router needs explicit LoRA leaves plus the forward hook in
+  ``gemma4.moe``. Raw expert weights (``gating_einsum`` and ``linear``) are
+  experimental opt-in targets because the official ragged implementation stores
+  them as raw weight providers rather than supported LoRA Einsum modules.
   """
   rngs = nnx.Rngs(rng_seed)
   for _path, module in nnx.iter_modules(model):
@@ -956,11 +958,7 @@ def apply_lora(
     rng_seed: int = 10003,
     materialize_without_remat: bool = True,
     apply_moe: bool = True,
-    moe_target_names: tuple[str, ...] = (
-        "router_logits",
-        "gating_einsum",
-        "linear",
-    ),
+    moe_target_names: tuple[str, ...] = ("router_logits",),
 ) -> nnx.Module:
   provider = qwix.LoraProvider(
       module_path=module_path,

@@ -1668,17 +1668,19 @@ def parse_args() -> argparse.Namespace:
       action=argparse.BooleanOptionalAction,
       default=True,
       help=(
-          "Attach DiffusionGemma MoE LoRA leaves. Enabled by default to match "
-          "the broad all-linear target set; disable only for memory diagnosis."
+          "Attach DiffusionGemma ragged-MoE LoRA leaves. Enabled by default "
+          "for the router path needed to mirror the official ragged MoE LoRA "
+          "coverage; raw expert weights are opt-in via --moe_lora_targets."
       ),
   )
   parser.add_argument(
       "--moe_lora_targets",
-      default="router_logits,gating_einsum,linear",
+      default="router_logits",
       help=(
-          "Comma-separated MoE raw-param LoRA targets. Use subsets such as "
-          "'router_logits' or 'router_logits,gating_einsum' to isolate H100x2 "
-          "memory pressure."
+          "Comma-separated MoE raw-param LoRA targets. The H100x2-verified "
+          "official-compatible default is 'router_logits'. Adding "
+          "'gating_einsum' or 'linear' enables experimental raw expert LoRA "
+          "and can exceed H100x2 memory."
       ),
   )
   parser.add_argument("--learning_rate", type=float, default=1e-4)
