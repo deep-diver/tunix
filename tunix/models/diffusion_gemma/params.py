@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import dataclasses
 import itertools
 from typing import Any
 
@@ -191,6 +192,10 @@ def create_model_from_checkpoint(
   deterministic initialization and reported as warnings so MVP validation tests can
   validate the training path before full checkpoint parity is completed.
   """
+  if dataclasses.is_dataclass(model_config):
+    model_config = dataclasses.replace(
+        model_config, dtype=dtype, param_dtype=dtype
+    )
   abs_model = nnx.eval_shape(
       lambda: model_lib.DiffusionGemma_A26B_A4B(model_config, rngs=nnx.Rngs(0))
   )
