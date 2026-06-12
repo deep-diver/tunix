@@ -29,6 +29,17 @@ def _maybe_lora_weight(module: nnx.Module, name: str, weight: jax.Array):
   return weight + delta.astype(weight.dtype) * scale
 
 
+def _has_lora(module: nnx.Module, name: str) -> bool:
+  return (
+      getattr(module, f'{name}_lora_a', None) is not None
+      and getattr(module, f'{name}_lora_b', None) is not None
+  )
+
+
+def _moe_lora_scale(module: nnx.Module):
+  return getattr(module, 'moe_lora_scale', 1.0)
+
+
 def _renormalization_factor(router_probs: jax.Array, choices: jax.Array):
   """Computes the renormalization factor for routing weights."""
   indicator = jax.nn.one_hot(
@@ -149,10 +160,7 @@ class MoERagged(nnx.Module):
         xs_combine_weights,
     ) = _expert_dispatch(x, expert_choices, expert_weights)
 
-    w_gate = _maybe_lora_weight(
-        self, 'gating_einsum', self.gating_einsum.value
-    )
-    w_gate = jnp.transpose(w_gate, (0, 3, 1, 2))
+    w_gate = jnp.transpose(self.gating_einsum.value, (0, 3, 1, 2))
     w_gate = w_gate.reshape(
         self.num_experts, self.features, 2 * self.hidden_dim
     )
@@ -162,6 +170,26 @@ class MoERagged(nnx.Module):
         w_gate.astype(self.config.dtype),
         group_sizes=xs_tokens_per_expert,
     )
+    if _has_lora(self, 'gating_einsum'):
+      gate_lora_a = self.gating_einsum_lora_a.value
+      gate_lora_b = self.gating_einsum_lora_b.value
+      gate_rank_acts = jnp.einsum(
+          'td,rd->tr',
+          sorted_xs.astype(self.config.dtype),
+          gate_lora_b.astype(self.config.dtype),
+          preferred_element_type=self.config.dtype,
+      )
+      gate_lora_w = jnp.transpose(gate_lora_a, (0, 3, 1, 2)).reshape(
+          self.num_experts, gate_lora_a.shape[-1], 2 * self.hidden_dim
+      )
+      gate_out = gate_out + (
+          jax.lax.ragged_dot(
+              gate_rank_acts,
+              gate_lora_w.astype(self.config.dtype),
+              group_sizes=xs_tokens_per_expert,
+          )
+          * _moe_lora_scale(self)
+      ).astype(gate_out.dtype)
 
     gate_out = gate_out.reshape(gate_out.shape[0], 2, self.hidden_dim)
     x1 = gate_out[:, 0, :]
@@ -170,11 +198,26 @@ class MoERagged(nnx.Module):
 
     expert_outputs = jax.lax.ragged_dot(
         activation,
-        _maybe_lora_weight(self, 'linear', self.linear.value).astype(
-            self.config.dtype
-        ),
+        self.linear.value.astype(self.config.dtype),
         group_sizes=xs_tokens_per_expert,
     )
+    if _has_lora(self, 'linear'):
+      linear_lora_a = self.linear_lora_a.value
+      linear_lora_b = self.linear_lora_b.value
+      linear_rank_acts = jax.lax.ragged_dot(
+          activation,
+          linear_lora_a.astype(self.config.dtype),
+          group_sizes=xs_tokens_per_expert,
+      )
+      linear_delta = jnp.einsum(
+          'tr,rd->td',
+          linear_rank_acts,
+          linear_lora_b.astype(self.config.dtype),
+          preferred_element_type=self.config.dtype,
+      )
+      expert_outputs = expert_outputs + (
+          linear_delta * _moe_lora_scale(self)
+      ).astype(expert_outputs.dtype)
 
     expert_indices = jnp.repeat(
         jnp.arange(self.num_experts),
@@ -213,10 +256,24 @@ class MoERagged(nnx.Module):
     logits = jnp.einsum(
         'gsd,de->gse',
         router_input,
-        _maybe_lora_weight(
-            self, 'router_logits', self.router_logits.value
-        ).astype(router_input.dtype),
+        self.router_logits.value.astype(router_input.dtype),
     )
+    if _has_lora(self, 'router_logits'):
+      router_rank_acts = jnp.einsum(
+          'gsd,dr->gsr',
+          router_input,
+          self.router_logits_lora_a.value.astype(router_input.dtype),
+          preferred_element_type=router_input.dtype,
+      )
+      router_delta = jnp.einsum(
+          'gsr,re->gse',
+          router_rank_acts,
+          self.router_logits_lora_b.value.astype(router_input.dtype),
+          preferred_element_type=router_input.dtype,
+      )
+      logits = logits + (
+          router_delta * _moe_lora_scale(self)
+      ).astype(logits.dtype)
     weights, choices = self._router(logits)
     out = self._run_ffw_and_routing(x, choices, weights)
     return out
