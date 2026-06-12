@@ -961,6 +961,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       ),
   )
 
+  if args.initial_loss_only:
+    ckpt_dir = _checkpoint_dir(
+        args, prefix="diffusion_gemma_pubmedqa_initial_loss_"
+    )
+    result = {
+        "mode": "initial_loss_only",
+        "steps": 0,
+        "checkpoint_dir": ckpt_dir,
+        "checkpoint_dir_exists": pathlib.Path(ckpt_dir).exists(),
+        "minimal_state_path": str(pathlib.Path(ckpt_dir) / "minimal_state.json"),
+        "initial_loss": float(jax.device_get(initial_loss)),
+        "initial_decoder_loss": float(jax.device_get(initial_aux["decoder_loss"])),
+        "initial_encoder_loss": float(jax.device_get(initial_aux["encoder_loss"])),
+        "corrupted_fraction": float(
+            jax.device_get(initial_aux["corrupted_fraction"])
+        ),
+        "time_mean": float(jax.device_get(initial_aux["time_mean"])),
+        "first_pubmed_id": examples[0].pubmed_id,
+        "prompt_len": args.prompt_len,
+        "canvas_size": args.canvas_size,
+        "num_canvases": args.num_canvases,
+        "batch_size": args.batch_size,
+        "decoder_implementation": args.decoder_implementation,
+        "remat_decoder": args.remat_decoder,
+        "encoder_loss_chunk_size": args.encoder_loss_chunk_size,
+        "mesh_fsdp": mesh_fsdp,
+        "mesh_tp": mesh_tp,
+        "trainable_state": trainable_summary,
+        "frozen_state": frozen_summary,
+    }
+    if not result["checkpoint_dir_exists"]:
+      raise RuntimeError(f"Checkpoint directory was not created: {ckpt_dir}")
+    return _write_result(
+        result,
+        event="initial_loss_only_complete",
+        gpu_memory_monitor=gpu_memory_monitor,
+    )
+
   lora_before_norm = _tree_l2_norm(nnx.state(model, nnx.LoRAParam))
   lora_before_checksums = _small_leaf_checksums(
       nnx.state(model, nnx.LoRAParam), limit=32, max_size=262144
@@ -1085,6 +1123,16 @@ def parse_args() -> argparse.Namespace:
           "minimal_state.json proof artifact, and exit before dataset, loss, "
           "or trainer construction. This isolates checkpoint/LoRA peak memory "
           "from train-step peak memory."
+      ),
+  )
+  parser.add_argument(
+      "--initial_loss_only",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Load model/data, attach LoRA params, compute the initial "
+          "DiffusionGemma SFT loss once, write minimal_state.json, and exit "
+          "before optimizer/trainer construction."
       ),
   )
   parser.add_argument("--steps", type=int, default=2)
