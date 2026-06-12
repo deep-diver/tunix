@@ -929,6 +929,7 @@ def apply_moe_lora(
     rank: int,
     alpha: float,
     rng_seed: int,
+    target_names: tuple[str, ...] = ("router_logits", "gating_einsum", "linear"),
 ) -> nnx.Module:
   """Adds LoRA leaves for Gemma4 MoE params used by DiffusionGemma 26B.
 
@@ -941,7 +942,7 @@ def apply_moe_lora(
     if not isinstance(module, gemma4_moe.MoERagged):
       continue
     module.moe_lora_scale = alpha / rank
-    for name in ("router_logits", "gating_einsum", "linear"):
+    for name in target_names:
       _ensure_moe_lora_param(module, name, rank=rank, rngs=rngs)
   return model
 
@@ -955,6 +956,11 @@ def apply_lora(
     rng_seed: int = 10003,
     materialize_without_remat: bool = True,
     apply_moe: bool = True,
+    moe_target_names: tuple[str, ...] = (
+        "router_logits",
+        "gating_einsum",
+        "linear",
+    ),
 ) -> nnx.Module:
   provider = qwix.LoraProvider(
       module_path=module_path,
@@ -989,7 +995,11 @@ def apply_lora(
     )
     if apply_moe:
       model = apply_moe_lora(
-          model, rank=rank, alpha=alpha, rng_seed=rng_seed + 1
+          model,
+          rank=rank,
+          alpha=alpha,
+          rng_seed=rng_seed + 1,
+          target_names=moe_target_names,
       )
     model.set_attributes(qwix_rngs=nnx.Rngs(rng_seed))
   finally:

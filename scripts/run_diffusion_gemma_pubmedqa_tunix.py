@@ -634,6 +634,18 @@ def _state_summary(state: Any) -> dict[str, int]:
   }
 
 
+def _parse_moe_lora_targets(value: str) -> tuple[str, ...]:
+  names = tuple(name.strip() for name in value.split(",") if name.strip())
+  valid = {"router_logits", "gating_einsum", "linear"}
+  unknown = sorted(set(names) - valid)
+  if unknown:
+    raise ValueError(
+        "--moe_lora_targets entries must be one of "
+        f"{sorted(valid)}, got {unknown}."
+    )
+  return names
+
+
 def _block_until_ready_state(state: Any) -> None:
   for leaf in jax.tree.leaves(state):
     if hasattr(leaf, "block_until_ready"):
@@ -1043,6 +1055,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         alpha=args.lora_alpha,
         module_path=args.lora_module_path,
         apply_moe=args.moe_lora,
+        moe_target_names=_parse_moe_lora_targets(args.moe_lora_targets),
     )
     _block_until_ready_state(nnx.state(model))
     _log(
@@ -1051,6 +1064,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         lora_rank=args.lora_rank,
         lora_module_path=args.lora_module_path,
         moe_lora=args.moe_lora,
+        moe_lora_targets=args.moe_lora_targets,
         remat_decoder=args.remat_decoder,
         remat_policy=_remat_policy_name(args),
         attention_implementation=_attention_implementation_name(args),
@@ -1088,6 +1102,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "lora_alpha": args.lora_alpha,
         "lora_module_path": args.lora_module_path,
         "moe_lora": args.moe_lora,
+        "moe_lora_targets": args.moe_lora_targets,
         "remat_decoder": args.remat_decoder,
         "remat_policy": _remat_policy_name(args),
         "attention_implementation": _attention_implementation_name(args),
@@ -1150,6 +1165,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       alpha=args.lora_alpha,
       module_path=args.lora_module_path,
       apply_moe=args.moe_lora,
+      moe_target_names=_parse_moe_lora_targets(args.moe_lora_targets),
   )
   _log(
       "model_ready",
@@ -1157,6 +1173,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       lora_rank=args.lora_rank,
       lora_module_path=args.lora_module_path,
       moe_lora=args.moe_lora,
+      moe_lora_targets=args.moe_lora_targets,
       remat_decoder=args.remat_decoder,
       remat_policy=_remat_policy_name(args),
       attention_implementation=_attention_implementation_name(args),
@@ -1266,6 +1283,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": args.batch_size,
         "decoder_implementation": args.decoder_implementation,
         "moe_lora": args.moe_lora,
+        "moe_lora_targets": args.moe_lora_targets,
         "remat_decoder": args.remat_decoder,
         "remat_policy": _remat_policy_name(args),
         "attention_implementation": _attention_implementation_name(args),
@@ -1391,6 +1409,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       ),
       "decoder_implementation": args.decoder_implementation,
       "moe_lora": args.moe_lora,
+      "moe_lora_targets": args.moe_lora_targets,
       "remat_decoder": args.remat_decoder,
       "remat_policy": _remat_policy_name(args),
       "attention_implementation": _attention_implementation_name(args),
@@ -1651,6 +1670,15 @@ def parse_args() -> argparse.Namespace:
       help=(
           "Attach DiffusionGemma MoE LoRA leaves. Enabled by default to match "
           "the broad all-linear target set; disable only for memory diagnosis."
+      ),
+  )
+  parser.add_argument(
+      "--moe_lora_targets",
+      default="router_logits,gating_einsum,linear",
+      help=(
+          "Comma-separated MoE raw-param LoRA targets. Use subsets such as "
+          "'router_logits' or 'router_logits,gating_einsum' to isolate H100x2 "
+          "memory pressure."
       ),
   )
   parser.add_argument("--learning_rate", type=float, default=1e-4)
