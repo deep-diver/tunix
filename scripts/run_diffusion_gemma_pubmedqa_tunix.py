@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import dataclasses
+import gc
 import json
 import os
 import pathlib
@@ -1171,22 +1172,43 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
   train_batches = _make_train_batches(
       examples, tokenizer=tokenizer, args=args, vocab_size=vocab_size
   )
-  initial_loss, initial_aux = diffusion_sft.make_loss_fn(diffusion_config)(
-      model, **train_batches[0]
-  )
-  initial_loss.block_until_ready()
-  if not bool(jnp.isfinite(initial_loss)):
-    raise RuntimeError(f"Initial PubMedQA loss is not finite: {initial_loss}")
-  _log(
-      "initial_loss",
-      loss=float(jax.device_get(initial_loss)),
-      decoder_loss=float(jax.device_get(initial_aux["decoder_loss"])),
-      encoder_loss=float(jax.device_get(initial_aux["encoder_loss"])),
-      corrupted_fraction=float(
-          jax.device_get(initial_aux["corrupted_fraction"])
-      ),
-      time_mean=float(jax.device_get(initial_aux["time_mean"])),
-  )
+  if args.skip_initial_loss and args.initial_loss_only:
+    raise ValueError("--skip_initial_loss cannot be used with --initial_loss_only.")
+  initial_loss_value = None
+  initial_decoder_loss_value = None
+  initial_encoder_loss_value = None
+  initial_corrupted_fraction_value = None
+  initial_time_mean_value = None
+  if args.skip_initial_loss:
+    _log(
+        "initial_loss_skipped",
+        reason=(
+            "Skipped to avoid compiling a large pre-train loss executable "
+            "before memory-constrained H100x2 train-step validation."
+        ),
+    )
+  else:
+    initial_loss, initial_aux = diffusion_sft.make_loss_fn(diffusion_config)(
+        model, **train_batches[0]
+    )
+    initial_loss.block_until_ready()
+    if not bool(jnp.isfinite(initial_loss)):
+      raise RuntimeError(f"Initial PubMedQA loss is not finite: {initial_loss}")
+    initial_loss_value = float(jax.device_get(initial_loss))
+    initial_decoder_loss_value = float(jax.device_get(initial_aux["decoder_loss"]))
+    initial_encoder_loss_value = float(jax.device_get(initial_aux["encoder_loss"]))
+    initial_corrupted_fraction_value = float(
+        jax.device_get(initial_aux["corrupted_fraction"])
+    )
+    initial_time_mean_value = float(jax.device_get(initial_aux["time_mean"]))
+    _log(
+        "initial_loss",
+        loss=initial_loss_value,
+        decoder_loss=initial_decoder_loss_value,
+        encoder_loss=initial_encoder_loss_value,
+        corrupted_fraction=initial_corrupted_fraction_value,
+        time_mean=initial_time_mean_value,
+    )
   trainable_summary = _state_summary(nnx.state(model, nnx.LoRAParam))
   frozen_summary = _state_summary(
       nnx.state(model, nnx.filterlib.Not(nnx.LoRAParam))
@@ -1211,13 +1233,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint_dir": ckpt_dir,
         "checkpoint_dir_exists": pathlib.Path(ckpt_dir).exists(),
         "minimal_state_path": str(pathlib.Path(ckpt_dir) / "minimal_state.json"),
-        "initial_loss": float(jax.device_get(initial_loss)),
-        "initial_decoder_loss": float(jax.device_get(initial_aux["decoder_loss"])),
-        "initial_encoder_loss": float(jax.device_get(initial_aux["encoder_loss"])),
-        "corrupted_fraction": float(
-            jax.device_get(initial_aux["corrupted_fraction"])
-        ),
-        "time_mean": float(jax.device_get(initial_aux["time_mean"])),
+        "initial_loss": initial_loss_value,
+        "initial_decoder_loss": initial_decoder_loss_value,
+        "initial_encoder_loss": initial_encoder_loss_value,
+        "corrupted_fraction": initial_corrupted_fraction_value,
+        "time_mean": initial_time_mean_value,
         "first_pubmed_id": examples[0].pubmed_id,
         "prompt_len": args.prompt_len,
         "canvas_size": args.canvas_size,
@@ -1236,10 +1256,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not result["checkpoint_dir_exists"]:
       raise RuntimeError(f"Checkpoint directory was not created: {ckpt_dir}")
     return _write_result(
-        result,
-        event="initial_loss_only_complete",
-        gpu_memory_monitor=gpu_memory_monitor,
+      result,
+      event="initial_loss_only_complete",
+      gpu_memory_monitor=gpu_memory_monitor,
     )
+
+  if not args.skip_initial_loss and args.clear_caches_after_initial_loss:
+    del initial_loss, initial_aux
+    gc.collect()
+    jax.clear_caches()
+    _log("jax_caches_cleared_after_initial_loss")
 
   lora_before_norm = _tree_l2_norm(nnx.state(model, nnx.LoRAParam))
   lora_before_checksums = _small_leaf_checksums(
@@ -1321,7 +1347,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       "checkpoint_dir_exists": pathlib.Path(ckpt_dir).exists(),
       "orbax_checkpoint": args.orbax_checkpoint,
       "minimal_state_path": str(pathlib.Path(ckpt_dir) / "minimal_state.json"),
-      "initial_loss": float(jax.device_get(initial_loss)),
+      "initial_loss": initial_loss_value,
       "final_loss": float(jax.device_get(final_loss)),
       "final_decoder_loss": float(jax.device_get(final_aux["decoder_loss"])),
       "final_encoder_loss": float(jax.device_get(final_aux["encoder_loss"])),
@@ -1412,6 +1438,26 @@ def parse_args() -> argparse.Namespace:
           "Load model/data, attach LoRA params, compute the initial "
           "DiffusionGemma SFT loss once, write minimal_state.json, and exit "
           "before optimizer/trainer construction."
+      ),
+  )
+  parser.add_argument(
+      "--skip_initial_loss",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Skip the pre-train full-loss compile. This is useful for tight "
+          "H100x2 train-step validation; final loss and train-step losses are "
+          "still checked."
+      ),
+  )
+  parser.add_argument(
+      "--clear_caches_after_initial_loss",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help=(
+          "Clear JAX compilation caches after the optional initial loss check "
+          "so memory-constrained train-step executables do not coexist with "
+          "the pre-train loss executable."
       ),
   )
   parser.add_argument("--steps", type=int, default=2)
