@@ -794,6 +794,7 @@ class Attention(nnx.Module):
         self.config.attention_implementation == 'cudnn'
         and seq_len > 1
         and key_proj.shape[1] == seq_len
+        and self.head_dim <= 256
     ):
       local_window_size = None
       if self.attn_type == AttentionType.LOCAL_SLIDING:
