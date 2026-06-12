@@ -2,6 +2,12 @@
 
 Date: 2026-06-12
 
+Superseded: this earlier CUDA12/NCCL result is superseded by
+`h100x2_cuda13_preinit_2026-06-12.md`, which verifies both the official
+reference runner and the Tunix wrapper on H100 x2 with CUDA13 JAX, early JAX
+GPU initialization, official NCCL/XLA settings, and addressable loss-shard
+synchronization.
+
 ## Setup
 
 - Official reference VM: `425566`, H100 80GB x2.

@@ -1,0 +1,301 @@
+{
+  "event_scalars": {
+    "event_dirs": [],
+    "metrics": {}
+  },
+  "gpu_memory": {
+    "path": "/home/ubuntu/diffusion_gemma_compare/upstream_official_preinit_h100x2_20260612T112355Z/workdir/gpu_memory.csv",
+    "per_gpu": {
+      " 0": {
+        "median_used_mib": 61385.0,
+        "min_free_mib": 19621.0,
+        "peak_used_mib": 61459.0
+      },
+      " 1": {
+        "median_used_mib": 61363.0,
+        "min_free_mib": 19717.0,
+        "peak_used_mib": 61363.0
+      }
+    },
+    "samples": 14
+  },
+  "log_events": {
+    "events": {
+      "diffusion_gemma_hybrid_loss": {
+        "count": 3,
+        "first": {
+          "event": "diffusion_gemma_hybrid_loss",
+          "line": 2665,
+          "loop_step": 0,
+          "metric": "losses/diffusion_loss",
+          "step": 1,
+          "value": 6.421875
+        },
+        "last": {
+          "event": "diffusion_gemma_hybrid_loss",
+          "line": 2667,
+          "loop_step": 0,
+          "metric": "losses/total",
+          "step": 1,
+          "value": 13.671875
+        },
+        "last_state_step": 1
+      },
+      "official_reference_config_built": {
+        "count": 1,
+        "first": {
+          "canvas_size": 128,
+          "checkpoint_path": "/home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it",
+          "dataset_batch_size": 2,
+          "evals": [],
+          "event": "official_reference_config_built",
+          "line": 11,
+          "lora_rank": 4,
+          "num_canvases": 2,
+          "num_train_steps": 2000,
+          "prompt_len": 1024,
+          "recipe": "pubmedqa",
+          "use_lora": true,
+          "workdir": "/home/ubuntu/diffusion_gemma_compare/upstream_official_preinit_h100x2_20260612T112355Z/workdir"
+        },
+        "last": {
+          "canvas_size": 128,
+          "checkpoint_path": "/home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it",
+          "dataset_batch_size": 2,
+          "evals": [],
+          "event": "official_reference_config_built",
+          "line": 11,
+          "lora_rank": 4,
+          "num_canvases": 2,
+          "num_train_steps": 2000,
+          "prompt_len": 1024,
+          "recipe": "pubmedqa",
+          "use_lora": true,
+          "workdir": "/home/ubuntu/diffusion_gemma_compare/upstream_official_preinit_h100x2_20260612T112355Z/workdir"
+        },
+        "last_state_step": null
+      },
+      "official_reference_dependencies": {
+        "count": 1,
+        "first": {
+          "available": true,
+          "event": "official_reference_dependencies",
+          "line": 7,
+          "missing": [],
+          "versions": {
+            "gemma": "4.0.1",
+            "hackable_diffusion": "1.0.1",
+            "kauldron": "1.4.4"
+          }
+        },
+        "last": {
+          "available": true,
+          "event": "official_reference_dependencies",
+          "line": 7,
+          "missing": [],
+          "versions": {
+            "gemma": "4.0.1",
+            "hackable_diffusion": "1.0.1",
+            "kauldron": "1.4.4"
+          }
+        },
+        "last_state_step": null
+      },
+      "official_reference_hybrid_step_complete": {
+        "count": 1,
+        "first": {
+          "event": "official_reference_hybrid_step_complete",
+          "line": 2668,
+          "logged_losses": [
+            "losses/diffusion_loss",
+            "losses/encoder_loss",
+            "losses/total"
+          ],
+          "loop_step": 0,
+          "state_step": 1,
+          "sync_after_step": "losses"
+        },
+        "last": {
+          "event": "official_reference_hybrid_step_complete",
+          "line": 2668,
+          "logged_losses": [
+            "losses/diffusion_loss",
+            "losses/encoder_loss",
+            "losses/total"
+          ],
+          "loop_step": 0,
+          "state_step": 1,
+          "sync_after_step": "losses"
+        },
+        "last_state_step": 1
+      },
+      "official_reference_hybrid_train_complete": {
+        "count": 1,
+        "first": {
+          "event": "official_reference_hybrid_train_complete",
+          "line": 2669,
+          "num_steps": 1,
+          "state_step": 1,
+          "workdir": "/home/ubuntu/diffusion_gemma_compare/upstream_official_preinit_h100x2_20260612T112355Z/workdir"
+        },
+        "last": {
+          "event": "official_reference_hybrid_train_complete",
+          "line": 2669,
+          "num_steps": 1,
+          "state_step": 1,
+          "workdir": "/home/ubuntu/diffusion_gemma_compare/upstream_official_preinit_h100x2_20260612T112355Z/workdir"
+        },
+        "last_state_step": 1
+      },
+      "official_reference_jax_preinit": {
+        "count": 1,
+        "first": {
+          "device_count": 2,
+          "devices": [
+            "cuda:0",
+            "cuda:1"
+          ],
+          "event": "official_reference_jax_preinit",
+          "line": 6,
+          "tensorflow_gpu_hidden": true
+        },
+        "last": {
+          "device_count": 2,
+          "devices": [
+            "cuda:0",
+            "cuda:1"
+          ],
+          "event": "official_reference_jax_preinit",
+          "line": 6,
+          "tensorflow_gpu_hidden": true
+        },
+        "last_state_step": null
+      },
+      "official_reference_train_complete": {
+        "count": 1,
+        "first": {
+          "event": "official_reference_train_complete",
+          "line": 2670,
+          "log_losses": true,
+          "num_train_steps": 2000,
+          "recipe": "pubmedqa",
+          "run_steps": 1,
+          "sync_after_step": "losses",
+          "train_loop": "hybrid",
+          "workdir": "/home/ubuntu/diffusion_gemma_compare/upstream_official_preinit_h100x2_20260612T112355Z/workdir"
+        },
+        "last": {
+          "event": "official_reference_train_complete",
+          "line": 2670,
+          "log_losses": true,
+          "num_train_steps": 2000,
+          "recipe": "pubmedqa",
+          "run_steps": 1,
+          "sync_after_step": "losses",
+          "train_loop": "hybrid",
+          "workdir": "/home/ubuntu/diffusion_gemma_compare/upstream_official_preinit_h100x2_20260612T112355Z/workdir"
+        },
+        "last_state_step": null
+      }
+    },
+    "path": "/home/ubuntu/diffusion_gemma_compare/upstream_official_preinit_h100x2_20260612T112355Z/workdir/train.log"
+  },
+  "log_scalars": {
+    "metrics": {
+      "losses/diffusion_loss": {
+        "count": 1,
+        "first": {
+          "line": 2665,
+          "step": 1,
+          "value": 6.421875
+        },
+        "last": {
+          "line": 2665,
+          "step": 1,
+          "value": 6.421875
+        },
+        "max": 6.421875,
+        "min": 6.421875
+      },
+      "losses/encoder_loss": {
+        "count": 1,
+        "first": {
+          "line": 2666,
+          "step": 1,
+          "value": 7.25
+        },
+        "last": {
+          "line": 2666,
+          "step": 1,
+          "value": 7.25
+        },
+        "max": 7.25,
+        "min": 7.25
+      },
+      "losses/total": {
+        "count": 1,
+        "first": {
+          "line": 2667,
+          "step": 1,
+          "value": 13.671875
+        },
+        "last": {
+          "line": 2667,
+          "step": 1,
+          "value": 13.671875
+        },
+        "max": 13.671875,
+        "min": 13.671875
+      }
+    },
+    "path": "/home/ubuntu/diffusion_gemma_compare/upstream_official_preinit_h100x2_20260612T112355Z/workdir/train.log"
+  },
+  "selected": {
+    "losses/diffusion_loss": {
+      "count": 1,
+      "first": {
+        "line": 2665,
+        "step": 1,
+        "value": 6.421875
+      },
+      "last": {
+        "line": 2665,
+        "step": 1,
+        "value": 6.421875
+      },
+      "max": 6.421875,
+      "min": 6.421875
+    },
+    "losses/encoder_loss": {
+      "count": 1,
+      "first": {
+        "line": 2666,
+        "step": 1,
+        "value": 7.25
+      },
+      "last": {
+        "line": 2666,
+        "step": 1,
+        "value": 7.25
+      },
+      "max": 7.25,
+      "min": 7.25
+    },
+    "losses/total": {
+      "count": 1,
+      "first": {
+        "line": 2667,
+        "step": 1,
+        "value": 13.671875
+      },
+      "last": {
+        "line": 2667,
+        "step": 1,
+        "value": 13.671875
+      },
+      "max": 13.671875,
+      "min": 13.671875
+    }
+  },
+  "workdir": "/home/ubuntu/diffusion_gemma_compare/upstream_official_preinit_h100x2_20260612T112355Z/workdir"
+}

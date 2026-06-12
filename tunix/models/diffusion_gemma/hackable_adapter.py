@@ -81,6 +81,10 @@ class OfficialSFTConfig:
     log_losses: If true, the hybrid loop requests and logs official loss states
       from each train step. Disable this to isolate train-step execution from
       host-side loss materialization.
+    sync_after_step: Hybrid-loop synchronization point. `state` preserves the
+      strict device-state block. `losses` synchronizes by reading addressable
+      loss shards only, avoiding full host all-gathers. `none` only dispatches
+      the official step.
     train_loop: Training loop implementation. `kauldron` delegates to the
       official `Trainer.train()`. `hybrid` uses the official resolved model,
       data, checkpoint loader, sharding, train step, optimizer, and LoRA mask,
@@ -108,6 +112,7 @@ class OfficialSFTConfig:
   dataset_batch_size: int | None = None
   skip_step_metrics: bool = False
   log_losses: bool = True
+  sync_after_step: str = "state"
   train_loop: str = "kauldron"
   use_early_stopping: bool | None = None
   disable_evals: bool = False
@@ -130,6 +135,7 @@ def check_dependencies(
     extra_paths: Sequence[str | pathlib.Path] = (),
 ) -> dict[str, Any]:
   """Checks whether the optional official backend can be imported."""
+  initialize_jax_before_tensorflow(extra_paths)
   missing = []
   versions = {}
   with _temporary_sys_path(extra_paths):
@@ -149,6 +155,7 @@ def check_dependencies(
 
 def build_official_sft_config(config: OfficialSFTConfig):
   """Builds an official Kauldron config with Tunix-side overrides applied."""
+  initialize_jax_before_tensorflow(_extra_paths(config))
   module = _import_recipe_module(config)
   module_overrides = dict(config.module_overrides)
   if config.checkpoint_path is not None:
@@ -170,6 +177,7 @@ def build_official_sft_config(config: OfficialSFTConfig):
 def resolve_official_trainer(config: OfficialSFTConfig):
   """Resolves the official Kauldron trainer for this backend."""
   extra_paths = _extra_paths(config)
+  initialize_jax_before_tensorflow(extra_paths)
   with _temporary_sys_path(extra_paths):
     try:
       from kauldron import konfig  # pylint: disable=g-import-not-at-top
@@ -202,6 +210,7 @@ class OfficialDiffusionGemmaTrainer:
           trainer,
           num_steps=self.config.run_steps or self.config.num_train_steps or 1,
           log_losses=self.config.log_losses,
+          sync_after_step=self.config.sync_after_step,
       )
     if self.config.train_loop != "kauldron":
       raise ValueError(
@@ -214,11 +223,20 @@ class OfficialDiffusionGemmaTrainer:
 
 
 def run_hybrid_official_loop(
-    trainer: Any, *, num_steps: int, log_losses: bool = True
+    trainer: Any,
+    *,
+    num_steps: int,
+    log_losses: bool = True,
+    sync_after_step: str = "state",
 ) -> dict[str, Any]:
   """Runs official DiffusionGemma train steps without Kauldron loop syncs."""
   if num_steps < 1:
     raise ValueError(f"num_steps must be positive, got {num_steps}.")
+  if sync_after_step not in ("state", "losses", "none"):
+    raise ValueError(
+        "sync_after_step must be 'state', 'losses', or 'none', got "
+        f"{sync_after_step!r}."
+    )
 
   try:
     import jax  # pylint: disable=g-import-not-at-top
@@ -268,7 +286,8 @@ def run_hybrid_official_loop(
         return_summaries=False,
         checkify_error_categories=trainer.checkify_error_categories,
     )
-    _block_first_array(state)
+    if sync_after_step == "state":
+      _block_first_array(state)
     if trainer.checkify_error_categories:
       jax.device_get(aux.error).throw()
 
@@ -285,6 +304,7 @@ def run_hybrid_official_loop(
             "loop_step": loop_step,
             "state_step": loop_step + 1,
             "logged_losses": logged_losses,
+            "sync_after_step": sync_after_step,
         }),
         flush=True,
     )
@@ -308,8 +328,45 @@ def _extra_paths(config: OfficialSFTConfig) -> list[str]:
   return paths
 
 
+_JAX_PREINIT_DONE = False
+
+
+def initialize_jax_before_tensorflow(
+    extra_paths: Sequence[str | pathlib.Path] = (),
+) -> dict[str, Any]:
+  """Initializes JAX before TensorFlow/Kauldron can claim CUDA libraries."""
+  global _JAX_PREINIT_DONE
+  if _JAX_PREINIT_DONE:
+    return {"event": "official_backend_jax_preinit", "already_done": True}
+
+  report: dict[str, Any] = {"event": "official_backend_jax_preinit"}
+  with _temporary_sys_path(extra_paths):
+    try:
+      import jax  # pylint: disable=g-import-not-at-top
+
+      report["devices"] = [str(device) for device in jax.devices()]
+      report["device_count"] = jax.device_count()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      report["jax_error"] = repr(exc)
+      print(_json_dumps(report), flush=True)
+      return report
+
+    try:
+      import tensorflow as tf  # pylint: disable=g-import-not-at-top
+
+      tf.config.set_visible_devices([], "GPU")
+      report["tensorflow_gpu_hidden"] = True
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      report["tensorflow_error"] = repr(exc)
+
+  _JAX_PREINIT_DONE = True
+  print(_json_dumps(report), flush=True)
+  return report
+
+
 def _import_recipe_module(config: OfficialSFTConfig):
   extra_paths = _extra_paths(config)
+  initialize_jax_before_tensorflow(extra_paths)
   module_name = recipe_module_name(config.recipe)
   with _temporary_sys_path(extra_paths):
     try:
@@ -431,40 +488,25 @@ def _emit_device_loss_values(
     loop_step: int,
     state_step: int,
 ) -> list[str]:
-  """Logs loss scalars through partitioned device callbacks."""
-  if loss_states is None:
-    return []
+  """Logs loss scalars via local-shard scalar reads.
 
-  try:
-    import jax  # pylint: disable=g-import-not-at-top
-    import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
-  except Exception as exc:  # pylint: disable=broad-exception-caught
-    raise OfficialBackendDependencyError(
-        "Device loss logging requires jax."
-    ) from exc
-
-  metric_names: list[str] = []
-  leaves = jax.tree_util.tree_flatten_with_path(
-      loss_states,
-      is_leaf=_is_loss_average_state,
-  )[0]
-  for path, state in leaves:
-    if not _is_loss_average_state(state):
-      continue
-    metric_name = f"losses/{_jax_path_to_string(path)}"
-    total = getattr(state, "total", getattr(state, "value", 0.0))
-    count = state.count
-    done = _device_loss_emitter(metric_name)(
-        total,
-        count,
-        jnp.asarray(loop_step, dtype=jnp.int32),
-        jnp.asarray(state_step, dtype=jnp.int32),
+  Device callbacks require blocking an XLA token, which can still force NCCL
+  collectives on multi-GPU hosts. This mirrors the official safe-writer style
+  by reading the first addressable shard instead.
+  """
+  values = _safe_average_loss_values(loss_states)
+  for metric_name, value in values.items():
+    print(
+        _json_dumps({
+            "event": "diffusion_gemma_hybrid_loss",
+            "metric": metric_name,
+            "step": state_step,
+            "loop_step": loop_step,
+            "value": value,
+        }),
+        flush=True,
     )
-    done.block_until_ready()
-    if hasattr(jax, "effects_barrier"):
-      jax.effects_barrier()
-    metric_names.append(metric_name)
-  return metric_names
+  return list(values)
 
 
 @functools.lru_cache(maxsize=None)
@@ -575,9 +617,8 @@ def _addressable_param_checksum(
 
 
 def _is_loss_average_state(value: Any) -> bool:
-  return (
-      hasattr(value, "count")
-      and (hasattr(value, "total") or hasattr(value, "value"))
+  return hasattr(value, "count") and (
+      hasattr(value, "total") or hasattr(value, "value")
   )
 
 

@@ -1,0 +1,6 @@
+{
+  "event": "official_reference_hybrid_train_complete",
+  "num_steps": 1,
+  "state_step": 1,
+  "workdir": "/home/ubuntu/diffusion_gemma_compare/upstream_official_preinit_h100x2_20260612T112355Z/workdir"
+}

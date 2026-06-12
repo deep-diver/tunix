@@ -57,64 +57,59 @@ do not prove full 26B training completion.
 
 ## H100 x2 Comparison
 
-Two H100 x2 JarvisLabs VMs were used for side-by-side validation:
+One H100 x2 JarvisLabs VM was used for sequential official-vs-wrapper
+validation:
 
-- Official reference VM: `425566`
-- Tunix wrapper VM: `425567`
-- Both VMs were destroyed after the run. Final `jl status --json` reported
-  `running_instances: 0` and `running_vms: 0`.
+- VM: `425813`, H100 80GB x2, region `IN2`.
+- The VM was destroyed after the run.
 
 Both runs used the same public DiffusionGemma checkpoint, official PubMedQA
-recipe geometry, LoRA rank `4`, batch size `2`, JAX `0.10.1`, CUDA 12 wheels,
-and NCCL `2.30.7`.
+recipe geometry, LoRA rank `4`, batch size `2`, prompt length `1024`, two
+canvases of size `128`, JAX `jax[cuda13]==0.10.1`, and the same official Gemma
+and Hackable Diffusion revisions.
 
-The official reference runner and the Tunix wrapper both reached dependency
-setup, dataset preparation, JAX two-device visibility, `pmap` psum validation,
-config construction, checkpoint restore, and model load. Both discarded the
-same 17 checkpoint-only vision/mm keys.
+The runner follows the official DiffusionGemma runtime guidance for CUDA13 JAX:
 
-An asynchronous 1-step hybrid run returned completion markers for both sides:
+- initialize JAX and call `jax.devices()` before TensorFlow/Kauldron imports;
+- set `XLA_FLAGS="--xla_disable_hlo_passes=constant_folding"`;
+- set `NCCL_ALGO=Ring`, `NCCL_PROTO=LL128`, `NCCL_NVLS_ENABLE=0`, and
+  `NCCL_CUMEM_ENABLE=0`;
+- synchronize by reading addressable loss shards instead of forcing a full
+  post-step state all-gather.
 
-- Official reference: `r_be358b08`
-- Tunix wrapper: `r_3f109764`
+The official reference and Tunix wrapper both completed one synchronized 26B
+PubMedQA LoRA train step:
 
-That is not sufficient proof of completed training, because JAX execution is
-asynchronous. A stricter rerun forced synchronization after the train step:
+| Path | Run id | Exit | Total loss | Diffusion loss | Encoder loss |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Official reference | `r_a7c3063e` | `0` | `13.671875` | `6.421875` | `7.25` |
+| Tunix wrapper | `r_f9bdce4c` | `0` | `13.40625` | `6.15625` | `7.25` |
 
-- Official reference strict sync: `r_3b9a2ca7`
-- Tunix wrapper strict sync: `r_b4405817`
+The loss values are finite but not expected to be bit-identical because the two
+runs were independent stochastic runs, not a shared-seed deterministic parity
+job. Peak sampled HBM was `61459/61363` MiB for the official reference and
+`63005/62979` MiB for the Tunix wrapper.
 
-Both strict-sync runs failed at the same point:
-
-```text
-jax.errors.JaxRuntimeError: INTERNAL: NCCL operation ncclAllGather(...) failed:
-invalid argument ... 'lib wrapper not initialized.' [executable_name='jit_step']
-```
-
-The failing call was train-step synchronization, not Tunix-native NNX code. The
-same failure appeared in the standalone official-reference runner and in the
-Tunix wrapper that delegates to the official backend.
+Evidence is stored in
+`evidence/diffusion_gemma/h100x2_cuda13_preinit_2026-06-12.md` and the sibling
+JSON/CSV artifacts.
 
 ## Current Verdict
 
-The wrapper correctly imports and configures the official DiffusionGemma backend
-and matches official helper/logit parity checks, but the H100 x2 synchronized
-26B training step is not verified in the current JarvisLabs runtime.
+The wrapper correctly imports, configures, and executes the official
+DiffusionGemma backend on H100 x2 when the official CUDA13/JAX runtime guidance
+is applied. It matches official helper/logit parity checks locally and completes
+a real 26B PubMedQA LoRA train step through the Tunix wrapper path.
 
-This is not evidence that the Tunix wrapper has diverged from the official
-backend. It is evidence that the official Hackable Diffusion train step, when
-driven under this H100 x2 JAX/NCCL setup and forced to synchronize, fails inside
-`jit_step` NCCL `allGather`.
-
-Treat this integration as a reference wrapper and parity scaffold, not as a
-ready H100 x2 training path.
+Treat this integration as a practical official-backend wrapper plus parity
+scaffold. It is not yet a claim that the native Tunix NNX/Qwix training graph
+has matched the official 2-GPU memory profile.
 
 ## Next Work
 
-- Re-run the strict official reference with a JAX/NCCL version matrix instead of
-  only `jax[cuda12]==0.10.1`.
-- Compare against the official Kauldron loop with an explicit synchronization
-  point that cannot be satisfied by asynchronous dispatch alone.
-- Keep loss/metric logging separate from train-step completion checks, because
-  host loss materialization can trigger additional collectives.
-- Use this official wrapper as the oracle while native NNX/Qwix work continues.
+- Add a shared-seed deterministic GPU comparison if exact stochastic loss parity
+  is required.
+- Compare the hybrid wrapper against a longer official Kauldron run now that the
+  CUDA13/JAX preinit setup is known-good.
+- Keep the official wrapper as the oracle while native NNX/Qwix memory work
+  continues.

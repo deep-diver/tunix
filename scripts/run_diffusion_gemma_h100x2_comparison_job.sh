@@ -20,6 +20,8 @@ CLI_MAX_RUNTIME_SECONDS=""
 CLI_NUM_TRAIN_STEPS=""
 CLI_RUN_STEPS=""
 CLI_LOG_LOSSES=""
+CLI_JAX_PACKAGE_SPEC=""
+CLI_SYNC_AFTER_STEP=""
 CLI_RUN_NAME=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,6 +43,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --log_losses)
       CLI_LOG_LOSSES="$2"
+      shift 2
+      ;;
+    --jax_package_spec)
+      CLI_JAX_PACKAGE_SPEC="$2"
+      shift 2
+      ;;
+    --sync_after_step)
+      CLI_SYNC_AFTER_STEP="$2"
       shift 2
       ;;
     --run_name)
@@ -79,10 +89,12 @@ CHECKPOINT_EVERY_N_STEPS="${CHECKPOINT_EVERY_N_STEPS:-1000}"
 DATASET_BATCH_SIZE="${DATASET_BATCH_SIZE:-2}"
 LORA_RANK="${LORA_RANK:-4}"
 GPU_POLL_SECONDS="${GPU_POLL_SECONDS:-60}"
-JAX_CUDA_EXTRA="${JAX_CUDA_EXTRA:-cuda12}"
+JAX_CUDA_EXTRA="${JAX_CUDA_EXTRA:-cuda13}"
+JAX_PACKAGE_SPEC="${CLI_JAX_PACKAGE_SPEC:-${JAX_PACKAGE_SPEC:-jax[${JAX_CUDA_EXTRA}]}}"
 XLA_FLAGS="${XLA_FLAGS:---xla_disable_hlo_passes=constant_folding}"
 TRAIN_LOOP="${TRAIN_LOOP:-hybrid}"
 LOG_LOSSES="${CLI_LOG_LOSSES:-${LOG_LOSSES:-true}}"
+SYNC_AFTER_STEP="${CLI_SYNC_AFTER_STEP:-${SYNC_AFTER_STEP:-state}}"
 
 python_version_ok() {
   "$1" - <<'PY' >/dev/null 2>&1
@@ -96,18 +108,27 @@ if [[ -n "${PYTHON_BIN:-}" ]] && ! python_version_ok "${PYTHON_BIN}"; then
 fi
 
 if [[ -z "${PYTHON_BIN:-}" ]]; then
-  if command -v python3.13 >/dev/null 2>&1 && python_version_ok "$(command -v python3.13)"; then
-    PYTHON_BIN="$(command -v python3.13)"
-  elif command -v python3.12 >/dev/null 2>&1 && python_version_ok "$(command -v python3.12)"; then
+  if command -v python3.12 >/dev/null 2>&1 && python_version_ok "$(command -v python3.12)"; then
     PYTHON_BIN="$(command -v python3.12)"
+  elif command -v python3.13 >/dev/null 2>&1 && python_version_ok "$(command -v python3.13)"; then
+    PYTHON_BIN="$(command -v python3.13)"
   elif [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -x "${VIRTUAL_ENV}/bin/python" ]] && python_version_ok "${VIRTUAL_ENV}/bin/python"; then
     PYTHON_BIN="${VIRTUAL_ENV}/bin/python"
-  elif command -v uv >/dev/null 2>&1; then
-    uv python install 3.13
-    PYTHON_BIN="$(uv python find 3.13)"
   else
-    echo "Python >=3.12 is required for official DiffusionGemma packages." >&2
-    exit 1
+    if ! command -v uv >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+      if ! python3 -m pip --version >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update
+        sudo apt-get install -y python3-pip python3-venv
+      fi
+      python3 -m pip install --user uv
+      export PATH="${HOME_DIR}/.local/bin:${PATH}"
+    fi
+    if ! command -v uv >/dev/null 2>&1; then
+      echo "Python >=3.12 is required and uv is unavailable to install it." >&2
+      exit 1
+    fi
+    uv python install 3.12
+    PYTHON_BIN="$(uv python find 3.12)"
   fi
 fi
 
@@ -142,6 +163,8 @@ json_event comparison_job_start \
   lora_rank="${LORA_RANK}" \
   train_loop="${TRAIN_LOOP}" \
   log_losses="${LOG_LOSSES}" \
+  sync_after_step="${SYNC_AFTER_STEP}" \
+  jax_package_spec="${JAX_PACKAGE_SPEC}" \
   xla_flags="${XLA_FLAGS}"
 
 if [[ ! -x "${VENV}/bin/python" ]] || ! python_version_ok "${VENV}/bin/python"; then
@@ -171,13 +194,33 @@ fi
 python -m pip install -e "${HACKABLE_DIFFUSION_REF}"
 python -m pip install -e "${GEMMA_REF}"
 python -m pip uninstall -y \
+  jax \
+  jaxlib \
   jax-cuda12-plugin \
   jax-cuda12-pjrt \
   jax-cuda13-plugin \
   jax-cuda13-pjrt \
+  nvidia-cublas-cu12 \
+  nvidia-cuda-cccl-cu12 \
+  nvidia-cuda-cupti-cu12 \
+  nvidia-cuda-nvcc-cu12 \
+  nvidia-cuda-nvrtc-cu12 \
+  nvidia-cuda-runtime-cu12 \
+  nvidia-cudnn-cu12 \
+  nvidia-cufft-cu12 \
+  nvidia-cusolver-cu12 \
+  nvidia-cusparse-cu12 \
   nvidia-nccl-cu12 \
-  nvidia-nccl-cu13 || true
-python -m pip install -U "jax[${JAX_CUDA_EXTRA}]" tensorboard
+  nvidia-nvjitlink-cu12 \
+  nvidia-nvshmem-cu12 || true
+python -m pip install -U "${JAX_PACKAGE_SPEC}" tensorboard
+
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+export NCCL_ALGO="${NCCL_ALGO:-Ring}"
+export NCCL_PROTO="${NCCL_PROTO:-LL128}"
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
+export XLA_FLAGS
 
 rm -rf /tmp/pubmedqa_repo
 (
@@ -256,6 +299,8 @@ else
   COMMON_ARGS+=(--log_losses)
 fi
 
+COMMON_ARGS+=(--sync_after_step "${SYNC_AFTER_STEP}")
+
 if [[ "${MODE}" == "upstream" ]]; then
   RUNNER=(
     python "${REPO_ROOT}/scripts/run_diffusion_gemma_official_reference.py"
@@ -269,13 +314,6 @@ else
     --train_loop "${TRAIN_LOOP}"
   )
 fi
-
-export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
-export NCCL_ALGO="${NCCL_ALGO:-Ring}"
-export NCCL_PROTO="${NCCL_PROTO:-LL128}"
-export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
-export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
-export XLA_FLAGS
 
 set +e
 timeout --preserve-status --signal=TERM "${MAX_RUNTIME_SECONDS}" \
@@ -315,6 +353,8 @@ payload = {
     "hackable_diffusion_revision": "$(git -C "${HACKABLE_DIFFUSION_REF}" rev-parse HEAD)",
     "train_loop": "${TRAIN_LOOP}",
     "log_losses": "${LOG_LOSSES}",
+    "sync_after_step": "${SYNC_AFTER_STEP}",
+    "jax_package_spec": "${JAX_PACKAGE_SPEC}",
     "xla_flags": "${XLA_FLAGS}",
 }
 path = pathlib.Path("${RESULT_JSON}")

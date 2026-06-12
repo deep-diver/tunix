@@ -139,6 +139,16 @@ def parse_args() -> argparse.Namespace:
       ),
   )
   parser.add_argument(
+      "--sync_after_step",
+      choices=["state", "losses", "none"],
+      default="state",
+      help=(
+          "Hybrid-loop synchronization point. 'state' preserves the strict "
+          "device-state block; 'losses' synchronizes by reading addressable "
+          "loss shards only; 'none' only dispatches the step."
+      ),
+  )
+  parser.add_argument(
       "--train_loop",
       choices=["kauldron", "hybrid"],
       default="kauldron",
@@ -184,6 +194,7 @@ def main() -> None:
       dataset_batch_size=args.dataset_batch_size,
       skip_step_metrics=args.skip_step_metrics,
       log_losses=args.log_losses,
+      sync_after_step=args.sync_after_step,
       train_loop=args.train_loop,
       use_early_stopping=args.use_early_stopping,
       disable_evals=args.disable_evals,
@@ -251,6 +262,7 @@ def main() -> None:
           "run_steps": args.run_steps,
           "skip_step_metrics": args.skip_step_metrics,
           "log_losses": args.log_losses,
+          "sync_after_step": args.sync_after_step,
           "train_loop": args.train_loop,
       }),
       flush=True,

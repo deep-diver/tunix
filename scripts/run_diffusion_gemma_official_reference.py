@@ -113,6 +113,16 @@ def parse_args() -> argparse.Namespace:
           "host-side loss materialization."
       ),
   )
+  parser.add_argument(
+      "--sync_after_step",
+      choices=["state", "losses", "none"],
+      default="state",
+      help=(
+          "Hybrid-loop synchronization point. 'state' preserves the strict "
+          "device-state block; 'losses' synchronizes by reading addressable "
+          "loss shards only; 'none' only dispatches the step."
+      ),
+  )
   parser.add_argument("--config_override", action="append", default=[])
   parser.add_argument("--module_override", action="append", default=[])
   return parser.parse_args()
@@ -123,6 +133,7 @@ def main() -> None:
   extra_paths = [
       path for path in (args.hackable_diffusion_ref, args.gemma_ref) if path
   ]
+  _initialize_jax_before_tensorflow(extra_paths)
   dependency_report = _check_dependencies(extra_paths)
   _json_event(event="official_reference_dependencies", **dependency_report)
   if not dependency_report["available"]:
@@ -168,6 +179,7 @@ def main() -> None:
           trainer,
           num_steps=args.run_steps or args.num_train_steps or 1,
           log_losses=args.log_losses,
+          sync_after_step=args.sync_after_step,
       )
     else:
       trainer.train()
@@ -179,11 +191,12 @@ def main() -> None:
       run_steps=args.run_steps,
       train_loop=args.train_loop,
       log_losses=args.log_losses,
+      sync_after_step=args.sync_after_step,
   )
 
 
 def _run_hybrid_official_loop(
-    trainer: Any, *, num_steps: int, log_losses: bool
+    trainer: Any, *, num_steps: int, log_losses: bool, sync_after_step: str
 ) -> None:
   """Runs upstream train steps while extracting losses without all-gathers."""
   import jax  # pylint: disable=g-import-not-at-top
@@ -229,7 +242,8 @@ def _run_hybrid_official_loop(
         return_summaries=False,
         checkify_error_categories=trainer.checkify_error_categories,
     )
-    _block_first_array(state)
+    if sync_after_step == "state":
+      _block_first_array(state)
     if trainer.checkify_error_categories:
       jax.device_get(aux.error).throw()
 
@@ -245,6 +259,7 @@ def _run_hybrid_official_loop(
         loop_step=loop_step,
         state_step=loop_step + 1,
         logged_losses=logged_losses,
+        sync_after_step=sync_after_step,
     )
 
   result = {
@@ -365,35 +380,23 @@ def _emit_device_loss_values(
     loop_step: int,
     state_step: int,
 ) -> list[str]:
-  """Logs loss scalars through partitioned device callbacks."""
-  if loss_states is None:
-    return []
+  """Logs loss scalars via local-shard scalar reads.
 
-  import jax  # pylint: disable=g-import-not-at-top
-  import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
-
-  metric_names: list[str] = []
-  leaves = jax.tree_util.tree_flatten_with_path(
-      loss_states,
-      is_leaf=_is_loss_average_state,
-  )[0]
-  for path, state in leaves:
-    if not _is_loss_average_state(state):
-      continue
-    metric_name = f"losses/{_jax_path_to_string(path)}"
-    total = getattr(state, "total", getattr(state, "value", 0.0))
-    count = state.count
-    done = _device_loss_emitter(metric_name)(
-        total,
-        count,
-        jnp.asarray(loop_step, dtype=jnp.int32),
-        jnp.asarray(state_step, dtype=jnp.int32),
+  `jax.debug.callback(...).block_until_ready()` can still force an XLA token
+  synchronization that trips NCCL on some GPU runtimes. The official
+  SafeMetricWriter already prefers single-addressable-shard reads, so mirror
+  that here for the hybrid runner.
+  """
+  values = _safe_average_loss_values(loss_states)
+  for metric_name, value in values.items():
+    _json_event(
+        event="diffusion_gemma_hybrid_loss",
+        metric=metric_name,
+        step=state_step,
+        loop_step=loop_step,
+        value=value,
     )
-    done.block_until_ready()
-    if hasattr(jax, "effects_barrier"):
-      jax.effects_barrier()
-    metric_names.append(metric_name)
-  return metric_names
+  return list(values)
 
 
 @functools.lru_cache(maxsize=None)
@@ -447,9 +450,8 @@ def _log_device_loss(
 
 
 def _is_loss_average_state(value: Any) -> bool:
-  return (
-      hasattr(value, "count")
-      and (hasattr(value, "total") or hasattr(value, "value"))
+  return hasattr(value, "count") and (
+      hasattr(value, "total") or hasattr(value, "value")
   )
 
 
@@ -475,6 +477,8 @@ def _safe_array_scalar(value: Any) -> float:
   if host_value.size == 0:
     return 0.0
   return float(host_value.reshape(-1)[0])
+
+
 def _jax_path_to_string(path: Any) -> str:
   parts = []
   for part in path:
@@ -510,6 +514,41 @@ def _check_dependencies(
       "missing": missing,
       "versions": versions,
   }
+
+
+_JAX_PREINIT_DONE = False
+
+
+def _initialize_jax_before_tensorflow(
+    extra_paths: Sequence[str | pathlib.Path] = (),
+) -> None:
+  """Initializes JAX before TensorFlow/Kauldron can claim CUDA libraries."""
+  global _JAX_PREINIT_DONE
+  if _JAX_PREINIT_DONE:
+    return
+
+  report: dict[str, Any] = {"event": "official_reference_jax_preinit"}
+  with _temporary_sys_path(extra_paths):
+    try:
+      import jax  # pylint: disable=g-import-not-at-top
+
+      report["devices"] = [str(device) for device in jax.devices()]
+      report["device_count"] = jax.device_count()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      report["jax_error"] = repr(exc)
+      _json_event(**report)
+      return
+
+    try:
+      import tensorflow as tf  # pylint: disable=g-import-not-at-top
+
+      tf.config.set_visible_devices([], "GPU")
+      report["tensorflow_gpu_hidden"] = True
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      report["tensorflow_error"] = repr(exc)
+
+  _JAX_PREINIT_DONE = True
+  _json_event(**report)
 
 
 @contextlib.contextmanager

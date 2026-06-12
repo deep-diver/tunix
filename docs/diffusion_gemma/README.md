@@ -46,12 +46,13 @@ and trainstep objects but drives the step loop from the Tunix wrapper. It is a
 compatibility validation path, not a replacement for the long-term NNX/Qwix model
 family integration.
 
-Current H100 x2 status: the official-reference runner and the Tunix wrapper both
-load the public 26B checkpoint and enter the official PubMedQA LoRA train step,
-but strict post-step synchronization fails for both with the same JAX/NCCL
-`ncclAllGather ... invalid argument` error inside `jit_step`. Treat older
-completion markers that did not force synchronization as asynchronous dispatch
-evidence, not as proof of completed training.
+Current H100 x2 official-backend status: the official-reference runner and the
+Tunix wrapper both complete one synchronized public 26B PubMedQA LoRA train step
+on an H100 80GB x2 VM when run with Python 3.12, `jax[cuda13]==0.10.1`, early
+JAX GPU initialization before TensorFlow/Kauldron imports, the official
+DiffusionGemma CUDA13 NCCL/XLA settings, and addressable loss-shard
+synchronization. Latest evidence is in
+`evidence/diffusion_gemma/h100x2_cuda13_preinit_2026-06-12.md`.
 
 Example PubMedQA validation command on a machine where the official repos are
 available:
@@ -203,6 +204,20 @@ jl exec <machine_id> --json -- sh -lc 'mkdir -p /home/ubuntu/checkpoints/tokeniz
 jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/ubuntu/tunix-dg-h100x2 && . .venv/bin/activate && env XLA_FLAGS="--xla_disable_hlo_passes=constant_folding" NCCL_ALGO=Ring NCCL_PROTO=LL128 NCCL_NVLS_ENABLE=0 NCCL_CUMEM_ENABLE=0 python3 scripts/run_diffusion_gemma_pubmedqa_tunix.py --steps 1 --batch_size 1 --prompt_len 1024 --canvas_size 128 --num_canvases 2 --max_examples 4 --max_context_chars 4000 --checkpoint /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 2 --mesh_tp 1 --restore_concurrent_gb 16 --checkpoint_dir /home/ubuntu/diffusion_gemma_pubmedqa_state_h100x2_fsdp2_encoder_b1 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption --decoder_implementation cached_selected_canvas_slice --remat_decoder --gpu_memory_poll_seconds 2'
 jl destroy <machine_id> --yes --json
 ```
+
+Latest Hackable backend H100x2 wrapper verification:
+
+- Machine: `425813` (`H100`, `IN2`, 2 GPUs, VM), destroyed after the run.
+- Official reference run: `r_a7c3063e`, exit `0`, `jax[cuda13]==0.10.1`,
+  `sync_after_step=losses`, total loss `13.671875`, diffusion loss `6.421875`,
+  encoder loss `7.25`, peak sampled HBM `61459/61363` MiB.
+- Tunix wrapper run: `r_f9bdce4c`, exit `0`, same checkpoint, same PubMedQA
+  recipe geometry, same official Gemma/Hackable Diffusion revisions, total loss
+  `13.40625`, diffusion loss `6.15625`, encoder loss `7.25`, peak sampled HBM
+  `63005/62979` MiB.
+- These were independent stochastic runs, so the loss values are finite
+  completion evidence rather than exact loss-parity evidence. Exact helper and
+  tiny-logit parity remain covered by the local parity scripts.
 
 Latest verified H100x2 comparison:
 
