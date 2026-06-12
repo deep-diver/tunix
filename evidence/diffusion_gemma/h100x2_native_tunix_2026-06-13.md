@@ -27,9 +27,8 @@ explicit experimental target set.
 ## Native H100x2 Run
 
 - Machine: JarvisLabs `425962`, H100 80GB x2, region `IN2`.
-- Repo commit: `7007c657` for the completed native runs. This note also records
-  the follow-up local patch that narrows the default LoRA regex so LoRA leaves
-  do not recursively match other LoRA leaves.
+- Repo commit: `c95a2ff0` for the final default native run. Earlier baseline
+  runs at `7007c657` are retained below for comparison.
 - Checkpoint: `/home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it`.
 - Tokenizer: `/home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model`.
 - Geometry: `prompt_len=1024`, `canvas_size=128`, `num_canvases=2`.
@@ -43,8 +42,42 @@ explicit experimental target set.
   remat, split encoder/decoder gradients, separate loss JITs,
   `encoder_loss_chunk_size=8`, `--skip_initial_loss`.
 
+Run `r_f30bde99` validated the `c95a2ff0` default load-only path:
+
+- LoRA module path:
+  `.*(q_einsum|kv_einsum|k_einsum|attn_vec_einsum|gate_proj|up_proj|down_proj)$`.
+- MoE LoRA targets: `router_logits`.
+- Trainable state: 426 leaves, 4,777,216 elements, 9,554,432 bytes.
+- Frozen state: 638 leaves, 25,250,986,784 elements, 50,501,973,576 bytes.
+- Minimal state:
+  `/home/ubuntu/diffusion_gemma_native_load_h100x2_default_c95a2ff/minimal_state.json`.
+
+Run `r_3ca6917b` validated the `c95a2ff0` default 1-step train path with the
+same official geometry and runtime:
+
+- Step loss: `18.10016632080078`.
+- Decoder loss: `7.257199287414551`.
+- Encoder loss: `10.842966079711914`.
+- Grad norm: `56.25`.
+- Update norm: `0.150390625`.
+- Final sampled loss: `17.54163932800293`.
+- Final sampled decoder loss: `6.385552883148193`.
+- Final sampled encoder loss: `11.156085968017578`.
+- LoRA norm delta: `0.000293731689453125`.
+- LoRA checksum delta: `0.028049468994140625`.
+- LoRA max absolute delta: `0.00010013580322265625`.
+- Base checksum delta: `0.0`.
+- Base max absolute delta: `0.0`.
+- Trainable state: 426 leaves, 4,777,216 elements, 9,554,432 bytes.
+- Frozen state: 638 leaves, 25,250,986,784 elements, 50,501,973,576 bytes.
+- Peak sampled HBM: GPU0 `78255` MiB, GPU1 `78253` MiB.
+- Minimum sampled headroom: `3304` MiB.
+- Minimal state:
+  `/home/ubuntu/diffusion_gemma_native_train_h100x2_default_c95a2ff/minimal_state.json`.
+
 Run `r_d416d3f5` completed one train step with `--no-moe_lora` before the
-default router-only cleanup. It is still useful as the memory-safe baseline:
+default router-only cleanup. It is retained as the memory-safe predecessor
+baseline:
 
 - Step loss: `17.26303482055664`.
 - Decoder loss: `6.420068264007568`.
