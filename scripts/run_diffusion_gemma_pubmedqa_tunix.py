@@ -563,6 +563,12 @@ def _block_until_ready_state(state: Any) -> None:
       leaf.block_until_ready()
 
 
+def _block_until_ready_first(value: Any) -> None:
+  leaves = jax.tree.leaves(value)
+  if leaves and hasattr(leaves[0], "block_until_ready"):
+    leaves[0].block_until_ready()
+
+
 def _checkpoint_dir(args: argparse.Namespace, *, prefix: str) -> str:
   ckpt_dir = args.checkpoint_dir or tempfile.mkdtemp(prefix=prefix)
   pathlib.Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
@@ -682,9 +688,13 @@ def _train_with_separate_loss_jits(
     )
     return grad_fn(model, **diffusion_sft.gen_model_input_fn(batch))
 
-  def apply_grad_step(
-      model: nnx.Module, optimizer: nnx.Optimizer, grads: Any
+  def apply_split_grad_step(
+      model: nnx.Module,
+      optimizer: nnx.Optimizer,
+      decoder_grads: Any,
+      encoder_grads: Any,
   ) -> jax.Array:
+    grads = jax.tree.map(jnp.add, decoder_grads, encoder_grads)
     grad_norm = optax.global_norm(grads)
     optimizer.update(model, grads)
     return grad_norm
@@ -697,30 +707,77 @@ def _train_with_separate_loss_jits(
   )
   decoder_grad_step = nnx.jit(decoder_grad_step)
   encoder_grad_step = nnx.jit(encoder_grad_step)
-  apply_grad_step = nnx.jit(apply_grad_step, donate_argnames=("optimizer",))
+  apply_split_grad_step = nnx.jit(
+      apply_split_grad_step, donate_argnames=("optimizer",)
+  )
 
   max_steps = trainer.config.max_steps or len(train_batches)
   start_time = time.monotonic()
   timed_out = False
   for step in range(max_steps):
     batch = train_batches[step % len(train_batches)]
+    step_started = time.monotonic()
     sc_prefill = precompute_self_conditioning_prefill_step(trainer.model, batch)
     jax.tree.leaves(sc_prefill)[0].block_until_ready()
+    if step == 0 or (step + 1) % 50 == 0:
+      _log(
+          "separate_loss_jit_phase",
+          step=step + 1,
+          phase="self_conditioning_prefill",
+          elapsed_seconds=time.monotonic() - step_started,
+      )
+    phase_started = time.monotonic()
     sc_logits, do_self_cond = precompute_self_conditioning_decode_step(
         trainer.model, sc_prefill
     )
     sc_logits.block_until_ready()
+    if step == 0 or (step + 1) % 50 == 0:
+      _log(
+          "separate_loss_jit_phase",
+          step=step + 1,
+          phase="self_conditioning_decode",
+          elapsed_seconds=time.monotonic() - phase_started,
+      )
+    phase_started = time.monotonic()
     (decoder_loss, decoder_aux), decoder_grads = decoder_grad_step(
         trainer.model, batch, sc_logits, do_self_cond
     )
+    _block_until_ready_first(decoder_loss)
+    del sc_prefill, sc_logits, do_self_cond
+    if step == 0 or (step + 1) % 50 == 0:
+      _log(
+          "separate_loss_jit_phase",
+          step=step + 1,
+          phase="decoder_grad",
+          elapsed_seconds=time.monotonic() - phase_started,
+      )
+    phase_started = time.monotonic()
     (encoder_loss, encoder_aux), encoder_grads = encoder_grad_step(
         trainer.model, batch
     )
-    grads = jax.tree.map(lambda x, y: x + y, decoder_grads, encoder_grads)
-    grad_norm = apply_grad_step(trainer.model, trainer.optimizer, grads)
+    _block_until_ready_first(encoder_loss)
+    if step == 0 or (step + 1) % 50 == 0:
+      _log(
+          "separate_loss_jit_phase",
+          step=step + 1,
+          phase="encoder_grad",
+          elapsed_seconds=time.monotonic() - phase_started,
+      )
+    phase_started = time.monotonic()
+    grad_norm = apply_split_grad_step(
+        trainer.model, trainer.optimizer, decoder_grads, encoder_grads
+    )
+    del decoder_grads, encoder_grads
     loss = decoder_loss + encoder_loss
     loss.block_until_ready()
     grad_norm.block_until_ready()
+    if step == 0 or (step + 1) % 50 == 0:
+      _log(
+          "separate_loss_jit_phase",
+          step=step + 1,
+          phase="apply_split_grad",
+          elapsed_seconds=time.monotonic() - phase_started,
+      )
     aux = dict(decoder_aux)
     aux["encoder_loss"] = encoder_aux["encoder_loss"]
     trainer.last_train_aux = aux
