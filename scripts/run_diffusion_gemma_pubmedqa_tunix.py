@@ -708,7 +708,8 @@ def _train_with_separate_loss_jits(
   decoder_grad_step = nnx.jit(decoder_grad_step)
   encoder_grad_step = nnx.jit(encoder_grad_step)
   apply_split_grad_step = nnx.jit(
-      apply_split_grad_step, donate_argnames=("optimizer",)
+      apply_split_grad_step,
+      donate_argnames=("optimizer", "decoder_grads", "encoder_grads"),
   )
 
   max_steps = trainer.config.max_steps or len(train_batches)
@@ -716,7 +717,20 @@ def _train_with_separate_loss_jits(
   timed_out = False
   for step in range(max_steps):
     batch = train_batches[step % len(train_batches)]
-    step_started = time.monotonic()
+    phase_started = time.monotonic()
+    (encoder_loss, encoder_aux), encoder_grads = encoder_grad_step(
+        trainer.model, batch
+    )
+    _block_until_ready_first(encoder_loss)
+    _block_until_ready_state(encoder_grads)
+    if step == 0 or (step + 1) % 50 == 0:
+      _log(
+          "separate_loss_jit_phase",
+          step=step + 1,
+          phase="encoder_grad",
+          elapsed_seconds=time.monotonic() - phase_started,
+      )
+    phase_started = time.monotonic()
     sc_prefill = precompute_self_conditioning_prefill_step(trainer.model, batch)
     jax.tree.leaves(sc_prefill)[0].block_until_ready()
     if step == 0 or (step + 1) % 50 == 0:
@@ -724,7 +738,7 @@ def _train_with_separate_loss_jits(
           "separate_loss_jit_phase",
           step=step + 1,
           phase="self_conditioning_prefill",
-          elapsed_seconds=time.monotonic() - step_started,
+          elapsed_seconds=time.monotonic() - phase_started,
       )
     phase_started = time.monotonic()
     sc_logits, do_self_cond = precompute_self_conditioning_decode_step(
@@ -750,19 +764,6 @@ def _train_with_separate_loss_jits(
           "separate_loss_jit_phase",
           step=step + 1,
           phase="decoder_grad",
-          elapsed_seconds=time.monotonic() - phase_started,
-      )
-    phase_started = time.monotonic()
-    (encoder_loss, encoder_aux), encoder_grads = encoder_grad_step(
-        trainer.model, batch
-    )
-    _block_until_ready_first(encoder_loss)
-    _block_until_ready_state(encoder_grads)
-    if step == 0 or (step + 1) % 50 == 0:
-      _log(
-          "separate_loss_jit_phase",
-          step=step + 1,
-          phase="encoder_grad",
           elapsed_seconds=time.monotonic() - phase_started,
       )
     phase_started = time.monotonic()
