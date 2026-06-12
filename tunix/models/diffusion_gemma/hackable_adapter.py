@@ -244,23 +244,6 @@ def run_hybrid_official_loop(trainer: Any, *, num_steps: int) -> dict[str, Any]:
       },
   )
 
-  lora_before = _addressable_param_checksum(
-      state.params, lambda path: "lora" in path.lower()
-  )
-  base_before = _addressable_param_checksum(
-      state.params,
-      lambda path: "lora" not in path.lower(),
-      max_leaves=8,
-  )
-  print(
-      _json_dumps({
-          "event": "official_backend_hybrid_checksums_before",
-          "lora": lora_before,
-          "base_sample": base_before,
-      }),
-      flush=True,
-  )
-
   for loop_step in range(num_steps):
     batch = next(ds_iter)
     batch = train_loop.sharding_lib.device_put(batch, trainer.sharding.batch)
@@ -275,39 +258,22 @@ def run_hybrid_official_loop(trainer: Any, *, num_steps: int) -> dict[str, Any]:
     if trainer.checkify_error_categories:
       jax.device_get(aux.error).throw()
 
-    step_value = _safe_scalar_to_int(getattr(state, "step", loop_step + 1))
     losses = _safe_average_loss_values(getattr(aux, "loss_states", None))
     print(
         _json_dumps({
             "event": "official_backend_hybrid_step_complete",
             "loop_step": loop_step,
-            "state_step": step_value,
+            "state_step": loop_step + 1,
             "losses": losses,
         }),
         flush=True,
     )
 
-  lora_after = _addressable_param_checksum(
-      state.params, lambda path: "lora" in path.lower()
-  )
-  base_after = _addressable_param_checksum(
-      state.params,
-      lambda path: "lora" not in path.lower(),
-      max_leaves=8,
-  )
   result = {
       "event": "official_backend_hybrid_train_complete",
       "num_steps": num_steps,
       "workdir": str(workdir),
-      "state_step": _safe_scalar_to_int(getattr(state, "step", num_steps)),
-      "lora_checksum_delta": lora_after["checksum"] - lora_before["checksum"],
-      "base_sample_checksum_delta": (
-          base_after["checksum"] - base_before["checksum"]
-      ),
-      "lora_before": lora_before,
-      "lora_after": lora_after,
-      "base_sample_before": base_before,
-      "base_sample_after": base_after,
+      "state_step": num_steps,
   }
   _write_json(workdir / "hybrid_loop_state.json", result)
   print(_json_dumps(result), flush=True)
@@ -407,49 +373,6 @@ def _patch_trainer_to_skip_step_metrics(trainer: Any) -> None:
   object.__setattr__(writer, "write_step_metrics", _skip_write_step_metrics)
 
 
-def _addressable_param_checksum(
-    tree: Any,
-    predicate,
-    *,
-    max_leaves: int | None = None,
-) -> dict[str, Any]:
-  try:
-    import jax  # pylint: disable=g-import-not-at-top
-    import numpy as np  # pylint: disable=g-import-not-at-top
-  except Exception as exc:  # pylint: disable=broad-exception-caught
-    raise OfficialBackendDependencyError(
-        "Checksum computation requires jax."
-    ) from exc
-
-  checksum = 0.0
-  num_leaves = 0
-  num_elements = 0
-  for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
-    path_str = _jax_path_to_string(path)
-    if not predicate(path_str):
-      continue
-    if not hasattr(leaf, "addressable_shards") and not hasattr(leaf, "shape"):
-      continue
-    if max_leaves is not None and num_leaves >= max_leaves:
-      break
-
-    if hasattr(leaf, "addressable_shards"):
-      shard_arrays = [shard.data for shard in leaf.addressable_shards]
-    else:
-      shard_arrays = [leaf]
-    for shard_array in shard_arrays:
-      shard_host = np.asarray(shard_array)
-      checksum += float(shard_host.astype(np.float64).sum())
-      num_elements += int(shard_host.size)
-    num_leaves += 1
-
-  return {
-      "checksum": checksum,
-      "num_leaves": num_leaves,
-      "num_elements": num_elements,
-  }
-
-
 def _safe_average_loss_values(loss_states: Any) -> dict[str, float]:
   """Extracts Kauldron AverageState losses without global host all-gathers."""
   if loss_states is None:
@@ -465,12 +388,14 @@ def _safe_average_loss_values(loss_states: Any) -> dict[str, float]:
   values: dict[str, float] = {}
   leaves = jax.tree_util.tree_flatten_with_path(
       loss_states,
-      is_leaf=lambda x: hasattr(x, "total") and hasattr(x, "count"),
+      is_leaf=_is_loss_average_state,
   )[0]
   for path, state in leaves:
-    if not (hasattr(state, "total") and hasattr(state, "count")):
+    if not _is_loss_average_state(state):
       continue
-    total = _safe_array_scalar(state.total)
+    total = _safe_array_scalar(
+        getattr(state, "total", getattr(state, "value", 0.0))
+    )
     count = _safe_array_scalar(state.count)
     value = 0.0 if count == 0.0 else total / count
     values[f"losses/{_jax_path_to_string(path)}"] = value
@@ -478,6 +403,62 @@ def _safe_average_loss_values(loss_states: Any) -> dict[str, float]:
   if values:
     values["losses/total"] = sum(values.values())
   return values
+
+
+def _addressable_param_checksum(
+    tree: Any,
+    predicate,
+    *,
+    max_leaves: int | None = None,
+) -> dict[str, Any]:
+  try:
+    import jax  # pylint: disable=g-import-not-at-top
+    import numpy as np  # pylint: disable=g-import-not-at-top
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    raise OfficialBackendDependencyError(
+        "Checksum computation requires jax and numpy."
+    ) from exc
+
+  checksum = 0.0
+  num_leaves = 0
+  num_elements = 0
+  for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+    path_str = _jax_path_to_string(path)
+    if not predicate(path_str):
+      continue
+    if not hasattr(leaf, "addressable_shards") and not hasattr(leaf, "shape"):
+      continue
+    if max_leaves is not None and num_leaves >= max_leaves:
+      break
+
+    if isinstance(leaf, jax.Array):
+      if hasattr(leaf, "addressable_data"):
+        shard_arrays = [
+            leaf.addressable_data(i)
+            for i in range(len(leaf.addressable_shards))
+        ]
+      else:
+        shard_arrays = [shard.data for shard in leaf.addressable_shards]
+    else:
+      shard_arrays = [leaf]
+    for shard_array in shard_arrays:
+      shard_host = np.asarray(jax.device_get(shard_array))
+      checksum += float(shard_host.astype(np.float64).sum())
+      num_elements += int(shard_host.size)
+    num_leaves += 1
+
+  return {
+      "checksum": checksum,
+      "num_leaves": num_leaves,
+      "num_elements": num_elements,
+  }
+
+
+def _is_loss_average_state(value: Any) -> bool:
+  return (
+      hasattr(value, "count")
+      and (hasattr(value, "total") or hasattr(value, "value"))
+  )
 
 
 def _safe_array_scalar(value: Any) -> float:
@@ -510,29 +491,6 @@ def _jax_path_to_string(path: Any) -> str:
       key = str(part)
     parts.append(str(key))
   return "/".join(parts)
-
-
-def _safe_scalar_to_int(value: Any) -> int | None:
-  try:
-    return int(round(_safe_array_scalar(value)))
-  except Exception:  # pylint: disable=broad-exception-caught
-    pass
-  try:
-    import numpy as np  # pylint: disable=g-import-not-at-top
-  except Exception:  # pylint: disable=broad-exception-caught
-    np = None
-  try:
-    if hasattr(value, "addressable_shards"):
-      shards = value.addressable_shards
-      if shards:
-        value = shards[0].data
-    if np is not None:
-      value = np.asarray(value)
-      if value.shape:
-        value = value.reshape(-1)[0]
-    return int(value)
-  except Exception:  # pylint: disable=broad-exception-caught
-    return None
 
 
 def _write_json(path: pathlib.Path, payload: Mapping[str, Any]) -> None:

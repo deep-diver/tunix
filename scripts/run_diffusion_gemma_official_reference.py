@@ -202,12 +202,11 @@ def _run_hybrid_official_loop(trainer: Any, *, num_steps: int) -> None:
     if trainer.checkify_error_categories:
       jax.device_get(aux.error).throw()
 
-    step_value = _safe_scalar_to_int(getattr(state, "step", loop_step + 1))
     losses = _safe_average_loss_values(getattr(aux, "loss_states", None))
     _json_event(
         event="official_reference_hybrid_step_complete",
         loop_step=loop_step,
-        state_step=step_value,
+        state_step=loop_step + 1,
         losses=losses,
     )
 
@@ -215,7 +214,7 @@ def _run_hybrid_official_loop(trainer: Any, *, num_steps: int) -> None:
       "event": "official_reference_hybrid_train_complete",
       "num_steps": num_steps,
       "workdir": str(workdir),
-      "state_step": _safe_scalar_to_int(getattr(state, "step", num_steps)),
+      "state_step": num_steps,
   }
   _write_json(workdir / "hybrid_loop_state.json", result)
   _json_event(**result)
@@ -306,12 +305,14 @@ def _safe_average_loss_values(loss_states: Any) -> dict[str, float]:
   values: dict[str, float] = {}
   leaves = jax.tree_util.tree_flatten_with_path(
       loss_states,
-      is_leaf=lambda x: hasattr(x, "total") and hasattr(x, "count"),
+      is_leaf=_is_loss_average_state,
   )[0]
   for path, state in leaves:
-    if not (hasattr(state, "total") and hasattr(state, "count")):
+    if not _is_loss_average_state(state):
       continue
-    total = _safe_array_scalar(state.total)
+    total = _safe_array_scalar(
+        getattr(state, "total", getattr(state, "value", 0.0))
+    )
     count = _safe_array_scalar(state.count)
     value = 0.0 if count == 0.0 else total / count
     values[f"losses/{_jax_path_to_string(path)}"] = value
@@ -319,6 +320,13 @@ def _safe_average_loss_values(loss_states: Any) -> dict[str, float]:
   if values:
     values["losses/total"] = sum(values.values())
   return values
+
+
+def _is_loss_average_state(value: Any) -> bool:
+  return (
+      hasattr(value, "count")
+      and (hasattr(value, "total") or hasattr(value, "value"))
+  )
 
 
 def _safe_array_scalar(value: Any) -> float:
@@ -334,12 +342,6 @@ def _safe_array_scalar(value: Any) -> float:
   if host_value.size == 0:
     return 0.0
   return float(host_value.reshape(-1)[0])
-
-
-def _safe_scalar_to_int(value: Any) -> int:
-  return int(round(_safe_array_scalar(value)))
-
-
 def _jax_path_to_string(path: Any) -> str:
   parts = []
   for part in path:
