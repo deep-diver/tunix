@@ -954,6 +954,7 @@ def apply_lora(
     module_path: str = DEFAULT_LORA_MODULE_PATH,
     rng_seed: int = 10003,
     materialize_without_remat: bool = True,
+    apply_moe: bool = True,
 ) -> nnx.Module:
   provider = qwix.LoraProvider(
       module_path=module_path,
@@ -978,9 +979,10 @@ def apply_lora(
         **model.get_model_input(),
         rngs=nnx.Rngs(rng_seed),
     )
-    model = apply_moe_lora(
-        model, rank=rank, alpha=alpha, rng_seed=rng_seed + 1
-    )
+    if apply_moe:
+      model = apply_moe_lora(
+          model, rank=rank, alpha=alpha, rng_seed=rng_seed + 1
+      )
     model.set_attributes(qwix_rngs=nnx.Rngs(rng_seed))
   finally:
     if temporarily_disable_remat:

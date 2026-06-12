@@ -904,6 +904,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         rank=args.lora_rank,
         alpha=args.lora_alpha,
         module_path=args.lora_module_path,
+        apply_moe=args.moe_lora,
     )
     _block_until_ready_state(nnx.state(model))
     _log(
@@ -911,6 +912,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         tiny=args.tiny,
         lora_rank=args.lora_rank,
         lora_module_path=args.lora_module_path,
+        moe_lora=args.moe_lora,
         remat_decoder=args.remat_decoder,
         remat_policy=_remat_policy_name(args),
         load_only=True,
@@ -946,6 +948,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
         "lora_module_path": args.lora_module_path,
+        "moe_lora": args.moe_lora,
         "remat_decoder": args.remat_decoder,
         "remat_policy": _remat_policy_name(args),
         "mesh_fsdp": mesh_fsdp,
@@ -1006,12 +1009,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       rank=args.lora_rank,
       alpha=args.lora_alpha,
       module_path=args.lora_module_path,
+      apply_moe=args.moe_lora,
   )
   _log(
       "model_ready",
       tiny=args.tiny,
       lora_rank=args.lora_rank,
       lora_module_path=args.lora_module_path,
+      moe_lora=args.moe_lora,
       remat_decoder=args.remat_decoder,
       remat_policy=_remat_policy_name(args),
   )
@@ -1100,6 +1105,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "num_canvases": args.num_canvases,
         "batch_size": args.batch_size,
         "decoder_implementation": args.decoder_implementation,
+        "moe_lora": args.moe_lora,
         "remat_decoder": args.remat_decoder,
         "remat_policy": _remat_policy_name(args),
         "encoder_loss_chunk_size": args.encoder_loss_chunk_size,
@@ -1202,6 +1208,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
           args.batch_size * (args.gradient_accumulation_steps or 1)
       ),
       "decoder_implementation": args.decoder_implementation,
+      "moe_lora": args.moe_lora,
       "remat_decoder": args.remat_decoder,
       "remat_policy": _remat_policy_name(args),
       "prefill_decode_only_last_token": args.encoder_loss_weight == 0.0,
@@ -1411,6 +1418,15 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument(
       "--lora_module_path",
       default=diffusion_sft.DEFAULT_LORA_MODULE_PATH,
+  )
+  parser.add_argument(
+      "--moe_lora",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help=(
+          "Attach DiffusionGemma MoE LoRA leaves. Enabled by default to match "
+          "the broad all-linear target set; disable only for memory diagnosis."
+      ),
   )
   parser.add_argument("--learning_rate", type=float, default=1e-4)
   parser.add_argument("--weight_decay", type=float, default=1e-4)
