@@ -50,6 +50,25 @@ class RematConfig(enum.Enum):
   BLOCK = enum.auto()
   DECODER = enum.auto()
   FULL = enum.auto()
+  FULL_OFFLOAD = enum.auto()
+
+
+def _matches_remat_config(
+    remat_config: RematConfig | int | None,
+    *targets: RematConfig,
+) -> bool:
+  return any(
+      remat_config == target or remat_config == target.value
+      for target in targets
+  )
+
+
+def _remat_policy(remat_config: RematConfig | int | None):
+  if _matches_remat_config(remat_config, RematConfig.FULL_OFFLOAD):
+    return jax.checkpoint_policies.offload_dot_with_no_batch_dims(
+        'device', 'pinned_host'
+    )
+  return None
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -937,16 +956,20 @@ class Attention(nnx.Module):
 
   def __call__(self, x, segment_pos, cache, attn_mask, kv_shared_cache=None):
     remat_config = getattr(self.config, 'remat_config', RematConfig.NONE)
-    if (
-        remat_config == RematConfig.BLOCK
-        or remat_config == RematConfig.BLOCK.value
-        or remat_config == RematConfig.FULL
-        or remat_config == RematConfig.FULL.value
+    if _matches_remat_config(
+        remat_config,
+        RematConfig.BLOCK,
+        RematConfig.FULL,
+        RematConfig.FULL_OFFLOAD,
     ):
       # nnx.remat needs to be applied to the unbound function and take self
       # as the first argument. graph_updates=False prevents TraceContextError
       # when mutating params across jax transformation trace levels.
-      return nnx.remat(self.block.__func__, graph_updates=False)(
+      return nnx.remat(
+          self.block.__func__,
+          graph_updates=False,
+          policy=_remat_policy(remat_config),
+      )(
           self, x, segment_pos, cache, attn_mask, kv_shared_cache
       )
     else:
@@ -1041,13 +1064,17 @@ class FeedForward(nnx.Module):
 
   def __call__(self, x):
     remat_config = getattr(self.config, 'remat_config', RematConfig.NONE)
-    if (
-        remat_config == RematConfig.BLOCK
-        or remat_config == RematConfig.BLOCK.value
-        or remat_config == RematConfig.FULL
-        or remat_config == RematConfig.FULL.value
+    if _matches_remat_config(
+        remat_config,
+        RematConfig.BLOCK,
+        RematConfig.FULL,
+        RematConfig.FULL_OFFLOAD,
     ):
-      return nnx.remat(self.block.__func__, graph_updates=False)(self, x)
+      return nnx.remat(
+          self.block.__func__,
+          graph_updates=False,
+          policy=_remat_policy(remat_config),
+      )(self, x)
     else:
       return self.block(x)
 
@@ -1207,13 +1234,17 @@ class DecoderLayer(nnx.Module):
       kv_shared_cache=None,
   ):
     remat_config = getattr(self.config, 'remat_config', RematConfig.NONE)
-    if (
-        remat_config == RematConfig.DECODER
-        or remat_config == RematConfig.DECODER.value
-        or remat_config == RematConfig.FULL
-        or remat_config == RematConfig.FULL.value
+    if _matches_remat_config(
+        remat_config,
+        RematConfig.DECODER,
+        RematConfig.FULL,
+        RematConfig.FULL_OFFLOAD,
     ):
-      return nnx.remat(self.block.__func__, graph_updates=False)(
+      return nnx.remat(
+          self.block.__func__,
+          graph_updates=False,
+          policy=_remat_policy(remat_config),
+      )(
           self,
           x,
           segment_pos,
