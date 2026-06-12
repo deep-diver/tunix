@@ -267,7 +267,7 @@ def run_hybrid_official_loop(trainer: Any, *, num_steps: int) -> dict[str, Any]:
     state, aux = trainstep.step(
         state,
         batch,
-        return_losses=False,
+        return_losses=True,
         return_metrics=False,
         return_summaries=False,
         checkify_error_categories=trainer.checkify_error_categories,
@@ -276,11 +276,13 @@ def run_hybrid_official_loop(trainer: Any, *, num_steps: int) -> dict[str, Any]:
       jax.device_get(aux.error).throw()
 
     step_value = _safe_scalar_to_int(getattr(state, "step", loop_step + 1))
+    losses = _safe_average_loss_values(getattr(aux, "loss_states", None))
     print(
         _json_dumps({
             "event": "official_backend_hybrid_step_complete",
             "loop_step": loop_step,
             "state_step": step_value,
+            "losses": losses,
         }),
         flush=True,
     )
@@ -448,6 +450,56 @@ def _addressable_param_checksum(
   }
 
 
+def _safe_average_loss_values(loss_states: Any) -> dict[str, float]:
+  """Extracts Kauldron AverageState losses without global host all-gathers."""
+  if loss_states is None:
+    return {}
+
+  try:
+    import jax  # pylint: disable=g-import-not-at-top
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    raise OfficialBackendDependencyError(
+        "Loss extraction requires jax."
+    ) from exc
+
+  values: dict[str, float] = {}
+  leaves = jax.tree_util.tree_flatten_with_path(
+      loss_states,
+      is_leaf=lambda x: hasattr(x, "total") and hasattr(x, "count"),
+  )[0]
+  for path, state in leaves:
+    if not (hasattr(state, "total") and hasattr(state, "count")):
+      continue
+    total = _safe_array_scalar(state.total)
+    count = _safe_array_scalar(state.count)
+    value = 0.0 if count == 0.0 else total / count
+    values[f"losses/{_jax_path_to_string(path)}"] = value
+
+  if values:
+    values["losses/total"] = sum(values.values())
+  return values
+
+
+def _safe_array_scalar(value: Any) -> float:
+  try:
+    import jax  # pylint: disable=g-import-not-at-top
+    import numpy as np  # pylint: disable=g-import-not-at-top
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    raise OfficialBackendDependencyError(
+        "Scalar extraction requires jax and numpy."
+    ) from exc
+
+  if isinstance(value, jax.Array):
+    if hasattr(value, "addressable_data"):
+      value = value.addressable_data(0)
+    elif getattr(value, "addressable_shards", None):
+      value = value.addressable_shards[0].data
+  host_value = np.asarray(jax.device_get(value))
+  if host_value.size == 0:
+    return 0.0
+  return float(host_value.reshape(-1)[0])
+
+
 def _jax_path_to_string(path: Any) -> str:
   parts = []
   for part in path:
@@ -461,6 +513,10 @@ def _jax_path_to_string(path: Any) -> str:
 
 
 def _safe_scalar_to_int(value: Any) -> int | None:
+  try:
+    return int(round(_safe_array_scalar(value)))
+  except Exception:  # pylint: disable=broad-exception-caught
+    pass
   try:
     import numpy as np  # pylint: disable=g-import-not-at-top
   except Exception:  # pylint: disable=broad-exception-caught

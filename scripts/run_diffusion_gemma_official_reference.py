@@ -81,6 +81,16 @@ def parse_args() -> argparse.Namespace:
       action=argparse.BooleanOptionalAction,
       default=False,
   )
+  parser.add_argument(
+      "--train_loop",
+      choices=["kauldron", "hybrid"],
+      default="kauldron",
+      help=(
+          "Use the upstream Kauldron Trainer loop, or a minimal loop that "
+          "reuses upstream model/data/loss/trainstep objects and logs losses "
+          "from addressable shards."
+      ),
+  )
   parser.add_argument("--config_override", action="append", default=[])
   parser.add_argument("--module_override", action="append", default=[])
   return parser.parse_args()
@@ -131,13 +141,84 @@ def main() -> None:
     if args.build_config_only:
       return
     trainer = konfig.resolve(cfg)
-    trainer.train()
+    if args.train_loop == "hybrid":
+      _run_hybrid_official_loop(trainer, num_steps=args.num_train_steps or 1)
+    else:
+      trainer.train()
   _json_event(
       event="official_reference_train_complete",
       recipe=args.recipe,
       workdir=args.workdir,
       num_train_steps=args.num_train_steps,
+      train_loop=args.train_loop,
   )
+
+
+def _run_hybrid_official_loop(trainer: Any, *, num_steps: int) -> None:
+  """Runs upstream train steps while extracting losses without all-gathers."""
+  import jax  # pylint: disable=g-import-not-at-top
+  from kauldron.train import train_loop  # pylint: disable=g-import-not-at-top
+
+  setup = trainer.setup
+  setup.log_status("Configuring upstream hybrid DiffusionGemma loop ...")
+  setup.run(trainer)
+
+  trainstep = trainer.trainstep
+  checkpointer = trainer.checkpointer
+  latest_step = checkpointer.latest_step
+  state = trainstep.init(
+      elem_spec=trainer.train_ds.element_spec,
+      skip_transforms=latest_step is not None,
+  )
+  chrono = trainer._chrono  # pylint: disable=protected-access
+  ds_iter = iter(trainer.train_ds)
+  state, chrono, ds_iter = checkpointer.restore(
+      train_loop.checkpoint_state.CheckpointState(state, chrono, ds_iter),
+      noop_if_missing=True,
+  )
+
+  workdir = pathlib.Path(str(trainer.workdir))
+  workdir.mkdir(parents=True, exist_ok=True)
+  _write_json(
+      workdir / "hybrid_loop_start.json",
+      {
+          "event": "official_reference_hybrid_loop_start",
+          "num_steps": num_steps,
+          "workdir": str(workdir),
+      },
+  )
+
+  for loop_step in range(num_steps):
+    batch = next(ds_iter)
+    batch = train_loop.sharding_lib.device_put(batch, trainer.sharding.batch)
+    state, aux = trainstep.step(
+        state,
+        batch,
+        return_losses=True,
+        return_metrics=False,
+        return_summaries=False,
+        checkify_error_categories=trainer.checkify_error_categories,
+    )
+    if trainer.checkify_error_categories:
+      jax.device_get(aux.error).throw()
+
+    step_value = _safe_scalar_to_int(getattr(state, "step", loop_step + 1))
+    losses = _safe_average_loss_values(getattr(aux, "loss_states", None))
+    _json_event(
+        event="official_reference_hybrid_step_complete",
+        loop_step=loop_step,
+        state_step=step_value,
+        losses=losses,
+    )
+
+  result = {
+      "event": "official_reference_hybrid_train_complete",
+      "num_steps": num_steps,
+      "workdir": str(workdir),
+      "state_step": _safe_scalar_to_int(getattr(state, "step", num_steps)),
+  }
+  _write_json(workdir / "hybrid_loop_state.json", result)
+  _json_event(**result)
 
 
 def _build_config(
@@ -213,6 +294,67 @@ def _set_child(target: Any, key: str, value: Any) -> None:
     target[key] = value
     return
   setattr(target, key, value)
+
+
+def _safe_average_loss_values(loss_states: Any) -> dict[str, float]:
+  """Extracts Kauldron AverageState losses without global host all-gathers."""
+  if loss_states is None:
+    return {}
+
+  import jax  # pylint: disable=g-import-not-at-top
+
+  values: dict[str, float] = {}
+  leaves = jax.tree_util.tree_flatten_with_path(
+      loss_states,
+      is_leaf=lambda x: hasattr(x, "total") and hasattr(x, "count"),
+  )[0]
+  for path, state in leaves:
+    if not (hasattr(state, "total") and hasattr(state, "count")):
+      continue
+    total = _safe_array_scalar(state.total)
+    count = _safe_array_scalar(state.count)
+    value = 0.0 if count == 0.0 else total / count
+    values[f"losses/{_jax_path_to_string(path)}"] = value
+
+  if values:
+    values["losses/total"] = sum(values.values())
+  return values
+
+
+def _safe_array_scalar(value: Any) -> float:
+  import jax  # pylint: disable=g-import-not-at-top
+  import numpy as np  # pylint: disable=g-import-not-at-top
+
+  if isinstance(value, jax.Array):
+    if hasattr(value, "addressable_data"):
+      value = value.addressable_data(0)
+    elif getattr(value, "addressable_shards", None):
+      value = value.addressable_shards[0].data
+  host_value = np.asarray(jax.device_get(value))
+  if host_value.size == 0:
+    return 0.0
+  return float(host_value.reshape(-1)[0])
+
+
+def _safe_scalar_to_int(value: Any) -> int:
+  return int(round(_safe_array_scalar(value)))
+
+
+def _jax_path_to_string(path: Any) -> str:
+  parts = []
+  for part in path:
+    key = getattr(part, "key", None)
+    if key is None:
+      key = getattr(part, "name", None)
+    if key is None:
+      key = str(part)
+    parts.append(str(key))
+  return "/".join(parts)
+
+
+def _write_json(path: pathlib.Path, payload: Mapping[str, Any]) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def _check_dependencies(

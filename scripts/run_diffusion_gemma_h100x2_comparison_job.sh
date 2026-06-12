@@ -55,6 +55,7 @@ LORA_RANK="${LORA_RANK:-4}"
 GPU_POLL_SECONDS="${GPU_POLL_SECONDS:-60}"
 JAX_CUDA_EXTRA="${JAX_CUDA_EXTRA:-cuda12}"
 XLA_FLAGS="${XLA_FLAGS:---xla_disable_hlo_passes=constant_folding}"
+TRAIN_LOOP="${TRAIN_LOOP:-hybrid}"
 
 python_version_ok() {
   "$1" - <<'PY' >/dev/null 2>&1
@@ -111,6 +112,7 @@ json_event comparison_job_start \
   num_train_steps="${NUM_TRAIN_STEPS}" \
   dataset_batch_size="${DATASET_BATCH_SIZE}" \
   lora_rank="${LORA_RANK}" \
+  train_loop="${TRAIN_LOOP}" \
   xla_flags="${XLA_FLAGS}"
 
 if [[ ! -x "${VENV}/bin/python" ]] || ! python_version_ok "${VENV}/bin/python"; then
@@ -219,12 +221,13 @@ if [[ "${MODE}" == "upstream" ]]; then
   RUNNER=(
     python "${REPO_ROOT}/scripts/run_diffusion_gemma_official_reference.py"
     "${COMMON_ARGS[@]}"
+    --train_loop "${TRAIN_LOOP}"
   )
 else
   RUNNER=(
     python "${REPO_ROOT}/scripts/run_diffusion_gemma_official_backend.py"
     "${COMMON_ARGS[@]}"
-    --train_loop kauldron
+    --train_loop "${TRAIN_LOOP}"
   )
 fi
 
@@ -271,6 +274,7 @@ payload = {
     "summary_json": "${SUMMARY_JSON}",
     "gemma_revision": "$(git -C "${GEMMA_REF}" rev-parse HEAD)",
     "hackable_diffusion_revision": "$(git -C "${HACKABLE_DIFFUSION_REF}" rev-parse HEAD)",
+    "train_loop": "${TRAIN_LOOP}",
     "xla_flags": "${XLA_FLAGS}",
 }
 path = pathlib.Path("${RESULT_JSON}")

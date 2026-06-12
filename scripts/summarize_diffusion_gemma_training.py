@@ -105,6 +105,7 @@ def _read_log_scalars(log_path: pathlib.Path) -> dict[str, Any]:
   for line_no, line in enumerate(
       log_path.read_text(encoding="utf-8", errors="replace").splitlines(), 1
   ):
+    _read_json_line_scalars(line, line_no, metrics)
     step_match = _STEP_RE.search(line)
     step = int(step_match.group("step")) if step_match else None
     for match in _LOG_METRIC_RE.finditer(line):
@@ -117,6 +118,43 @@ def _read_log_scalars(log_path: pathlib.Path) -> dict[str, Any]:
       "path": str(log_path),
       "metrics": _summarize_series(metrics),
   }
+
+
+def _read_json_line_scalars(
+    line: str,
+    line_no: int,
+    metrics: dict[str, list[dict[str, float | int | None]]],
+) -> None:
+  line = line.strip()
+  if not line.startswith("{"):
+    return
+  try:
+    payload = json.loads(line)
+  except json.JSONDecodeError:
+    return
+  if not isinstance(payload, dict):
+    return
+
+  step = payload.get("state_step", payload.get("step"))
+  if step is not None:
+    try:
+      step = int(step)
+    except (TypeError, ValueError):
+      step = None
+
+  for container_name, prefix in (("losses", "losses"), ("metrics", "metrics")):
+    values = payload.get(container_name)
+    if not isinstance(values, dict):
+      continue
+    for name, value in values.items():
+      if not isinstance(value, (int, float)):
+        continue
+      metric_name = name if "/" in name else f"{prefix}/{name}"
+      metrics.setdefault(metric_name, []).append({
+          "step": step,
+          "line": line_no,
+          "value": float(value),
+      })
 
 
 def _read_gpu_csv(path: pathlib.Path) -> dict[str, Any]:
