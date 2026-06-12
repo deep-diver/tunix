@@ -53,10 +53,6 @@ Both matched H100x2 runs completed the requested timed training window with fini
 
 ![GPU memory](gpu_memory.png)
 
-## Generation Animation
-
-![DiffusionGemma denoising trace](diffusion_gemma_readable_denoising.gif)
-
 ## Notes
 
 - The two long runs are independent stochastic training runs. Exact step-by-step loss identity is not expected; parity of deterministic helper paths and logits is covered by the dedicated parity scripts in `scripts/verify_diffusion_gemma_official_parity.py` and `scripts/verify_diffusion_gemma_official_logits.py`.

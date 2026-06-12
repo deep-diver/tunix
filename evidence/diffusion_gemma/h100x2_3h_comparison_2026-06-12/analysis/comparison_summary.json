@@ -1,5 +1,5 @@
 {
-  "animation": "../animation/diffusion_gemma_readable_denoising.gif",
+  "animation": null,
   "generated_at_utc": "2026-06-12T15:08:28.802180+00:00",
   "plots": {
     "gpu_memory": "analysis/gpu_memory.png",
