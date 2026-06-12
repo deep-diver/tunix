@@ -16,10 +16,25 @@
 set -euo pipefail
 
 MODE=""
+CLI_MAX_RUNTIME_SECONDS=""
+CLI_NUM_TRAIN_STEPS=""
+CLI_RUN_NAME=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode)
       MODE="$2"
+      shift 2
+      ;;
+    --max_runtime_seconds)
+      CLI_MAX_RUNTIME_SECONDS="$2"
+      shift 2
+      ;;
+    --num_train_steps)
+      CLI_NUM_TRAIN_STEPS="$2"
+      shift 2
+      ;;
+    --run_name)
+      CLI_RUN_NAME="$2"
       shift 2
       ;;
     *)
@@ -36,7 +51,7 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOME_DIR="${HOME:-/home/ubuntu}"
-RUN_NAME="${RUN_NAME:-${MODE}_$(date -u +%Y%m%dT%H%M%SZ)}"
+RUN_NAME="${CLI_RUN_NAME:-${RUN_NAME:-${MODE}_$(date -u +%Y%m%dT%H%M%SZ)}}"
 WORK_BASE="${WORK_BASE:-${HOME_DIR}/diffusion_gemma_compare}"
 WORKDIR="${WORKDIR:-${WORK_BASE}/${RUN_NAME}/workdir}"
 TRAIN_LOG="${TRAIN_LOG:-${WORKDIR}/train.log}"
@@ -47,8 +62,8 @@ SUMMARY_JSON="${SUMMARY_JSON:-${WORKDIR}/run_summary.json}"
 GEMMA_REF="${GEMMA_REF:-${HOME_DIR}/gemma_official_reference}"
 HACKABLE_DIFFUSION_REF="${HACKABLE_DIFFUSION_REF:-${HOME_DIR}/hackable_diffusion_reference}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-${HOME_DIR}/checkpoints/diffusiongemma-26B-A4B-it}"
-MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-10800}"
-NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-2000}"
+MAX_RUNTIME_SECONDS="${CLI_MAX_RUNTIME_SECONDS:-${MAX_RUNTIME_SECONDS:-10800}}"
+NUM_TRAIN_STEPS="${CLI_NUM_TRAIN_STEPS:-${NUM_TRAIN_STEPS:-2000}}"
 CHECKPOINT_EVERY_N_STEPS="${CHECKPOINT_EVERY_N_STEPS:-1000}"
 DATASET_BATCH_SIZE="${DATASET_BATCH_SIZE:-2}"
 LORA_RANK="${LORA_RANK:-4}"
