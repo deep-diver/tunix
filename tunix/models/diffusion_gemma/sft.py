@@ -963,14 +963,22 @@ def apply_lora(
   )
   original_config = getattr(model, "config", None)
   remat_config = getattr(original_config, "remat_config", None)
-  temporarily_disable_remat = (
-      materialize_without_remat
-      and remat_config is not None
-      and dataclasses.is_dataclass(original_config)
+  attention_implementation = getattr(
+      original_config, "attention_implementation", None
   )
-  if temporarily_disable_remat:
+  temporarily_simplify_materialization = (
+      materialize_without_remat
+      and dataclasses.is_dataclass(original_config)
+      and (remat_config is not None or attention_implementation is not None)
+  )
+  if temporarily_simplify_materialization:
+    config_updates = {}
+    if remat_config is not None:
+      config_updates["remat_config"] = None
+    if attention_implementation is not None:
+      config_updates["attention_implementation"] = None
     model.set_attributes(
-        config=dataclasses.replace(original_config, remat_config=None)
+        config=dataclasses.replace(original_config, **config_updates)
     )
   try:
     model = qwix.apply_lora_to_model(
@@ -985,7 +993,7 @@ def apply_lora(
       )
     model.set_attributes(qwix_rngs=nnx.Rngs(rng_seed))
   finally:
-    if temporarily_disable_remat:
+    if temporarily_simplify_materialization:
       model.set_attributes(config=original_config)
   return model
 
