@@ -556,6 +556,152 @@ def _state_summary(state: Any) -> dict[str, int]:
   }
 
 
+def _train_with_separate_loss_jits(
+    trainer: diffusion_sft.DiffusionGemmaTrainer,
+    train_batches: list[dict[str, jax.Array]],
+    diffusion_config: diffusion_sft.DiffusionGemmaSFTConfig,
+) -> None:
+  """Runs exact split-gradient training with separate JAX executables."""
+  if trainer.config.gradient_accumulation_steps not in (None, 1):
+    raise ValueError(
+        "--separate_loss_jits does not support gradient accumulation."
+    )
+
+  grad_arg = nnx.DiffState(0, nnx.LoRAParam) if trainer._lora_enabled else 0
+  decoder_config = dataclasses.replace(
+      diffusion_config,
+      encoder_loss_weight=0.0,
+      force_full_encoder_prefill=True,
+  )
+  encoder_config = dataclasses.replace(
+      diffusion_config, decoder_loss_weight=0.0
+  )
+  encoder_loss_fn = diffusion_sft.make_loss_fn(encoder_config)
+
+  def precompute_self_conditioning_prefill_step(
+      model: nnx.Module, batch: dict[str, jax.Array]
+  ):
+    inputs = diffusion_sft.gen_model_input_fn(batch)
+    return diffusion_sft.diffusion_gemma_sft_self_conditioning_prefill(
+        model,
+        prompt=inputs["prompt"],
+        canvas=inputs["canvas"],
+        canvas_mask=inputs["canvas_mask"],
+        rng=inputs["rng"],
+        config=decoder_config,
+    )
+
+  def precompute_self_conditioning_decode_step(
+      model: nnx.Module, prefill: dict[str, Any]
+  ):
+    return (
+        diffusion_sft.diffusion_gemma_sft_self_conditioning_logits_from_prefill(
+            model,
+            **prefill,
+            config=decoder_config,
+        )
+    )
+
+  def decoder_loss_fn(
+      model: nnx.Module,
+      prompt: jax.Array,
+      canvas: jax.Array,
+      canvas_id: jax.Array,
+      canvas_mask: jax.Array,
+      encoder_target: jax.Array,
+      encoder_target_mask: jax.Array,
+      rng: jax.Array,
+      precomputed_sc_logits: jax.Array,
+      precomputed_self_conditioning_mask: jax.Array,
+  ):
+    return diffusion_sft.diffusion_gemma_sft_loss(
+        model,
+        prompt=prompt,
+        canvas=canvas,
+        canvas_id=canvas_id,
+        canvas_mask=canvas_mask,
+        encoder_target=encoder_target,
+        encoder_target_mask=encoder_target_mask,
+        rng=rng,
+        config=decoder_config,
+        precomputed_sc_logits=precomputed_sc_logits,
+        precomputed_self_conditioning_mask=precomputed_self_conditioning_mask,
+    )
+
+  def decoder_grad_step(
+      model: nnx.Module,
+      batch: dict[str, jax.Array],
+      precomputed_sc_logits: jax.Array,
+      precomputed_self_conditioning_mask: jax.Array,
+  ):
+    grad_fn = nnx.value_and_grad(
+        decoder_loss_fn, argnums=grad_arg, has_aux=True
+    )
+    return grad_fn(
+        model,
+        **diffusion_sft.gen_model_input_fn(batch),
+        precomputed_sc_logits=precomputed_sc_logits,
+        precomputed_self_conditioning_mask=precomputed_self_conditioning_mask,
+    )
+
+  def encoder_grad_step(model: nnx.Module, batch: dict[str, jax.Array]):
+    grad_fn = nnx.value_and_grad(
+        encoder_loss_fn, argnums=grad_arg, has_aux=True
+    )
+    return grad_fn(model, **diffusion_sft.gen_model_input_fn(batch))
+
+  def apply_grad_step(
+      model: nnx.Module, optimizer: nnx.Optimizer, grads: Any
+  ) -> jax.Array:
+    grad_norm = optax.global_norm(grads)
+    optimizer.update(model, grads)
+    return grad_norm
+
+  precompute_self_conditioning_prefill_step = nnx.jit(
+      precompute_self_conditioning_prefill_step
+  )
+  precompute_self_conditioning_decode_step = nnx.jit(
+      precompute_self_conditioning_decode_step
+  )
+  decoder_grad_step = nnx.jit(decoder_grad_step)
+  encoder_grad_step = nnx.jit(encoder_grad_step)
+  apply_grad_step = nnx.jit(apply_grad_step, donate_argnames=("optimizer",))
+
+  max_steps = trainer.config.max_steps or len(train_batches)
+  for step in range(max_steps):
+    batch = train_batches[step % len(train_batches)]
+    sc_prefill = precompute_self_conditioning_prefill_step(trainer.model, batch)
+    jax.tree.leaves(sc_prefill)[0].block_until_ready()
+    sc_logits, do_self_cond = precompute_self_conditioning_decode_step(
+        trainer.model, sc_prefill
+    )
+    sc_logits.block_until_ready()
+    (decoder_loss, decoder_aux), decoder_grads = decoder_grad_step(
+        trainer.model, batch, sc_logits, do_self_cond
+    )
+    (encoder_loss, encoder_aux), encoder_grads = encoder_grad_step(
+        trainer.model, batch
+    )
+    grads = jax.tree.map(lambda x, y: x + y, decoder_grads, encoder_grads)
+    grad_norm = apply_grad_step(trainer.model, trainer.optimizer, grads)
+    loss = decoder_loss + encoder_loss
+    loss.block_until_ready()
+    grad_norm.block_until_ready()
+    aux = dict(decoder_aux)
+    aux["encoder_loss"] = encoder_aux["encoder_loss"]
+    trainer.last_train_aux = aux
+    trainer._iter_steps += 1
+    trainer._train_steps += 1
+    _log(
+        "separate_loss_jit_step",
+        step=step + 1,
+        loss=float(jax.device_get(loss)),
+        decoder_loss=float(jax.device_get(decoder_aux["decoder_loss"])),
+        encoder_loss=float(jax.device_get(encoder_aux["encoder_loss"])),
+        grad_norm=float(jax.device_get(grad_norm)),
+    )
+
+
 def _make_train_batches(
     examples: list[PreparedExample],
     *,
@@ -677,6 +823,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       ),
       decoder_implementation=args.decoder_implementation,
       fast_uniform_corruption=args.fast_uniform_corruption,
+      encoder_loss_chunk_size=args.encoder_loss_chunk_size,
   )
   train_batches = _make_train_batches(
       examples, tokenizer=tokenizer, args=args, vocab_size=vocab_size
@@ -745,8 +892,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       optimizer,
       train_config,
       diffusion_config,
+      split_loss_gradients=args.split_loss_gradients,
   )
-  trainer.train(train_batches, cache_nnx_graph=False)
+  if args.separate_loss_jits:
+    if not args.split_loss_gradients:
+      raise ValueError("--separate_loss_jits requires --split_loss_gradients.")
+    _train_with_separate_loss_jits(trainer, train_batches, diffusion_config)
+  else:
+    trainer.train(train_batches, cache_nnx_graph=False)
   final_loss, final_aux = diffusion_sft.make_loss_fn(diffusion_config)(
       model, **train_batches[0]
   )
@@ -790,6 +943,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       "decoder_implementation": args.decoder_implementation,
       "remat_decoder": args.remat_decoder,
       "prefill_decode_only_last_token": args.encoder_loss_weight == 0.0,
+      "encoder_loss_chunk_size": args.encoder_loss_chunk_size,
+      "split_loss_gradients": args.split_loss_gradients,
+      "separate_loss_jits": args.separate_loss_jits,
+      "precomputed_self_conditioning": args.separate_loss_jits,
       "mesh_fsdp": mesh_fsdp,
       "mesh_tp": mesh_tp,
       "trainable_state": trainable_summary,
@@ -837,6 +994,15 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--decoder_loss_weight", type=float, default=1.0)
   parser.add_argument("--encoder_loss_weight", type=float, default=1.0)
   parser.add_argument(
+      "--encoder_loss_chunk_size",
+      type=int,
+      default=64,
+      help=(
+          "Chunk size for encoder AR loss projection. Set to 0 to materialize "
+          "full encoder logits before CE."
+      ),
+  )
+  parser.add_argument(
       "--decoder_implementation",
       choices=[
           "cached_selected_canvas",
@@ -854,6 +1020,27 @@ def parse_args() -> argparse.Namespace:
       "--stop_gradient_from_denoiser_to_encoder",
       action=argparse.BooleanOptionalAction,
       default=False,
+  )
+  parser.add_argument(
+      "--split_loss_gradients",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Compute decoder and encoder gradients in separate exact passes and "
+          "sum them before the optimizer update. This is slower but lowers the "
+          "peak memory of 26B LoRA smoke runs on 2x80GB GPUs."
+      ),
+  )
+  parser.add_argument(
+      "--separate_loss_jits",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "When --split_loss_gradients is enabled, compile decoder-gradient, "
+          "encoder-gradient, and optimizer-update steps as separate JAX "
+          "executables. This is slower but further lowers peak memory for "
+          "2x80GB GPU smoke runs."
+      ),
   )
   parser.add_argument("--seed", type=int, default=42)
   parser.add_argument("--data_dir", default="/tmp/pubmedqa_jsonl")

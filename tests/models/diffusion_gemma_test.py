@@ -15,6 +15,9 @@
 """Tests for the DiffusionGemma Tunix integration."""
 
 import dataclasses
+import sys
+import types
+from unittest import mock
 
 from absl.testing import absltest
 from flax import nnx
@@ -24,6 +27,7 @@ import numpy as np
 import optax
 from tunix.models import automodel
 from tunix.models import naming
+from tunix.models.diffusion_gemma import hackable_adapter
 from tunix.models.diffusion_gemma import model as diffusion_model
 from tunix.models.diffusion_gemma import sft as diffusion_sft
 from tunix.models.gemma4 import model as gemma4_model
@@ -121,6 +125,126 @@ def _official_reference_masked_ce(logits, targets, mask):
 
 class DiffusionGemmaTest(absltest.TestCase):
 
+  def test_official_backend_dependency_probe_is_non_throwing(self):
+    report = hackable_adapter.check_dependencies()
+    self.assertIn("available", report)
+    self.assertIn("missing", report)
+    self.assertIn("versions", report)
+
+  def test_official_backend_builds_fake_recipe_with_overrides(self):
+    module_name = hackable_adapter.recipe_module_name("pubmedqa")
+    fake_module = types.ModuleType(module_name)
+    fake_module.CHECKPOINT_PATH = "old_checkpoint"
+    fake_module._LORA_RANK = 4
+    seen_dataset_batches = []
+
+    def make_pubmedqa_ds(**kwargs):
+      seen_dataset_batches.append(kwargs["batch_size"])
+      return kwargs
+
+    fake_module.pubmedqa_data = types.SimpleNamespace(
+        make_pubmedqa_ds=make_pubmedqa_ds
+    )
+
+    @dataclasses.dataclass(frozen=True, kw_only=True)
+    class FakeConfigArgs:
+      use_early_stopping: bool = True
+
+    def get_config(args=FakeConfigArgs()):
+      train_ds = fake_module.pubmedqa_data.make_pubmedqa_ds(batch_size=2)
+      return types.SimpleNamespace(
+          aux=types.SimpleNamespace(
+              checkpoint_every_n_steps=1000,
+              eval_num_batches=None,
+          ),
+          checkpointer=types.SimpleNamespace(save_interval_steps=1000),
+          evals={"sample": object()},
+          train_ds=train_ds,
+          schedules={
+              "learning_rate": types.SimpleNamespace(
+                  warmup_steps=100,
+                  decay_steps=200,
+              )
+          },
+          seen_checkpoint=fake_module.CHECKPOINT_PATH,
+          seen_lora_rank=fake_module._LORA_RANK,
+          seen_early_stopping=args.use_early_stopping,
+      )
+
+    fake_module.ConfigArgs = FakeConfigArgs
+    fake_module.get_config = get_config
+
+    with mock.patch.dict(sys.modules, {module_name: fake_module}):
+      cfg = hackable_adapter.build_official_sft_config(
+          hackable_adapter.OfficialSFTConfig(
+              recipe="pubmedqa",
+              workdir="/tmp/dg-workdir",
+              checkpoint_path="/tmp/dg-checkpoint",
+              num_train_steps=1,
+              checkpoint_every_n_steps=1,
+              lora_rank=8,
+              dataset_batch_size=1,
+              use_early_stopping=False,
+              disable_evals=True,
+              config_overrides={
+                  "aux.eval_num_batches": 2,
+                  "schedules.learning_rate.warmup_steps": 0,
+              },
+          )
+      )
+
+    self.assertEqual(cfg.seen_checkpoint, "/tmp/dg-checkpoint")
+    self.assertEqual(cfg.seen_lora_rank, 8)
+    self.assertFalse(cfg.seen_early_stopping)
+    self.assertEqual(cfg.workdir, "/tmp/dg-workdir")
+    self.assertEqual(cfg.num_train_steps, 1)
+    self.assertEqual(cfg.aux.checkpoint_every_n_steps, 1)
+    self.assertEqual(cfg.aux.eval_num_batches, 2)
+    self.assertEqual(cfg.train_ds["batch_size"], 1)
+    self.assertEqual(seen_dataset_batches, [1])
+    self.assertEqual(cfg.schedules["learning_rate"].warmup_steps, 0)
+    self.assertEqual(cfg.schedules["learning_rate"].decay_steps, 200)
+    self.assertEqual(cfg.checkpointer.save_interval_steps, 1)
+    self.assertEmpty(cfg.evals)
+    self.assertEqual(fake_module.CHECKPOINT_PATH, "old_checkpoint")
+    self.assertEqual(fake_module._LORA_RANK, 4)
+
+  def test_official_backend_can_skip_step_metrics(self):
+    calls = []
+
+    class FakeWriter:
+
+      def write_step_metrics(self, *args, **kwargs):
+        calls.append(("original", args, kwargs))
+
+    writer = FakeWriter()
+    trainer = types.SimpleNamespace(writer=writer)
+    hackable_adapter._patch_trainer_to_skip_step_metrics(trainer)
+
+    writer.write_step_metrics(step=7)
+
+    self.assertEmpty(calls)
+
+  def test_official_backend_checksum_uses_addressable_leaves(self):
+    tree = {
+        "lora": {"a": jnp.array([1.0, 2.0])},
+        "base": {"w": jnp.array([4.0, 8.0])},
+    }
+
+    lora = hackable_adapter._addressable_param_checksum(
+        tree, lambda path: "lora" in path
+    )
+    base = hackable_adapter._addressable_param_checksum(
+        tree, lambda path: "base" in path
+    )
+
+    self.assertEqual(lora["num_leaves"], 1)
+    self.assertEqual(lora["num_elements"], 2)
+    self.assertEqual(lora["checksum"], 3.0)
+    self.assertEqual(base["num_leaves"], 1)
+    self.assertEqual(base["num_elements"], 2)
+    self.assertEqual(base["checksum"], 12.0)
+
   def test_model_naming_and_config(self):
     info = naming.ModelNaming(model_name="diffusion-gemma-a26b-a4b-it")
     self.assertEqual(info.model_family, "diffusion_gemma")
@@ -170,6 +294,112 @@ class DiffusionGemmaTest(absltest.TestCase):
     self.assertTrue(bool(jnp.isfinite(loss)))
     self.assertIn("decoder_loss", aux)
     self.assertIn("encoder_loss", aux)
+
+  def test_split_loss_gradients_match_full_loss_gradients(self):
+    vocab_size = 32
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        diffusion_model.ModelConfig.tiny(vocab_size=vocab_size),
+        rngs=nnx.Rngs(0),
+    )
+    model = diffusion_sft.apply_lora(model, rank=2, alpha=4.0)
+    cfg = diffusion_sft.DiffusionGemmaSFTConfig(
+        prompt_len=4,
+        canvas_size=4,
+        num_canvases=2,
+        vocab_size=vocab_size,
+        self_cond_prob=1.0,
+        decoder_implementation="cached_selected_canvas_slice",
+        encoder_loss_chunk_size=3,
+    )
+    batch = _make_batch(vocab_size=vocab_size)
+    inputs = diffusion_sft.gen_model_input_fn(batch)
+
+    grad_arg = nnx.DiffState(0, nnx.LoRAParam)
+    decoder_config = dataclasses.replace(
+        cfg, encoder_loss_weight=0.0, force_full_encoder_prefill=True
+    )
+    full_grad_fn = nnx.value_and_grad(
+        diffusion_sft.make_loss_fn(cfg),
+        argnums=grad_arg,
+        has_aux=True,
+    )
+    decoder_grad_fn = nnx.value_and_grad(
+        diffusion_sft.make_loss_fn(decoder_config),
+        argnums=grad_arg,
+        has_aux=True,
+    )
+    encoder_grad_fn = nnx.value_and_grad(
+        diffusion_sft.make_loss_fn(
+            dataclasses.replace(cfg, decoder_loss_weight=0.0)
+        ),
+        argnums=grad_arg,
+        has_aux=True,
+    )
+    sc_logits, do_self_cond = (
+        diffusion_sft.diffusion_gemma_sft_self_conditioning_logits(
+            model,
+            prompt=inputs["prompt"],
+            canvas=inputs["canvas"],
+            canvas_mask=inputs["canvas_mask"],
+            rng=inputs["rng"],
+            config=decoder_config,
+        )
+    )
+
+    def precomputed_decoder_loss_fn(
+        model,
+        prompt,
+        canvas,
+        canvas_id,
+        canvas_mask,
+        encoder_target,
+        encoder_target_mask,
+        rng,
+    ):
+      return diffusion_sft.diffusion_gemma_sft_loss(
+          model,
+          prompt=prompt,
+          canvas=canvas,
+          canvas_id=canvas_id,
+          canvas_mask=canvas_mask,
+          encoder_target=encoder_target,
+          encoder_target_mask=encoder_target_mask,
+          rng=rng,
+          config=decoder_config,
+          precomputed_sc_logits=sc_logits,
+          precomputed_self_conditioning_mask=do_self_cond,
+      )
+
+    precomputed_decoder_grad_fn = nnx.value_and_grad(
+        precomputed_decoder_loss_fn,
+        argnums=grad_arg,
+        has_aux=True,
+    )
+    (full_loss, _), full_grads = full_grad_fn(model, **inputs)
+    (decoder_loss, _), decoder_grads = decoder_grad_fn(model, **inputs)
+    (precomputed_decoder_loss, _), precomputed_decoder_grads = (
+        precomputed_decoder_grad_fn(model, **inputs)
+    )
+    (encoder_loss, _), encoder_grads = encoder_grad_fn(model, **inputs)
+    split_grads = jax.tree.map(lambda x, y: x + y, decoder_grads, encoder_grads)
+
+    np.testing.assert_allclose(
+        full_loss, decoder_loss + encoder_loss, rtol=2e-5, atol=2e-5
+    )
+    np.testing.assert_allclose(
+        decoder_loss, precomputed_decoder_loss, rtol=2e-5, atol=2e-5
+    )
+    for decoder_grad, precomputed_grad in zip(
+        jax.tree.leaves(decoder_grads),
+        jax.tree.leaves(precomputed_decoder_grads),
+    ):
+      np.testing.assert_allclose(
+          decoder_grad, precomputed_grad, rtol=2e-5, atol=2e-5
+      )
+    for full_grad, split_grad in zip(
+        jax.tree.leaves(full_grads), jax.tree.leaves(split_grads)
+    ):
+      np.testing.assert_allclose(full_grad, split_grad, rtol=2e-5, atol=2e-5)
 
   def test_masked_ce_matches_optax_reference(self):
     logits = jnp.array(
@@ -300,6 +530,94 @@ class DiffusionGemmaTest(absltest.TestCase):
     self.assertEqual(full_cache.keys(), last_cache.keys())
     np.testing.assert_array_equal(full_positions, last_positions)
     np.testing.assert_array_equal(full_prompt_mask, last_prompt_mask)
+
+  def test_forward_hidden_matches_logits_call(self):
+    vocab_size = 32
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        diffusion_model.ModelConfig.tiny(vocab_size=vocab_size),
+        rngs=nnx.Rngs(0),
+    )
+    cfg = diffusion_sft.DiffusionGemmaSFTConfig(
+        prompt_len=4,
+        canvas_size=4,
+        num_canvases=2,
+        vocab_size=vocab_size,
+    )
+    batch = _make_batch(vocab_size=vocab_size)
+    tokens = jnp.concatenate([batch.prompt, batch.canvas], axis=1)
+    token_mask = jnp.ones_like(tokens, dtype=jnp.bool_)
+    positions = diffusion_sft.build_positions_from_mask(token_mask)
+    attention_mask = diffusion_sft.make_causal_prefill_mask(
+        token_mask, tokens.shape[1]
+    )
+    cache = model.init_cache(
+        batch_size=tokens.shape[0],
+        max_seq_len=tokens.shape[1],
+        dtype=jnp.float32,
+    )
+
+    logits, _ = model(
+        tokens,
+        positions=positions,
+        cache=cache,
+        attention_mask=attention_mask,
+    )
+    hidden, _ = model.forward_hidden(
+        tokens,
+        positions=positions,
+        cache=cache,
+        attention_mask=attention_mask,
+    )
+    np.testing.assert_allclose(
+        model.decode_hidden(hidden),
+        logits,
+        rtol=0,
+        atol=0,
+    )
+
+  def test_chunked_encoder_loss_matches_full_logits_loss(self):
+    vocab_size = 32
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        diffusion_model.ModelConfig.tiny(vocab_size=vocab_size),
+        rngs=nnx.Rngs(0),
+    )
+    batch = _make_batch(vocab_size=vocab_size)
+    selected_canvas_idx = jnp.array([0, 1], dtype=jnp.int32)
+    cfg = diffusion_sft.DiffusionGemmaSFTConfig(
+        prompt_len=4,
+        canvas_size=4,
+        num_canvases=2,
+        vocab_size=vocab_size,
+    )
+    logits, _, _, _ = diffusion_sft.sft_encode(
+        model,
+        prompt=batch.prompt,
+        x0_tokens=batch.canvas,
+        canvas_mask=batch.canvas_mask,
+        selected_canvas_idx=selected_canvas_idx,
+        config=cfg,
+    )
+    hidden, _, _, _ = diffusion_sft.sft_encode(
+        model,
+        prompt=batch.prompt,
+        x0_tokens=batch.canvas,
+        canvas_mask=batch.canvas_mask,
+        selected_canvas_idx=selected_canvas_idx,
+        config=cfg,
+        return_encoder_hidden=True,
+    )
+
+    full_loss = diffusion_sft._masked_ce_loss(  # pylint: disable=protected-access
+        logits, batch.encoder_target, batch.encoder_target_mask
+    )
+    chunked_loss = diffusion_sft._masked_ce_loss_from_hidden(  # pylint: disable=protected-access
+        model,
+        hidden,
+        batch.encoder_target,
+        batch.encoder_target_mask,
+        chunk_size=3,
+    )
+    np.testing.assert_allclose(chunked_loss, full_loss, rtol=1e-6, atol=1e-6)
 
   def test_cached_slice_decoder_matches_full_for_first_canvas(self):
     vocab_size = 32

@@ -186,7 +186,7 @@ class DiffusionGemma_A26B_A4B(gemma4_model.Gemma4):  # pylint: disable=invalid-n
       self_conditioning_mask=None,
   ):
     if sc_logits is None:
-      return super().__call__(
+      hidden, new_cache = self.forward_hidden(
           tokens,
           positions=positions,
           cache=cache,
@@ -194,16 +194,104 @@ class DiffusionGemma_A26B_A4B(gemma4_model.Gemma4):  # pylint: disable=invalid-n
           decode_only_last_token=decode_only_last_token,
           segment_ids=segment_ids,
       )
-    return self.call_with_self_conditioning(
-        tokens=tokens,
-        sc_logits=sc_logits,
-        positions=positions,
-        cache=cache,
-        attention_mask=attention_mask,
-        decode_only_last_token=decode_only_last_token,
-        segment_ids=segment_ids,
-        self_conditioning_mask=self_conditioning_mask,
-    )
+    else:
+      hidden, new_cache = self.forward_hidden(
+          tokens,
+          positions=positions,
+          cache=cache,
+          attention_mask=attention_mask,
+          decode_only_last_token=decode_only_last_token,
+          segment_ids=segment_ids,
+          sc_logits=sc_logits,
+          self_conditioning_mask=self_conditioning_mask,
+      )
+    logits = self.decode_hidden(hidden)
+    return logits, new_cache
+
+  def decode_hidden(self, hidden: jaxtyping.Array) -> jaxtyping.Array:
+    logits = self.embedder.decode(hidden).astype(jnp.float32)
+    if self.config.final_logit_softcap is not None:
+      logits /= self.config.final_logit_softcap
+      logits = jnp.tanh(logits) * self.config.final_logit_softcap
+    return logits
+
+  def forward_hidden(
+      self,
+      tokens,
+      positions=None,
+      cache=None,
+      attention_mask=None,
+      decode_only_last_token=False,
+      segment_ids=None,
+      *,
+      sc_logits=None,
+      self_conditioning_mask=None,
+  ):
+    if sc_logits is not None:
+      return self.forward_hidden_with_self_conditioning(
+          tokens=tokens,
+          sc_logits=sc_logits,
+          positions=positions,
+          cache=cache,
+          attention_mask=attention_mask,
+          decode_only_last_token=decode_only_last_token,
+          segment_ids=segment_ids,
+          self_conditioning_mask=self_conditioning_mask,
+      )
+    del segment_ids
+    if positions is None:
+      batch_size, seq_len = tokens.shape
+      positions = jnp.tile(jnp.arange(seq_len)[None, :], (batch_size, 1))
+
+    if attention_mask is None:
+      seq_len = tokens.shape[1]
+      causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
+      attention_mask = jnp.broadcast_to(
+          causal[None, :, :], (tokens.shape[0], seq_len, seq_len)
+      )
+
+    new_cache = {}
+    x = self.embedder.encode(tokens)
+    per_layer_inputs = None
+    if self.config.per_layer_input_dim > 0:
+      per_layer_inputs = self.embedder.encode_per_layer_input(x, tokens)
+
+    transient_kvs: dict[str, dict[str, Any]] = {}
+    is_prefill = tokens.shape[1] > 1
+    for i, layer in enumerate(self.layers):
+      layer_name = f"layer_{i}"
+      shared_idx = self.kv_cache_sharing_patterns[i]
+      is_shared = shared_idx != i
+      if is_shared:
+        layer_cache = None
+        shared_layer_name = f"layer_{shared_idx}"
+        if is_prefill:
+          kv_shared_cache = transient_kvs[shared_layer_name]
+        else:
+          kv_shared_cache = new_cache.get(shared_layer_name)
+      else:
+        layer_cache = cache[layer_name] if cache else None
+        kv_shared_cache = None
+
+      layer_cache, x, layers_kvs = layer(
+          x,
+          positions,
+          layer_cache,
+          attention_mask,
+          per_layer_input=per_layer_inputs[:, :, i, :]
+          if per_layer_inputs is not None
+          else None,
+          kv_shared_cache=kv_shared_cache,
+      )
+      if is_prefill and i in self.shared_layer_origins:
+        transient_kvs[layer_name] = layers_kvs
+      if not is_shared:
+        new_cache[layer_name] = layer_cache
+
+    x = self.final_norm(x)
+    if decode_only_last_token:
+      x = x[:, -1:, :]
+    return x, (None if cache is None else new_cache)
 
   def call_with_self_conditioning(
       self,
@@ -218,6 +306,31 @@ class DiffusionGemma_A26B_A4B(gemma4_model.Gemma4):  # pylint: disable=invalid-n
       self_conditioning_mask=None,
   ):
     """Forward pass with DiffusionGemma self-conditioning."""
+    hidden, new_cache = self.forward_hidden_with_self_conditioning(
+        tokens=tokens,
+        sc_logits=sc_logits,
+        positions=positions,
+        cache=cache,
+        attention_mask=attention_mask,
+        decode_only_last_token=decode_only_last_token,
+        segment_ids=segment_ids,
+        self_conditioning_mask=self_conditioning_mask,
+    )
+    logits = self.decode_hidden(hidden)
+    return logits, new_cache
+
+  def forward_hidden_with_self_conditioning(
+      self,
+      *,
+      tokens,
+      sc_logits,
+      positions=None,
+      cache=None,
+      attention_mask=None,
+      decode_only_last_token=False,
+      segment_ids=None,
+      self_conditioning_mask=None,
+  ):
     del segment_ids
     if positions is None:
       batch_size, seq_len = tokens.shape
@@ -281,13 +394,7 @@ class DiffusionGemma_A26B_A4B(gemma4_model.Gemma4):  # pylint: disable=invalid-n
     x = self.final_norm(x)
     if decode_only_last_token:
       x = x[:, -1:, :]
-    logits = self.embedder.decode(x).astype(jnp.float32)
-
-    if self.config.final_logit_softcap is not None:
-      logits /= self.config.final_logit_softcap
-      logits = jnp.tanh(logits) * self.config.final_logit_softcap
-
-    return logits, (None if cache is None else new_cache)
+    return x, (None if cache is None else new_cache)
 
   def get_model_input(self):
     model_input = super().get_model_input()

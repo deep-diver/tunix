@@ -52,6 +52,8 @@ class DiffusionGemmaSFTConfig:
   stop_gradient_from_denoiser_to_encoder: bool = False
   decoder_implementation: str = "cached_selected_canvas"
   fast_uniform_corruption: bool = False
+  encoder_loss_chunk_size: int | None = 64
+  force_full_encoder_prefill: bool = False
 
   @property
   def total_canvas_len(self) -> int:
@@ -154,6 +156,7 @@ def sft_encode(
     selected_canvas_idx: jax.Array,
     config: DiffusionGemmaSFTConfig,
     return_encoder_logits: bool = True,
+    return_encoder_hidden: bool = False,
 ) -> tuple[jax.Array, Any, jax.Array, jax.Array]:
   del selected_canvas_idx
   full_seq = jnp.concatenate([prompt, x0_tokens], axis=1)
@@ -162,16 +165,29 @@ def sft_encode(
   positions = build_positions_from_mask(full_seq_mask)
   attention_mask = make_causal_prefill_mask(full_seq_mask, full_seq.shape[1])
   kv_cache = _init_cache(model, full_seq.shape[0], full_seq.shape[1])
-  encoder_logits, kv_cache = model(
-      full_seq,
-      positions=positions,
-      cache=kv_cache,
-      attention_mask=attention_mask,
-      decode_only_last_token=not return_encoder_logits,
-  )
+  if return_encoder_hidden:
+    if not hasattr(model, "forward_hidden"):
+      raise ValueError(
+          "return_encoder_hidden=True requires a model with forward_hidden()."
+      )
+    encoder_output, kv_cache = model.forward_hidden(
+        full_seq,
+        positions=positions,
+        cache=kv_cache,
+        attention_mask=attention_mask,
+        decode_only_last_token=not return_encoder_logits,
+    )
+  else:
+    encoder_output, kv_cache = model(
+        full_seq,
+        positions=positions,
+        cache=kv_cache,
+        attention_mask=attention_mask,
+        decode_only_last_token=not return_encoder_logits,
+    )
   if kv_cache is None:
     raise ValueError("KV cache should not be None after SFT prefill.")
-  return encoder_logits, kv_cache, positions, prompt_mask
+  return encoder_output, kv_cache, positions, prompt_mask
 
 
 def _full_sequence_decoder_attention_mask(
@@ -478,6 +494,186 @@ def _masked_ce_loss(
   return jnp.mean(per_example_loss / per_example_denom)
 
 
+def _masked_ce_loss_from_hidden(
+    model: nnx.Module,
+    hidden: jax.Array,
+    targets: jax.Array,
+    mask: jax.Array,
+    *,
+    chunk_size: int | None,
+) -> jax.Array:
+  """Computes CE from hidden states without materializing full-sequence logits."""
+  if chunk_size is None or chunk_size <= 0 or chunk_size >= hidden.shape[1]:
+    return _masked_ce_loss(model.decode_hidden(hidden), targets, mask)
+
+  seq_len = hidden.shape[1]
+  pad_len = (-seq_len) % chunk_size
+  if pad_len:
+    hidden = jnp.pad(hidden, ((0, 0), (0, pad_len), (0, 0)))
+    targets = jnp.pad(targets, ((0, 0), (0, pad_len)))
+    mask = jnp.pad(mask, ((0, 0), (0, pad_len)), constant_values=False)
+
+  num_chunks = hidden.shape[1] // chunk_size
+  hidden_chunks = hidden.reshape(
+      hidden.shape[0], num_chunks, chunk_size, hidden.shape[-1]
+  )
+  target_chunks = targets.reshape(targets.shape[0], num_chunks, chunk_size)
+  mask_chunks = mask.reshape(mask.shape[0], num_chunks, chunk_size)
+
+  def scan_body(carry, chunk_inputs):
+    total_loss, total_weight = carry
+    hidden_chunk, target_chunk, mask_chunk = chunk_inputs
+    logits = model.decode_hidden(hidden_chunk)
+    logits = logits.astype(jnp.float32)
+    target_logits = jnp.take_along_axis(
+        logits, target_chunk[..., None], axis=-1
+    ).squeeze(axis=-1)
+    loss = jax.nn.logsumexp(logits, axis=-1) - target_logits
+    weight = mask_chunk.astype(loss.dtype)
+    return (
+        total_loss + jnp.sum(loss * weight, axis=1),
+        total_weight + jnp.sum(weight, axis=1),
+    ), None
+
+  init = (
+      jnp.zeros((hidden.shape[0],), dtype=jnp.float32),
+      jnp.zeros((hidden.shape[0],), dtype=jnp.float32),
+  )
+  (loss_sum, weight_sum), _ = jax.lax.scan(
+      scan_body,
+      init,
+      (
+          jnp.swapaxes(hidden_chunks, 0, 1),
+          jnp.swapaxes(target_chunks, 0, 1),
+          jnp.swapaxes(mask_chunks, 0, 1),
+      ),
+  )
+  per_example_loss = loss_sum / jnp.maximum(weight_sum, 1.0)
+  return jnp.mean(per_example_loss)
+
+
+def diffusion_gemma_sft_self_conditioning_logits(
+    model: nnx.Module,
+    *,
+    prompt: jax.Array,
+    canvas: jax.Array,
+    canvas_mask: jax.Array,
+    rng: jax.Array,
+    config: DiffusionGemmaSFTConfig,
+) -> tuple[jax.Array, jax.Array]:
+  """Computes the stopped first-pass logits used for self-conditioning."""
+  prefill = diffusion_gemma_sft_self_conditioning_prefill(
+      model,
+      prompt=prompt,
+      canvas=canvas,
+      canvas_mask=canvas_mask,
+      rng=rng,
+      config=config,
+  )
+  return diffusion_gemma_sft_self_conditioning_logits_from_prefill(
+      model,
+      **prefill,
+      config=config,
+  )
+
+
+def diffusion_gemma_sft_self_conditioning_prefill(
+    model: nnx.Module,
+    *,
+    prompt: jax.Array,
+    canvas: jax.Array,
+    canvas_mask: jax.Array,
+    rng: jax.Array,
+    config: DiffusionGemmaSFTConfig,
+) -> dict[str, Any]:
+  """Builds the no-grad clean prefill state for self-conditioning."""
+  if canvas.ndim == 3:
+    x0_tokens = canvas[..., 0]
+  else:
+    x0_tokens = canvas
+  canvas_mask = canvas_mask.astype(jnp.bool_)
+
+  rng_time, rng_corrupt, rng_canvas, rng_self_cond = jax.random.split(rng, 4)
+  batch_size = x0_tokens.shape[0]
+  time = jax.random.uniform(
+      rng_time,
+      (batch_size, 1),
+      minval=config.min_time,
+      maxval=config.max_time,
+      dtype=jnp.float32,
+  )
+  xt, _ = _corrupt_tokens(
+      rng_corrupt,
+      x0_tokens,
+      time,
+      config.vocab_size,
+      fast_uniform=config.fast_uniform_corruption,
+  )
+  selected_canvas_idx = _sample_selected_canvas(rng_canvas, canvas_mask, config)
+
+  _, kv_cache, positions, prompt_mask = sft_encode(
+      model,
+      prompt=prompt,
+      x0_tokens=x0_tokens,
+      canvas_mask=canvas_mask,
+      selected_canvas_idx=selected_canvas_idx,
+      config=config,
+      return_encoder_logits=False,
+      return_encoder_hidden=False,
+  )
+  end_index = config.prompt_len + selected_canvas_idx * config.canvas_size
+  kv_cache = set_cache_end_index(kv_cache, end_index)
+  if config.stop_gradient_from_denoiser_to_encoder:
+    kv_cache = jax.lax.stop_gradient(kv_cache)
+
+  do_self_cond = (
+      jax.random.uniform(rng_self_cond, (batch_size,)) < config.self_cond_prob
+  )
+  do_self_cond = do_self_cond.reshape((batch_size, 1, 1))
+  return {
+      "prompt": prompt,
+      "xt": xt,
+      "kv_cache": jax.lax.stop_gradient(kv_cache),
+      "positions": positions,
+      "prompt_mask": prompt_mask,
+      "canvas_mask": canvas_mask,
+      "selected_canvas_idx": selected_canvas_idx,
+      "do_self_cond": do_self_cond,
+  }
+
+
+def diffusion_gemma_sft_self_conditioning_logits_from_prefill(
+    model: nnx.Module,
+    *,
+    prompt: jax.Array,
+    xt: jax.Array,
+    kv_cache: Any,
+    positions: jax.Array,
+    prompt_mask: jax.Array,
+    canvas_mask: jax.Array,
+    selected_canvas_idx: jax.Array,
+    do_self_cond: jax.Array,
+    config: DiffusionGemmaSFTConfig,
+) -> tuple[jax.Array, jax.Array]:
+  """Computes stopped first-pass logits from a precomputed clean KV cache."""
+  first_pass_logits = sft_decode(
+      model,
+      prompt=prompt,
+      xt=xt,
+      kv_cache=kv_cache,
+      positions=positions,
+      prompt_mask=prompt_mask,
+      canvas_mask=canvas_mask,
+      selected_canvas_idx=selected_canvas_idx,
+      config=config,
+  )
+  first_pass_logits = jax.lax.stop_gradient(first_pass_logits)
+  sc_logits = jnp.where(
+      do_self_cond, first_pass_logits, jnp.zeros_like(first_pass_logits)
+  )
+  return jax.lax.stop_gradient(sc_logits), do_self_cond
+
+
 def diffusion_gemma_sft_loss(
     model: nnx.Module,
     *,
@@ -489,6 +685,8 @@ def diffusion_gemma_sft_loss(
     encoder_target_mask: jax.Array,
     rng: jax.Array,
     config: DiffusionGemmaSFTConfig,
+    precomputed_sc_logits: jax.Array | None = None,
+    precomputed_self_conditioning_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
   """Computes the DiffusionGemma SFT objective used by Tunix."""
   if canvas.ndim == 3:
@@ -515,14 +713,25 @@ def diffusion_gemma_sft_loss(
   )
   selected_canvas_idx = _sample_selected_canvas(rng_canvas, canvas_mask, config)
 
-  encoder_logits, kv_cache, positions, prompt_mask = sft_encode(
+  use_chunked_encoder_loss = (
+      config.encoder_loss_weight != 0.0
+      and config.encoder_loss_chunk_size is not None
+      and config.encoder_loss_chunk_size > 0
+  )
+  return_full_encoder_prefill = (
+      config.encoder_loss_weight != 0.0 or config.force_full_encoder_prefill
+  )
+  encoder_output, kv_cache, positions, prompt_mask = sft_encode(
       model,
       prompt=prompt,
       x0_tokens=x0_tokens,
       canvas_mask=canvas_mask,
       selected_canvas_idx=selected_canvas_idx,
       config=config,
-      return_encoder_logits=config.encoder_loss_weight != 0.0,
+      return_encoder_logits=return_full_encoder_prefill,
+      return_encoder_hidden=(
+          use_chunked_encoder_loss or config.force_full_encoder_prefill
+      ),
   )
   end_index = config.prompt_len + selected_canvas_idx * config.canvas_size
   kv_cache = set_cache_end_index(kv_cache, end_index)
@@ -531,57 +740,85 @@ def diffusion_gemma_sft_loss(
 
   target_mask = canvas_mask & (canvas_id == selected_canvas_idx[:, None])
   denoise_loss_mask = is_corrupted & target_mask
-  first_pass_logits = sft_decode(
-      model,
-      prompt=prompt,
-      xt=xt,
-      kv_cache=kv_cache,
-      positions=positions,
-      prompt_mask=prompt_mask,
-      canvas_mask=canvas_mask,
-      selected_canvas_idx=selected_canvas_idx,
-      config=config,
-  )
-
-  first_pass_logits = jax.lax.stop_gradient(first_pass_logits)
-  do_self_cond = (
-      jax.random.uniform(rng_self_cond, (batch_size,)) < config.self_cond_prob
-  )
-  do_self_cond = do_self_cond.reshape((batch_size, 1, 1))
-  zero_logits = jnp.zeros_like(first_pass_logits)
-  sc_logits = jnp.where(do_self_cond, first_pass_logits, zero_logits)
-  logits = sft_decode(
-      model,
-      prompt=prompt,
-      xt=xt,
-      kv_cache=kv_cache,
-      positions=positions,
-      prompt_mask=prompt_mask,
-      canvas_mask=canvas_mask,
-      selected_canvas_idx=selected_canvas_idx,
-      config=config,
-      sc_logits=sc_logits,
-  )
 
   if config.decoder_loss_weight == 0.0:
     decoder_loss = jnp.asarray(0.0, dtype=jnp.float32)
-  elif config.decoder_implementation == "cached_selected_canvas_slice":
-    decoder_loss = _masked_ce_loss(
-        logits,
-        _gather_selected_canvas(
-            x0_tokens, selected_canvas_idx, config.canvas_size
-        ),
-        _gather_selected_canvas(
-            denoise_loss_mask, selected_canvas_idx, config.canvas_size
-        ),
-    )
+    do_self_cond = jnp.zeros((batch_size, 1, 1), dtype=jnp.bool_)
   else:
-    decoder_loss = _masked_ce_loss(logits, x0_tokens, denoise_loss_mask)
+    if precomputed_sc_logits is None:
+      first_pass_logits = sft_decode(
+          model,
+          prompt=prompt,
+          xt=xt,
+          kv_cache=kv_cache,
+          positions=positions,
+          prompt_mask=prompt_mask,
+          canvas_mask=canvas_mask,
+          selected_canvas_idx=selected_canvas_idx,
+          config=config,
+      )
+      first_pass_logits = jax.lax.stop_gradient(first_pass_logits)
+      do_self_cond = (
+          jax.random.uniform(rng_self_cond, (batch_size,))
+          < config.self_cond_prob
+      )
+      do_self_cond = do_self_cond.reshape((batch_size, 1, 1))
+      sc_logits = jnp.where(
+          do_self_cond, first_pass_logits, jnp.zeros_like(first_pass_logits)
+      )
+    else:
+      precomputed_sc_logits = jax.lax.stop_gradient(precomputed_sc_logits)
+      if precomputed_self_conditioning_mask is None:
+        do_self_cond = (
+            jax.random.uniform(rng_self_cond, (batch_size,))
+            < config.self_cond_prob
+        )
+        do_self_cond = do_self_cond.reshape((batch_size, 1, 1))
+        sc_logits = jnp.where(
+            do_self_cond,
+            precomputed_sc_logits,
+            jnp.zeros_like(precomputed_sc_logits),
+        )
+      else:
+        do_self_cond = precomputed_self_conditioning_mask
+        sc_logits = precomputed_sc_logits
+    logits = sft_decode(
+        model,
+        prompt=prompt,
+        xt=xt,
+        kv_cache=kv_cache,
+        positions=positions,
+        prompt_mask=prompt_mask,
+        canvas_mask=canvas_mask,
+        selected_canvas_idx=selected_canvas_idx,
+        config=config,
+        sc_logits=sc_logits,
+    )
+    if config.decoder_implementation == "cached_selected_canvas_slice":
+      decoder_loss = _masked_ce_loss(
+          logits,
+          _gather_selected_canvas(
+              x0_tokens, selected_canvas_idx, config.canvas_size
+          ),
+          _gather_selected_canvas(
+              denoise_loss_mask, selected_canvas_idx, config.canvas_size
+          ),
+      )
+    else:
+      decoder_loss = _masked_ce_loss(logits, x0_tokens, denoise_loss_mask)
   if config.encoder_loss_weight == 0.0:
     encoder_loss = jnp.asarray(0.0, dtype=jnp.float32)
+  elif use_chunked_encoder_loss:
+    encoder_loss = _masked_ce_loss_from_hidden(
+        model,
+        encoder_output,
+        encoder_target,
+        encoder_target_mask,
+        chunk_size=config.encoder_loss_chunk_size,
+    )
   else:
     encoder_loss = _masked_ce_loss(
-        encoder_logits, encoder_target, encoder_target_mask
+        encoder_output, encoder_target, encoder_target_mask
     )
   loss = (
       config.decoder_loss_weight * decoder_loss
@@ -693,14 +930,57 @@ class DiffusionGemmaTrainer(peft_trainer.PeftTrainer):
       optimizer: optax.GradientTransformation,
       training_config: peft_trainer.TrainingConfig,
       diffusion_config: DiffusionGemmaSFTConfig,
+      *,
+      split_loss_gradients: bool = False,
       **kwargs,
   ):
     self.diffusion_config = diffusion_config
+    self.split_loss_gradients = split_loss_gradients
+    self.decoder_only_config = dataclasses.replace(
+        diffusion_config,
+        encoder_loss_weight=0.0,
+        force_full_encoder_prefill=True,
+    )
+    self.encoder_only_config = dataclasses.replace(
+        diffusion_config, decoder_loss_weight=0.0
+    )
     self.last_train_aux = None
     self.last_eval_aux = None
     super().__init__(model, optimizer, training_config, **kwargs)
     self.with_gen_model_input_fn(gen_model_input_fn)
     self.with_loss_fn(make_loss_fn(diffusion_config), has_aux=True)
+
+  def _train_step(
+      self, model: nnx.Module, optimizer: nnx.Optimizer, inputs: Any
+  ) -> tuple[jax.Array, Any | None, jax.Array]:
+    if not self.split_loss_gradients:
+      return super()._train_step(model, optimizer, inputs)
+
+    inputs = self.gen_model_input_fn(inputs)
+    grad_arg = nnx.DiffState(0, nnx.LoRAParam) if self._lora_enabled else 0
+    decoder_grad_fn = nnx.value_and_grad(
+        make_loss_fn(self.decoder_only_config),
+        argnums=grad_arg,
+        has_aux=True,
+    )
+    encoder_grad_fn = nnx.value_and_grad(
+        make_loss_fn(self.encoder_only_config),
+        argnums=grad_arg,
+        has_aux=True,
+    )
+    (decoder_loss, decoder_aux), decoder_grads = decoder_grad_fn(
+        model, **inputs
+    )
+    (encoder_loss, encoder_aux), encoder_grads = encoder_grad_fn(
+        model, **inputs
+    )
+    grads = jax.tree.map(lambda x, y: x + y, decoder_grads, encoder_grads)
+    grad_norm = optax.global_norm(grads)
+    optimizer.update(model, grads)
+    aux = dict(decoder_aux)
+    aux["encoder_loss"] = encoder_aux["encoder_loss"]
+    loss = decoder_loss + encoder_loss
+    return loss, aux, grad_norm
 
   def _post_process_train_step(self, aux: Any) -> None:
     self.last_train_aux = aux

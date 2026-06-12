@@ -14,9 +14,10 @@
 
 """DiffusionGemma API."""
 
+from tunix.models.diffusion_gemma import hackable_adapter
 from tunix.models.diffusion_gemma import model
 from tunix.models.diffusion_gemma import params
 from tunix.models.diffusion_gemma import params_safetensors
 from tunix.models.diffusion_gemma import sft
 
-__all__ = ["model", "params", "params_safetensors", "sft"]
+__all__ = ["hackable_adapter", "model", "params", "params_safetensors", "sft"]

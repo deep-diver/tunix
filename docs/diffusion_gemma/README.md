@@ -13,6 +13,7 @@ This directory is the runbook for the Tunix DiffusionGemma MVP integration.
 - Matches official full-model logits on a tiny non-MoE DiffusionGemma config by copying official Flax/Linen weights into the Tunix NNX model and comparing complete-sequence plain logits plus self-conditioning logits.
 - Includes a tiny synthetic smoke script that checks finite loss, LoRA-only updates, and checkpoint directory creation.
 - Includes a PubMedQA real-data LoRA SFT smoke script that mirrors the official DeepMind PubMedQA split and prompt/answer formatting without importing Kauldron or Grain.
+- Includes an optional official Hackable Diffusion compatibility backend that keeps the official Flax/Linen + Kauldron SFT path intact and wraps it with a Tunix entrypoint for 2-GPU parity/resource checks.
 - Includes a no-tuning generation demo with official-style confidence selection, annealed temperature, token-stability plus entropy early stopping, JSON trace export, and a self-contained HTML animation of every denoising frame.
 
 ## Current Limitations
@@ -26,6 +27,84 @@ This directory is the runbook for the Tunix DiffusionGemma MVP integration.
 - For multi-GPU public-checkpoint runs, `scripts/smoke_diffusion_gemma_pubmedqa_tunix.py` now defaults to an official-style FSDP-first mesh (`mesh_fsdp=jax.device_count(), mesh_tp=1`) when both mesh flags are omitted. Tensor parallelism can still be requested explicitly, but TP-only is not the right H100x2 comparison for the official recipe.
 - Decoder rematerialization is compatible with Qwix LoRA materialization in this MVP. The SFT adapter temporarily disables decoder remat while Qwix discovers LoRA targets, then restores remat for the actual forward/train path; GPU logs verify the same 366 LoRA leaves with `--remat_decoder`.
 - For public 26B smoke runs, `scripts/smoke_diffusion_gemma_pubmedqa_tunix.py` defaults to a minimal `minimal_state.json` proof artifact instead of Tunix/Orbax optimizer checkpointing. Use `--orbax_checkpoint` only when the shape is known to fit; the public 26B optimizer checkpoint path can exceed memory.
+
+## Official Hackable Backend
+
+The native Tunix path in `tunix.models.diffusion_gemma.sft` is the long-term
+NNX/Qwix integration target. For a lower-risk 2-GPU path, this branch also
+adds `tunix.models.diffusion_gemma.hackable_adapter`, which loads the official
+Gemma Diffusion recipe modules directly and only applies run-environment
+overrides such as checkpoint path, workdir, LoRA rank, and smoke step count.
+
+This backend is intentionally not a rewrite. It preserves the official
+Flax/Linen model, Hackable Diffusion corruption/loss/sampling logic, Kauldron
+trainer, official LoRA wrapper, FSDP sharding, and dataset factories.
+
+For debugging environments where Kauldron's multi-GPU writer/final-sync path
+fails, `--train_loop hybrid` reuses the official model, dataset, optimizer, loss,
+and trainstep objects but drives the step loop from the Tunix wrapper. It is a
+compatibility smoke path, not a replacement for the long-term NNX/Qwix model
+family integration.
+
+Example PubMedQA smoke command on a machine where the official repos are
+available:
+
+```bash
+python scripts/smoke_diffusion_gemma_official_backend.py \
+  --recipe pubmedqa \
+  --gemma_ref /tmp/gemma-diffusion-reference \
+  --hackable_diffusion_ref /tmp/hackable-diffusion-reference \
+  --checkpoint_path /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it \
+  --workdir /home/ubuntu/diffusion_gemma_official_pubmedqa_smoke \
+  --num_train_steps 1 \
+  --checkpoint_every_n_steps 1 \
+  --config_override schedules.learning_rate.warmup_steps=0 \
+  --config_override schedules.learning_rate.decay_steps=1 \
+  --no-use_early_stopping \
+  --disable_evals
+```
+
+Use this path when the goal is to match the official 2xA100/H100 memory profile.
+Use `scripts/smoke_diffusion_gemma_pubmedqa_tunix.py` when the goal is to test
+the native Tunix NNX/Qwix trainer path.
+
+Latest A100-80GB x2 official-backend check:
+
+- Machine: `425388` (`A100-80GB`, `IN2`, 2 GPUs, pytorch container), destroyed after the run. `jl status --json` reported `running_instances: 0` afterward.
+- Official deps/config build: `r_c257587b`; `gemma==4.0.1`, `hackable_diffusion==1.0.1`, `kauldron==1.4.4`; PubMedQA config built with LoRA rank 4, prompt length 1024, 2 canvases, canvas size 128.
+- Checkpoint mirror: `r_ebee1a23`, 31 objects, 37.633 GiB, 164.191 seconds.
+- Full official batch-2 A100x2 train attempts reached checkpoint restore and the train loop, with about 61.3 GiB used per GPU. Step metric/loss materialization failed in the official `safe_writer` path with `ncclAllGather ... invalid argument` / `corrupted comm object detected` on both `jax[cuda13]` and `jax[cuda12]`.
+- Single-GPU attempts with `CUDA_VISIBLE_DEVICES=0` failed with GPU OOM, even with `--dataset_batch_size 1`; A100 80GB one-card training is not enough for this recipe.
+- With metric materialization skipped and checkpoint saving suppressed, the official trainer ran to `train: 100%|2/2`; final Kauldron host `_sync()` still failed with `ncclAllReduce ... invalid argument`. Workdir evidence existed before destroy: `config.json`, `element_spec.json`, TensorBoard event file, and `checkpoints/ckpt_0/_CHECKPOINT_METADATA` totaling 37 GiB.
+- Verdict: the wrapper can import/build the official recipe and drive real train steps, but this Jarvis A100x2 container has an NCCL communicator failure in official Kauldron post-step sync/metric paths. Treat clean A100x2 completion as not verified in this environment.
+
+Follow-up A100-80GB x2 hybrid/official comparison on 2026-06-12:
+
+- Machine: `425531` (`A100-80GB`, `IN2`, 2 GPUs, pytorch container), destroyed after the run. `jl status --json` reported `running_instances: 0` and `running_vms: 0` afterward.
+- H100 containers were unavailable (`num_free_devices: 0` in `IN2`), so this repeat used the official-comparable A100-80GBx2 container path.
+- Official deps/config build: `r_0192fe97`; `gemma==4.0.1`, `hackable_diffusion==1.0.1`, `kauldron==1.4.4`; PubMedQA config built with LoRA rank 4, prompt length 1024, 2 canvases, canvas size 128.
+- Checkpoint mirror: `r_aeac19fb`, 32 objects, 37.633 GiB, 96.474 seconds.
+- JAX/NCCL baseline: `jax.pmap(lax.psum)` succeeded on both CUDA13 (`r_dfc8cf19`, `NCCL version 2.30.7+cuda13.3`) and CUDA12 (`r_4bf8abdb`, `NCCL version 2.30.7+cuda12.9`) with `NCCL_IB_DISABLE=1`.
+- Hybrid official-backend attempts reached checkpoint restore and emitted pre-step verification checksums: LoRA 364 leaves / 8,856,064 elements; sampled base 8 leaves / 1,280,317,952 elements. VRAM was about 61.3 GiB used per A100.
+- Hybrid CUDA13 without `NCCL_IB_DISABLE` (`r_b68bffeb`), CUDA13 with `NCCL_IB_DISABLE=1` (`r_391e403e`), and CUDA12 with `NCCL_IB_DISABLE=1` (`r_ef15db9d`) all reached `official_backend_hybrid_step_complete`, then surfaced an async official `jit_step` NCCL failure when synchronizing post-step state: `ncclAllGather ... invalid argument`, `corrupted comm object detected`.
+- Direct official Kauldron comparison with CUDA12 + `NCCL_IB_DISABLE=1` (`r_3d606f48`) ran the official train loop to `train: 100%|2/2` with step metrics skipped; final Kauldron `_sync()` failed with `ncclAllReduce ... invalid argument`.
+- Verdict: the hybrid wrapper removes Kauldron metric/final-sync code from the Tunix-controlled loop, but this A100x2 Jarvis container still produces an underlying official JAX/NCCL communicator error around the DiffusionGemma trainstep. Clean 2-GPU completion is not verified in this environment. The run does verify official-recipe import/build, checkpoint restore, public PubMedQA dataset wiring, LoRA parameter detection, and entry into real official train steps.
+
+Cross-GPU official-backend comparison on 2026-06-12:
+
+- RTX PRO 6000 x2 machine: `425551` (`RTX-PRO6000`, `IN1`, 2 GPUs, pytorch container), destroyed after the run.
+- H100 x2 machine: `425553` (`H100`, `IN2`, 2 GPUs, VM), destroyed after the run.
+- `jl status --json` reported `running_instances: 0` and `running_vms: 0` after both destroys.
+- RTX setup/config: `r_d5baac99`, succeeded with official deps and PubMedQA config.
+- RTX checkpoint mirror: `r_04367c75`, 32 objects, 37.633 GiB, 83.988 seconds.
+- RTX official Kauldron run: `r_6f265dee`, CUDA13, `NCCL_IB_DISABLE=1`, batch size 2, step metrics skipped. It emitted Blackwell PTX JIT warnings, TensorFlow allocator warnings for a 33.57 GiB allocation, and non-fatal NCCL `corrupted comm object detected` warnings. It still reached `train: 100%|2/2` and printed `official_backend_train_complete`; exit code 0.
+- H100 auto-venv setup first failed (`r_ee34574d`) because the VM default Python was 3.14 and TensorFlow wheels were unavailable. The valid run used an explicit Python 3.13 venv.
+- H100 setup/config: `r_06c091e1`, succeeded.
+- H100 checkpoint mirror: `r_aaab1b1b`, 32 objects, 37.633 GiB, 77.306 seconds.
+- H100 CUDA13 train attempt (`r_467172a5`) was stopped because the JAX CUDA13 plugin fell back to CPU due a cuBLAS plugin/library mismatch; this was not counted as a valid GPU train result.
+- H100 CUDA12 pmap baseline: `r_b7da99b3`, succeeded on both H100s.
+- H100 official Kauldron run: `r_2200993f`, CUDA12, `NCCL_IB_DISABLE=1`, batch size 2, step metrics skipped. It emitted CUDA VMM permission warnings and non-fatal NCCL `corrupted comm object detected` warnings. It reached `train: 100%|2/2` and printed `official_backend_train_complete`; exit code 0.
+- Verdict: the A100-80GB x2 container failure is not universal across 2-GPU Jarvis runtimes. Official DiffusionGemma cleanly completes the same 1-step PubMedQA Kauldron smoke on RTX PRO 6000 x2 and H100 x2 when the runtime is set up correctly. The remaining A100 result should be treated as an A100 container/JAX-NCCL runtime issue, not proof that the official implementation is generally broken.
 
 ## Local Commands
 

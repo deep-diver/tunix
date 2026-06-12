@@ -65,6 +65,8 @@ def _download_one(
     obj: dict[str, str],
     prefix: str,
     dest: pathlib.Path,
+    slices_per_large_object: int,
+    large_object_threshold_mb: int,
 ) -> dict[str, object]:
   name = obj["name"]
   size = int(obj.get("size", 0))
@@ -76,6 +78,18 @@ def _download_one(
     return {"name": name, "size": size, "status": "cached"}
 
   url = _object_url(bucket, name)
+  if (
+      slices_per_large_object > 1
+      and size >= large_object_threshold_mb * 1024 * 1024
+  ):
+    _download_one_sliced(
+        url=url,
+        target=target,
+        size=size,
+        slices=slices_per_large_object,
+    )
+    return {"name": name, "size": size, "status": "downloaded"}
+
   with tempfile.NamedTemporaryFile(
       dir=str(target.parent), delete=False
   ) as tmp_file:
@@ -96,12 +110,66 @@ def _download_one(
   return {"name": name, "size": size, "status": "downloaded"}
 
 
+def _download_one_sliced(
+    *,
+    url: str,
+    target: pathlib.Path,
+    size: int,
+    slices: int,
+) -> None:
+  tmp_path = target.with_name(target.name + ".partial")
+  with tmp_path.open("wb") as f:
+    f.truncate(size)
+
+  def download_range(range_index: int) -> None:
+    start = range_index * size // slices
+    end = ((range_index + 1) * size // slices) - 1
+    request = urllib.request.Request(
+        url, headers={"Range": f"bytes={start}-{end}"}
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+      if response.status != 206:
+        raise IOError(
+            f"Expected HTTP 206 for range {start}-{end}, got {response.status}."
+        )
+      with tmp_path.open("r+b") as tmp_file:
+        tmp_file.seek(start)
+        while True:
+          chunk = response.read(16 * 1024 * 1024)
+          if not chunk:
+            break
+          tmp_file.write(chunk)
+
+  with futures.ThreadPoolExecutor(max_workers=slices) as executor:
+    list(executor.map(download_range, range(slices)))
+
+  if tmp_path.stat().st_size != size:
+    tmp_path.unlink(missing_ok=True)
+    raise IOError(
+        f"Short sliced download for {target}: got {tmp_path.stat().st_size},"
+        f" want {size}"
+    )
+  tmp_path.replace(target)
+
+
 def main() -> None:
   parser = argparse.ArgumentParser()
   parser.add_argument("--bucket", required=True)
   parser.add_argument("--prefix", required=True)
   parser.add_argument("--dest", required=True)
   parser.add_argument("--workers", type=int, default=8)
+  parser.add_argument(
+      "--slices_per_large_object",
+      type=int,
+      default=1,
+      help="Use HTTP Range requests to download each large object in slices.",
+  )
+  parser.add_argument(
+      "--large_object_threshold_mb",
+      type=int,
+      default=512,
+      help="Minimum object size for sliced download.",
+  )
   args = parser.parse_args()
 
   prefix = args.prefix
@@ -130,6 +198,8 @@ def main() -> None:
             obj=obj,
             prefix=prefix,
             dest=dest,
+            slices_per_large_object=args.slices_per_large_object,
+            large_object_threshold_mb=args.large_object_threshold_mb,
         ): obj
         for obj in objects
     }
