@@ -49,6 +49,7 @@ class RematConfig(enum.Enum):
   NONE = enum.auto()
   BLOCK = enum.auto()
   DECODER = enum.auto()
+  FULL = enum.auto()
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -939,6 +940,8 @@ class Attention(nnx.Module):
     if (
         remat_config == RematConfig.BLOCK
         or remat_config == RematConfig.BLOCK.value
+        or remat_config == RematConfig.FULL
+        or remat_config == RematConfig.FULL.value
     ):
       # nnx.remat needs to be applied to the unbound function and take self
       # as the first argument. graph_updates=False prevents TraceContextError
@@ -1041,6 +1044,8 @@ class FeedForward(nnx.Module):
     if (
         remat_config == RematConfig.BLOCK
         or remat_config == RematConfig.BLOCK.value
+        or remat_config == RematConfig.FULL
+        or remat_config == RematConfig.FULL.value
     ):
       return nnx.remat(self.block.__func__, graph_updates=False)(self, x)
     else:
@@ -1205,6 +1210,8 @@ class DecoderLayer(nnx.Module):
     if (
         remat_config == RematConfig.DECODER
         or remat_config == RematConfig.DECODER.value
+        or remat_config == RematConfig.FULL
+        or remat_config == RematConfig.FULL.value
     ):
       return nnx.remat(self.block.__func__, graph_updates=False)(
           self,

@@ -488,6 +488,8 @@ def _remat_config_from_args(
     return gemma4_model.RematConfig.DECODER
   if policy == "block":
     return gemma4_model.RematConfig.BLOCK
+  if policy == "full":
+    return gemma4_model.RematConfig.FULL
   raise ValueError(f"Unsupported remat policy: {policy}")
 
 
@@ -1520,12 +1522,12 @@ def parse_args() -> argparse.Namespace:
   )
   parser.add_argument(
       "--remat_policy",
-      choices=["none", "decoder", "block"],
+      choices=["none", "decoder", "block", "full"],
       default=None,
       help=(
           "Explicit Gemma4 rematerialization policy. Overrides"
-          " --remat_decoder when set. Use 'block' for lower peak memory on"
-          " long prompt encoder-gradient runs."
+          " --remat_decoder when set. Use 'block' or 'full' for lower peak"
+          " memory on long prompt encoder-gradient runs."
       ),
   )
   parser.add_argument("--restore_concurrent_gb", type=int, default=16)
