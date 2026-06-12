@@ -556,6 +556,36 @@ def _state_summary(state: Any) -> dict[str, int]:
   }
 
 
+def _block_until_ready_state(state: Any) -> None:
+  for leaf in jax.tree.leaves(state):
+    if hasattr(leaf, "block_until_ready"):
+      leaf.block_until_ready()
+
+
+def _checkpoint_dir(args: argparse.Namespace, *, prefix: str) -> str:
+  ckpt_dir = args.checkpoint_dir or tempfile.mkdtemp(prefix=prefix)
+  pathlib.Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+  return ckpt_dir
+
+
+def _write_result(
+    result: dict[str, Any],
+    *,
+    event: str,
+    gpu_memory_monitor: _GpuMemoryMonitor,
+) -> dict[str, Any]:
+  gpu_memory = gpu_memory_monitor.stop()
+  if gpu_memory is not None:
+    result["gpu_memory"] = gpu_memory
+    _log("gpu_memory_summary", **gpu_memory)
+  pathlib.Path(result["minimal_state_path"]).write_text(
+      json.dumps(result, indent=2, sort_keys=True) + "\n",
+      encoding="utf-8",
+  )
+  _log(event, **result)
+  return result
+
+
 def _train_with_separate_loss_jits(
     trainer: diffusion_sft.DiffusionGemmaTrainer,
     train_batches: list[dict[str, jax.Array]],
@@ -744,6 +774,79 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
   )
   gpu_memory_monitor = _GpuMemoryMonitor(args.gpu_memory_poll_seconds)
   gpu_memory_monitor.start()
+
+  if args.load_only:
+    if args.tiny:
+      vocab_size = args.tiny_vocab_size
+      model = _load_tiny_model(args, vocab_size)
+    else:
+      vocab_size = (
+          diffusion_model.ModelConfig.diffusion_gemma_a26b_a4b().num_embed
+      )
+      _log("loading_model", checkpoint=args.checkpoint, dtype=args.dtype)
+      model = _load_real_model(args)
+
+    model = diffusion_sft.apply_lora(
+        model,
+        rank=args.lora_rank,
+        alpha=args.lora_alpha,
+        module_path=args.lora_module_path,
+    )
+    _block_until_ready_state(nnx.state(model))
+    _log(
+        "model_ready",
+        tiny=args.tiny,
+        lora_rank=args.lora_rank,
+        lora_module_path=args.lora_module_path,
+        remat_decoder=args.remat_decoder,
+        load_only=True,
+    )
+    trainable_summary = _state_summary(nnx.state(model, nnx.LoRAParam))
+    frozen_summary = _state_summary(
+        nnx.state(model, nnx.filterlib.Not(nnx.LoRAParam))
+    )
+    _log(
+        "trainable_state",
+        lora=trainable_summary,
+        frozen=frozen_summary,
+        lora_fraction=(
+            trainable_summary["elements"]
+            / max(
+                trainable_summary["elements"] + frozen_summary["elements"], 1
+            )
+        ),
+    )
+    ckpt_dir = _checkpoint_dir(
+        args, prefix="diffusion_gemma_pubmedqa_load_only_"
+    )
+    result = {
+        "mode": "load_only",
+        "steps": 0,
+        "checkpoint_dir": ckpt_dir,
+        "checkpoint_dir_exists": pathlib.Path(ckpt_dir).exists(),
+        "minimal_state_path": str(pathlib.Path(ckpt_dir) / "minimal_state.json"),
+        "checkpoint": args.checkpoint,
+        "tiny": args.tiny,
+        "dtype": args.dtype,
+        "vocab_size": vocab_size,
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
+        "lora_module_path": args.lora_module_path,
+        "remat_decoder": args.remat_decoder,
+        "mesh_fsdp": mesh_fsdp,
+        "mesh_tp": mesh_tp,
+        "restore_concurrent_gb": args.restore_concurrent_gb,
+        "trainable_state": trainable_summary,
+        "frozen_state": frozen_summary,
+    }
+    if not result["checkpoint_dir_exists"]:
+      raise RuntimeError(f"Checkpoint directory was not created: {ckpt_dir}")
+    return _write_result(
+        result,
+        event="load_only_complete",
+        gpu_memory_monitor=gpu_memory_monitor,
+    )
+
   train_path, test_path = _prepare_pubmedqa(args)
   all_examples = _read_jsonl(train_path)
   examples = all_examples[args.slice_start :]
@@ -865,10 +968,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
   base_before_checksums = _small_leaf_checksums(
       nnx.state(model, nnx.filterlib.Not(nnx.LoRAParam))
   )
-  ckpt_dir = args.checkpoint_dir or tempfile.mkdtemp(
-      prefix="diffusion_gemma_pubmedqa_ckpt_"
-  )
-  pathlib.Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+  ckpt_dir = _checkpoint_dir(args, prefix="diffusion_gemma_pubmedqa_ckpt_")
   optimizer = optax.chain(
       optax.clip_by_global_norm(args.max_grad_norm),
       optax.adamw(
@@ -952,10 +1052,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       "trainable_state": trainable_summary,
       "frozen_state": frozen_summary,
   }
-  gpu_memory = gpu_memory_monitor.stop()
-  if gpu_memory is not None:
-    result["gpu_memory"] = gpu_memory
-    _log("gpu_memory_summary", **gpu_memory)
   if trainer.train_steps < args.steps:
     raise RuntimeError(
         f"Expected {args.steps} train steps, got {trainer.train_steps}"
@@ -968,18 +1064,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     raise RuntimeError(
         "Sampled non-LoRA parameter checksums changed during LoRA training."
     )
-  pathlib.Path(result["minimal_state_path"]).write_text(
-      json.dumps(result, indent=2, sort_keys=True) + "\n",
-      encoding="utf-8",
+  return _write_result(
+      result,
+      event="train_complete",
+      gpu_memory_monitor=gpu_memory_monitor,
   )
-  _log("train_complete", **result)
-  return result
 
 
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser()
   parser.add_argument(
       "--tiny", action=argparse.BooleanOptionalAction, default=False
+  )
+  parser.add_argument(
+      "--load_only",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Load the DiffusionGemma checkpoint, attach LoRA params, write a "
+          "minimal_state.json proof artifact, and exit before dataset, loss, "
+          "or trainer construction. This isolates checkpoint/LoRA peak memory "
+          "from train-step peak memory."
+      ),
   )
   parser.add_argument("--steps", type=int, default=2)
   parser.add_argument("--batch_size", type=int, default=1)
