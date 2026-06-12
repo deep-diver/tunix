@@ -182,7 +182,7 @@ def create_model_from_checkpoint(
 
   This loader maps the Gemma4-compatible backbone and the known
   ``self_conditioner`` leaves. Missing diffusion-only leaves are kept at their
-  deterministic initialization and reported as warnings so MVP smoke tests can
+  deterministic initialization and reported as warnings so MVP validation tests can
   validate the training path before full checkpoint parity is completed.
   """
   abs_model = nnx.eval_shape(

@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""PubMedQA LoRA SFT smoke test for Tunix DiffusionGemma.
+"""PubMedQA LoRA SFT validation test for Tunix DiffusionGemma.
 
 This script mirrors the official DeepMind
 ``hackable_diffusion_adapter/data/pubmedqa`` preprocessing path closely enough
 to exercise Tunix on real PubMedQA examples without importing Kauldron/Grain.
 It can run with a tiny randomly initialized model for local checks or with the
-public DiffusionGemma checkpoint for a GPU smoke run.
+public DiffusionGemma checkpoint for a GPU validation run.
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ def _log(event: str, **kwargs: Any) -> None:
 
 
 class _GpuMemoryMonitor:
-  """Polls nvidia-smi so GPU smoke runs leave explicit VRAM evidence."""
+  """Polls nvidia-smi so GPU validation runs leave explicit VRAM evidence."""
 
   def __init__(self, poll_seconds: float):
     self._poll_seconds = poll_seconds
@@ -1028,7 +1028,7 @@ def parse_args() -> argparse.Namespace:
       help=(
           "Compute decoder and encoder gradients in separate exact passes and "
           "sum them before the optimizer update. This is slower but lowers the "
-          "peak memory of 26B LoRA smoke runs on 2x80GB GPUs."
+          "peak memory of 26B LoRA validation runs on 2x80GB GPUs."
       ),
   )
   parser.add_argument(
@@ -1039,7 +1039,7 @@ def parse_args() -> argparse.Namespace:
           "When --split_loss_gradients is enabled, compile decoder-gradient, "
           "encoder-gradient, and optimizer-update steps as separate JAX "
           "executables. This is slower but further lowers peak memory for "
-          "2x80GB GPU smoke runs."
+          "2x80GB GPU validation runs."
       ),
   )
   parser.add_argument("--seed", type=int, default=42)
@@ -1061,7 +1061,7 @@ def parse_args() -> argparse.Namespace:
       default=False,
       help=(
           "Use Tunix/Orbax checkpointing. Disabled by default for public 26B "
-          "GPU smoke runs because the optimizer checkpoint can exceed memory; "
+          "GPU validation runs because the optimizer checkpoint can exceed memory; "
           "a minimal_state.json proof artifact is always written instead."
       ),
   )

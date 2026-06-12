@@ -8,25 +8,25 @@ This directory is the runbook for the Tunix DiffusionGemma MVP integration.
 - Adds `DiffusionGemma_A26B_A4B` as an NNX model that reuses Tunix Gemma4 A26B/A4B and adds a self-conditioning block.
 - Adds a DiffusionGemma SFT adapter around `PeftTrainer.with_gen_model_input_fn()` and `with_loss_fn(has_aux=True)`.
 - Implements prompt + clean canvas prefill, KV cache construction, diffusion timestep sampling, token corruption, selected canvas denoising loss, self-conditioning second pass, encoder AR loss, and LoRA SFT.
-- Implements an official-style cached selected-canvas decoder path plus a `cached_selected_canvas_slice` smoke path that decodes only the selected canvas loss window.
+- Implements an official-style cached selected-canvas decoder path plus a `cached_selected_canvas_slice` validation path that decodes only the selected canvas loss window.
 - Matches official helper semantics for positions, prefill/decoder masks, cache `end_index`, `SafeSpan(1e-4)` timestep sampling, categorical corruption, selected-canvas sampling, unweighted discrete loss normalization, and unscaled self-conditioning post-norm.
 - Matches official full-model logits on a tiny non-MoE DiffusionGemma config by copying official Flax/Linen weights into the Tunix NNX model and comparing complete-sequence plain logits plus self-conditioning logits.
-- Includes a tiny synthetic smoke script that checks finite loss, LoRA-only updates, and checkpoint directory creation.
-- Includes a PubMedQA real-data LoRA SFT smoke script that mirrors the official DeepMind PubMedQA split and prompt/answer formatting without importing Kauldron or Grain.
+- Includes a tiny synthetic validation script that checks finite loss, LoRA-only updates, and checkpoint directory creation.
+- Includes a PubMedQA real-data LoRA SFT validation script that mirrors the official DeepMind PubMedQA split and prompt/answer formatting without importing Kauldron or Grain.
 - Includes an optional official Hackable Diffusion compatibility backend that keeps the official Flax/Linen + Kauldron SFT path intact and wraps it with a Tunix entrypoint for 2-GPU parity/resource checks.
 - Includes a no-tuning generation demo with official-style confidence selection, annealed temperature, token-stability plus entropy early stopping, JSON trace export, and a self-contained HTML animation of every denoising frame.
 
 ## Current Limitations
 
-- The NNX MVP now has cached selected-canvas decoding, including per-example cache `end_index` updates. The `cached_selected_canvas_slice` mode is a lower-memory smoke path for the selected loss window; it is parity-checked against the full cached path when the selected canvas is the first canvas.
+- The NNX MVP now has cached selected-canvas decoding, including per-example cache `end_index` updates. The `cached_selected_canvas_slice` mode is a lower-memory validation path for the selected loss window; it is parity-checked against the full cached path when the selected canvas is the first canvas.
 - The full-model logits parity script covers the direct transformer forward path without cache. Cached SFT logits parity against the full official Flax/Linen stack is still a next gate.
 - Upstream Orbax checkpoint loading maps the Gemma4-compatible backbone and known `self_conditioner` leaves. The public `diffusiongemma-26B-A4B-it` checkpoint has been loaded successfully on 4xH100 and 8x96GB JAX meshes.
-- The no-tuning generation demo uses the full-sequence no-cache path covered by logits parity, not the official cached production sampler. Treat it as a load/denoise visibility smoke test, not a quality benchmark.
-- Public 26B PubMedQA LoRA tuning now passes 1-step official-length smokes on an 8x RTX PRO 6000 96GB container with `mesh_fsdp=4, mesh_tp=2`, `prompt_len=1024`, `num_canvases=2`, `canvas_size=128`, batch size 1, long answers, `cached_selected_canvas_slice`, decoder remat, self-conditioning, encoder AR loss, full backbone LoRA coverage, LoRA-only update, base-parameter non-update, VRAM telemetry, and minimal state save.
+- The no-tuning generation demo uses the full-sequence no-cache path covered by logits parity, not the official cached production sampler. Treat it as a load/denoise visibility validation test, not a quality benchmark.
+- Public 26B PubMedQA LoRA tuning now passes 1-step official-length validations on an 8x RTX PRO 6000 96GB container with `mesh_fsdp=4, mesh_tp=2`, `prompt_len=1024`, `num_canvases=2`, `canvas_size=128`, batch size 1, long answers, `cached_selected_canvas_slice`, decoder remat, self-conditioning, encoder AR loss, full backbone LoRA coverage, LoRA-only update, base-parameter non-update, VRAM telemetry, and minimal state save.
 - The official PubMedQA SFT recipe uses the same prompt/canvas geometry, batch size 2, long answers, encoder AR loss, LoRA rank 4, and 2000 train steps. A direct official Kauldron run on 2xH100 successfully saved `ckpt_0` and completed train step 1 at batch size 2. The Tunix MVP does not yet match that 2xH100 memory profile: `mesh_fsdp=2, mesh_tp=1` still OOMs during `jit__train_step`, even with selected-canvas slice decoding and decoder remat.
-- For multi-GPU public-checkpoint runs, `scripts/smoke_diffusion_gemma_pubmedqa_tunix.py` now defaults to an official-style FSDP-first mesh (`mesh_fsdp=jax.device_count(), mesh_tp=1`) when both mesh flags are omitted. Tensor parallelism can still be requested explicitly, but TP-only is not the right H100x2 comparison for the official recipe.
+- For multi-GPU public-checkpoint runs, `scripts/run_diffusion_gemma_pubmedqa_tunix.py` now defaults to an official-style FSDP-first mesh (`mesh_fsdp=jax.device_count(), mesh_tp=1`) when both mesh flags are omitted. Tensor parallelism can still be requested explicitly, but TP-only is not the right H100x2 comparison for the official recipe.
 - Decoder rematerialization is compatible with Qwix LoRA materialization in this MVP. The SFT adapter temporarily disables decoder remat while Qwix discovers LoRA targets, then restores remat for the actual forward/train path; GPU logs verify the same 366 LoRA leaves with `--remat_decoder`.
-- For public 26B smoke runs, `scripts/smoke_diffusion_gemma_pubmedqa_tunix.py` defaults to a minimal `minimal_state.json` proof artifact instead of Tunix/Orbax optimizer checkpointing. Use `--orbax_checkpoint` only when the shape is known to fit; the public 26B optimizer checkpoint path can exceed memory.
+- For public 26B validation runs, `scripts/run_diffusion_gemma_pubmedqa_tunix.py` defaults to a minimal `minimal_state.json` proof artifact instead of Tunix/Orbax optimizer checkpointing. Use `--orbax_checkpoint` only when the shape is known to fit; the public 26B optimizer checkpoint path can exceed memory.
 
 ## Official Hackable Backend
 
@@ -43,10 +43,10 @@ trainer, official LoRA wrapper, FSDP sharding, and dataset factories.
 For debugging environments where Kauldron's multi-GPU writer/final-sync path
 fails, `--train_loop hybrid` reuses the official model, dataset, optimizer, loss,
 and trainstep objects but drives the step loop from the Tunix wrapper. It is a
-compatibility smoke path, not a replacement for the long-term NNX/Qwix model
+compatibility validation path, not a replacement for the long-term NNX/Qwix model
 family integration.
 
-Example PubMedQA smoke command on a machine where the official repos are
+Example PubMedQA validation command on a machine where the official repos are
 available:
 
 ```bash
@@ -55,7 +55,7 @@ python scripts/run_diffusion_gemma_official_backend.py \
   --gemma_ref /tmp/gemma-diffusion-reference \
   --hackable_diffusion_ref /tmp/hackable-diffusion-reference \
   --checkpoint_path /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it \
-  --workdir /home/ubuntu/diffusion_gemma_official_pubmedqa_smoke \
+  --workdir /home/ubuntu/diffusion_gemma_official_pubmedqa_validation \
   --num_train_steps 1 \
   --checkpoint_every_n_steps 1 \
   --config_override schedules.learning_rate.warmup_steps=0 \
@@ -65,7 +65,7 @@ python scripts/run_diffusion_gemma_official_backend.py \
 ```
 
 Use this path when the goal is to match the official 2xA100/H100 memory profile.
-Use `scripts/smoke_diffusion_gemma_pubmedqa_tunix.py` when the goal is to test
+Use `scripts/run_diffusion_gemma_pubmedqa_tunix.py` when the goal is to test
 the native Tunix NNX/Qwix trainer path.
 
 Latest A100-80GB x2 official-backend check:
@@ -104,21 +104,21 @@ Cross-GPU official-backend comparison on 2026-06-12:
 - H100 CUDA13 train attempt (`r_467172a5`) was stopped because the JAX CUDA13 plugin fell back to CPU due a cuBLAS plugin/library mismatch; this was not counted as a valid GPU train result.
 - H100 CUDA12 pmap baseline: `r_b7da99b3`, succeeded on both H100s.
 - H100 official Kauldron run: `r_2200993f`, CUDA12, `NCCL_IB_DISABLE=1`, batch size 2, step metrics skipped. It emitted CUDA VMM permission warnings and non-fatal NCCL `corrupted comm object detected` warnings. It reached `train: 100%|2/2` and printed `official_backend_train_complete`; exit code 0.
-- Verdict: the A100-80GB x2 container failure is not universal across 2-GPU Jarvis runtimes. Official DiffusionGemma cleanly completes the same 1-step PubMedQA Kauldron smoke on RTX PRO 6000 x2 and H100 x2 when the runtime is set up correctly. The remaining A100 result should be treated as an A100 container/JAX-NCCL runtime issue, not proof that the official implementation is generally broken.
+- Verdict: the A100-80GB x2 container failure is not universal across 2-GPU Jarvis runtimes. Official DiffusionGemma cleanly completes the same 1-step PubMedQA Kauldron validation on RTX PRO 6000 x2 and H100 x2 when the runtime is set up correctly. The remaining A100 result should be treated as an A100 container/JAX-NCCL runtime issue, not proof that the official implementation is generally broken.
 
 ## Local Commands
 
 ```bash
-python -m pyink tunix/models/diffusion_gemma tests/models/diffusion_gemma_test.py scripts/smoke_diffusion_gemma_tunix.py tunix/models/automodel.py tunix/models/naming.py
+python -m pyink tunix/models/diffusion_gemma tests/models/diffusion_gemma_test.py scripts/run_diffusion_gemma_tiny_tunix.py tunix/models/automodel.py tunix/models/naming.py
 python -m pytest tests/models/diffusion_gemma_test.py -q --import-mode=importlib
 python scripts/verify_diffusion_gemma_official_parity.py
 python scripts/verify_diffusion_gemma_official_logits.py
 python scripts/generate_diffusion_gemma_tunix.py --tiny --max_new_tokens 4 --canvas_length 4 --denoising_steps 3 --prompt "Hi" --animation_output /tmp/diffusion_gemma_tiny_trace.html --trace_json /tmp/diffusion_gemma_tiny_trace.json
 python scripts/render_diffusion_gemma_trace_gif.py /tmp/diffusion_gemma_tiny_trace.json --output /tmp/diffusion_gemma_tiny_trace.gif --width 900 --height 520
-python scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --tiny --steps 1 --batch_size 1 --gradient_accumulation_steps 2 --prompt_len 128 --canvas_size 32 --num_canvases 1 --max_examples 4 --max_context_chars 600 --tiny_vocab_size 256 --decoder_implementation cached_selected_canvas_slice
+python scripts/run_diffusion_gemma_pubmedqa_tunix.py --tiny --steps 1 --batch_size 1 --gradient_accumulation_steps 2 --prompt_len 128 --canvas_size 32 --num_canvases 1 --max_examples 4 --max_context_chars 600 --tiny_vocab_size 256 --decoder_implementation cached_selected_canvas_slice
 python -m pytest tests/models/registry_test.py -q --import-mode=importlib
 python -m pytest tests/models/naming_test.py -q --import-mode=importlib -k 'not model_id_exists_on_huggingface'
-python scripts/smoke_diffusion_gemma_tunix.py --steps 3 --use_lora
+python scripts/run_diffusion_gemma_tiny_tunix.py --steps 3 --use_lora
 python -m pytest
 ```
 
@@ -148,14 +148,14 @@ MVP, the full suite also aborts in `tests/generate/tokenizer_adapter_test.py`
 inside SentencePiece native code. With that crashing file ignored, the latest
 run reached `1528 passed`, `34 failed`, and `105 errors`; the remaining failures
 are unrelated optional-backend imports, JAX CPU-device ordering setup, and
-pre-existing sampler/SFT/RL/smoke-test environment failures. The
+pre-existing sampler/SFT/RL/validation-test environment failures. The
 DiffusionGemma-specific tests and parity scripts above pass.
 
-## PubMedQA SFT Smoke
+## PubMedQA SFT Validation
 
 The official DeepMind DiffusionGemma SFT recipe includes PubMedQA data setup in
 `gemma/diffusion/hackable_diffusion_adapter/configs/sft_pubmedqa.py` and
-`.../data/pubmedqa`. The Tunix smoke mirrors the relevant pieces:
+`.../data/pubmedqa`. The Tunix validation mirrors the relevant pieces:
 
 - data source: `pubmedqa/pubmedqa`
 - train split: `ori_pqal.json` minus IDs in `test_ground_truth.json`
@@ -167,7 +167,7 @@ The official DeepMind DiffusionGemma SFT recipe includes PubMedQA data setup in
 Local tiny real-data command:
 
 ```bash
-python scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --tiny --steps 2 --batch_size 1 --prompt_len 128 --canvas_size 32 --num_canvases 1 --max_examples 4 --max_context_chars 600 --tiny_vocab_size 256
+python scripts/run_diffusion_gemma_pubmedqa_tunix.py --tiny --steps 2 --batch_size 1 --prompt_len 128 --canvas_size 32 --num_canvases 1 --max_examples 4 --max_context_chars 600 --tiny_vocab_size 256
 ```
 
 Latest verified local tiny PubMedQA result:
@@ -182,9 +182,9 @@ Latest verified local tiny PubMedQA result:
 Public 26B PubMedQA GPU commands used for the latest H100 attempts:
 
 ```bash
-jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/ubuntu/tunix-dg-pubmedqa && . .venv/bin/activate && python scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --steps 1 --batch_size 1 --prompt_len 64 --canvas_size 8 --num_canvases 1 --max_examples 2 --max_context_chars 300 --no-use_long_answer --checkpoint /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 4 --mesh_tp 1 --restore_concurrent_gb 16 --checkpoint_dir /home/ubuntu/diffusion_gemma_pubmedqa_state_short_v2 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption'
-jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/ubuntu/tunix-dg-pubmedqa-tp && . .venv/bin/activate && python scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --steps 1 --batch_size 1 --prompt_len 64 --canvas_size 8 --num_canvases 1 --max_examples 2 --max_context_chars 300 --no-use_long_answer --checkpoint /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 1 --mesh_tp 4 --restore_concurrent_gb 16 --checkpoint_dir /home/ubuntu/diffusion_gemma_pubmedqa_state_tp4 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption'
-jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/ubuntu/tunix-dg-pubmedqa-tp && . .venv/bin/activate && python scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --steps 1 --batch_size 1 --prompt_len 64 --canvas_size 8 --num_canvases 1 --max_examples 2 --max_context_chars 300 --no-use_long_answer --checkpoint /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 2 --mesh_tp 2 --restore_concurrent_gb 16 --checkpoint_dir /home/ubuntu/diffusion_gemma_pubmedqa_state_fsdp2_tp2 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption'
+jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/ubuntu/tunix-dg-pubmedqa && . .venv/bin/activate && python scripts/run_diffusion_gemma_pubmedqa_tunix.py --steps 1 --batch_size 1 --prompt_len 64 --canvas_size 8 --num_canvases 1 --max_examples 2 --max_context_chars 300 --no-use_long_answer --checkpoint /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 4 --mesh_tp 1 --restore_concurrent_gb 16 --checkpoint_dir /home/ubuntu/diffusion_gemma_pubmedqa_state_short_v2 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption'
+jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/ubuntu/tunix-dg-pubmedqa-tp && . .venv/bin/activate && python scripts/run_diffusion_gemma_pubmedqa_tunix.py --steps 1 --batch_size 1 --prompt_len 64 --canvas_size 8 --num_canvases 1 --max_examples 2 --max_context_chars 300 --no-use_long_answer --checkpoint /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 1 --mesh_tp 4 --restore_concurrent_gb 16 --checkpoint_dir /home/ubuntu/diffusion_gemma_pubmedqa_state_tp4 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption'
+jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/ubuntu/tunix-dg-pubmedqa-tp && . .venv/bin/activate && python scripts/run_diffusion_gemma_pubmedqa_tunix.py --steps 1 --batch_size 1 --prompt_len 64 --canvas_size 8 --num_canvases 1 --max_examples 2 --max_context_chars 300 --no-use_long_answer --checkpoint /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 2 --mesh_tp 2 --restore_concurrent_gb 16 --checkpoint_dir /home/ubuntu/diffusion_gemma_pubmedqa_state_fsdp2_tp2 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption'
 ```
 
 H100x2 official-vs-Tunix verification:
@@ -193,7 +193,7 @@ H100x2 official-vs-Tunix verification:
 jl create --gpu H100 --num-gpus 2 --storage 300 --vm --region IN2 --yes --json
 jl run /tmp/tunix-dg-h100x2 --script scripts/download_public_gcs_prefix.py --on <machine_id> --requirements /tmp/tunix-dg-h100x2/requirements-gpu.txt --json --yes -- --bucket gemma-data --prefix checkpoints/diffusiongemma-26B-A4B-it/ --dest /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it --workers 16
 jl exec <machine_id> --json -- sh -lc 'mkdir -p /home/ubuntu/checkpoints/tokenizers && curl -L https://storage.googleapis.com/gemma-data/tokenizers/tokenizer_gemma4.model -o /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model'
-jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/ubuntu/tunix-dg-h100x2 && . .venv/bin/activate && env XLA_FLAGS="--xla_disable_hlo_passes=constant_folding" NCCL_ALGO=Ring NCCL_PROTO=LL128 NCCL_NVLS_ENABLE=0 NCCL_CUMEM_ENABLE=0 python3 scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --steps 1 --batch_size 1 --prompt_len 1024 --canvas_size 128 --num_canvases 2 --max_examples 4 --max_context_chars 4000 --checkpoint /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 2 --mesh_tp 1 --restore_concurrent_gb 16 --checkpoint_dir /home/ubuntu/diffusion_gemma_pubmedqa_state_h100x2_fsdp2_encoder_b1 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption --decoder_implementation cached_selected_canvas_slice --remat_decoder --gpu_memory_poll_seconds 2'
+jl run --on <machine_id> --json --yes -- sh -lc 'cd /home/ubuntu/tunix-dg-h100x2 && . .venv/bin/activate && env XLA_FLAGS="--xla_disable_hlo_passes=constant_folding" NCCL_ALGO=Ring NCCL_PROTO=LL128 NCCL_NVLS_ENABLE=0 NCCL_CUMEM_ENABLE=0 python3 scripts/run_diffusion_gemma_pubmedqa_tunix.py --steps 1 --batch_size 1 --prompt_len 1024 --canvas_size 128 --num_canvases 2 --max_examples 4 --max_context_chars 4000 --checkpoint /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 2 --mesh_tp 1 --restore_concurrent_gb 16 --checkpoint_dir /home/ubuntu/diffusion_gemma_pubmedqa_state_h100x2_fsdp2_encoder_b1 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption --decoder_implementation cached_selected_canvas_slice --remat_decoder --gpu_memory_poll_seconds 2'
 jl destroy <machine_id> --yes --json
 ```
 
@@ -202,7 +202,7 @@ Latest verified H100x2 comparison:
 - Machine: `425205` (`H100`, `IN2`, 2 GPUs, VM), destroyed after the run. `jl status --json` reported `running_instances: 0` and `running_vms: 0` after destroy.
 - Checkpoint mirror: `r_d0ffa7fc`, 31 objects, 37.633 GiB, 207.234 seconds.
 - Official Gemma checkout: `8fb37ee37e43d23165fe8919c4b1bb9c6e57492a`, Python 3.12, CUDA 13 JAX wheel (`jax==0.10.1`), both H100 devices visible to JAX.
-- Official PubMedQA source patch used for the smoke was path-only plus one enum alias: local checkpoint/tokenizer paths and `DIFFUSIONGEMMA_26B_A4B_IT = DIFFUSIONGEMMA_A26B_A4B_IT`. No training/model logic was changed.
+- Official PubMedQA source patch used for the validation was path-only plus one enum alias: local checkpoint/tokenizer paths and `DIFFUSIONGEMMA_26B_A4B_IT = DIFFUSIONGEMMA_A26B_A4B_IT`. No training/model logic was changed.
 - Official config evidence: `kd.sharding.ShardingStrategy(params=kd.sharding.FSDPSharding(), opt_state=kd.sharding.FSDPSharding())`, `use_lora=True`, `target_modules="all-linear"`, train `batch_size=2`, `num_train_steps=2_000`.
 - Official run: `r_e97874e5`; `ckpt_0` saved a 47.1 GiB checkpoint, then train step 1 completed with `losses/diffusion_loss=6.328125`, `losses/encoder_loss=7.25`, `losses/total=13.578125`, `perf_stats/train/avg_time_sec=259.697`, and about `65.6GB` used / `15.4GB` free on each H100. The run was manually stopped after first-step success, so JarvisLabs records exit 143.
 - Tunix TP-only comparison: `r_d83c9316`, `mesh_fsdp=1, mesh_tp=2`, batch size 1. Initial loss was finite (`total=12.563678741455078`, decoder `4.934838771820068`, encoder `7.62883996963501`), LoRA coverage was 366 leaves / 4,423,936 elements, but train step failed with `RESOURCE_EXHAUSTED` while allocating `32.42GiB`; XLA remat reduced the module to `58.67GiB` from `74.46GiB`.
@@ -215,8 +215,8 @@ Repeatable 8-GPU public-checkpoint command with VRAM telemetry:
 jl create --gpu RTX-PRO6000 --region IN1 --num-gpus 8 --storage 300 --template pytorch --yes --json
 jl run /tmp/tunix-dg-efficient --script scripts/download_public_gcs_prefix.py --on <machine_id> --requirements /tmp/tunix-dg-efficient/requirements-gpu.txt --json --yes -- --bucket gemma-data --prefix checkpoints/diffusiongemma-26B-A4B-it/ --dest /root/checkpoints/diffusiongemma-26B-A4B-it --workers 16
 jl exec <machine_id> --json -- sh -lc 'mkdir -p /root/checkpoints/tokenizers && curl -L https://storage.googleapis.com/gemma-data/tokenizers/tokenizer_gemma4.model -o /root/checkpoints/tokenizers/tokenizer_gemma4.model'
-jl run /tmp/tunix-dg-efficient --script scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --on <machine_id> --requirements /tmp/tunix-dg-efficient/requirements-gpu.txt --json --yes -- --steps 1 --batch_size 1 --prompt_len 1024 --canvas_size 128 --num_canvases 2 --max_examples 4 --max_context_chars 4000 --checkpoint /root/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /root/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 4 --mesh_tp 2 --restore_concurrent_gb 16 --checkpoint_dir /root/diffusion_gemma_pubmedqa_state_8gpu_remat_official_denoiser_b1_prefillskip --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption --decoder_implementation cached_selected_canvas_slice --encoder_loss_weight 0.0 --stop_gradient_from_denoiser_to_encoder --remat_decoder --gpu_memory_poll_seconds 2
-jl run /tmp/tunix-dg-efficient --script scripts/smoke_diffusion_gemma_pubmedqa_tunix.py --on <machine_id> --requirements /tmp/tunix-dg-efficient/requirements-gpu.txt --json --yes -- --steps 1 --batch_size 1 --prompt_len 1024 --canvas_size 128 --num_canvases 2 --max_examples 4 --max_context_chars 4000 --checkpoint /root/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /root/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 4 --mesh_tp 2 --restore_concurrent_gb 16 --checkpoint_dir /root/diffusion_gemma_pubmedqa_state_8gpu_remat_official_encoder_b1 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption --decoder_implementation cached_selected_canvas_slice --remat_decoder --gpu_memory_poll_seconds 2
+jl run /tmp/tunix-dg-efficient --script scripts/run_diffusion_gemma_pubmedqa_tunix.py --on <machine_id> --requirements /tmp/tunix-dg-efficient/requirements-gpu.txt --json --yes -- --steps 1 --batch_size 1 --prompt_len 1024 --canvas_size 128 --num_canvases 2 --max_examples 4 --max_context_chars 4000 --checkpoint /root/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /root/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 4 --mesh_tp 2 --restore_concurrent_gb 16 --checkpoint_dir /root/diffusion_gemma_pubmedqa_state_8gpu_remat_official_denoiser_b1_prefillskip --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption --decoder_implementation cached_selected_canvas_slice --encoder_loss_weight 0.0 --stop_gradient_from_denoiser_to_encoder --remat_decoder --gpu_memory_poll_seconds 2
+jl run /tmp/tunix-dg-efficient --script scripts/run_diffusion_gemma_pubmedqa_tunix.py --on <machine_id> --requirements /tmp/tunix-dg-efficient/requirements-gpu.txt --json --yes -- --steps 1 --batch_size 1 --prompt_len 1024 --canvas_size 128 --num_canvases 2 --max_examples 4 --max_context_chars 4000 --checkpoint /root/checkpoints/diffusiongemma-26B-A4B-it --tokenizer /root/checkpoints/tokenizers/tokenizer_gemma4.model --mesh_fsdp 4 --mesh_tp 2 --restore_concurrent_gb 16 --checkpoint_dir /root/diffusion_gemma_pubmedqa_state_8gpu_remat_official_encoder_b1 --lora_rank 4 --lora_alpha 8.0 --fast_uniform_corruption --decoder_implementation cached_selected_canvas_slice --remat_decoder --gpu_memory_poll_seconds 2
 jl destroy <machine_id> --yes --json
 ```
 
@@ -249,14 +249,14 @@ Latest verified 8x RTX PRO 6000 PubMedQA public-checkpoint result:
 - Full-loss VRAM telemetry: peak used MiB `76963` on GPU 0 and `60553-60555` on GPUs 1-7; minimum free MiB `20924`.
 - First JIT compile remains expensive. The encoder-loss train step emitted XLA constant-folding warnings in `jit(_train_step)/jvp()/reduce_max` and took about 14-15 minutes wall time including restore/compile/run. Batch size 2/effective batch 2 and steady-state multi-step throughput are still separate scale-out checks.
 
-## JarvisLabs Smoke
+## JarvisLabs Validation
 
 ```bash
 jl status --json
 jl gpus --json
 jl resources --json
 jl create --gpu H100 --storage 200 --template pytorch --yes --json
-jl run . --script scripts/smoke_diffusion_gemma_tunix.py --on <machine_id> --requirements requirements-gpu.txt --json --yes -- --steps 5 --use_lora
+jl run . --script scripts/run_diffusion_gemma_tiny_tunix.py --on <machine_id> --requirements requirements-gpu.txt --json --yes -- --steps 5 --use_lora
 sleep 15 && jl run logs <run_id> --tail 30
 sleep 120 && jl run logs <run_id> --tail 50
 jl destroy <machine_id> --yes --json
@@ -264,15 +264,15 @@ jl destroy <machine_id> --yes --json
 
 If H100 is unavailable, choose the best available H200/H100-class GPU reported by `jl gpus --json`; do not guess the exact SKU.
 
-For a faster upload, stage only the files needed by the smoke test:
+For a faster upload, stage only the files needed by the validation test:
 
 ```bash
-mkdir -p /tmp/tunix-dg-smoke/scripts
-rsync -a --delete --exclude __pycache__/ tunix/ /tmp/tunix-dg-smoke/tunix/
-rsync -a pyproject.toml README.md requirements-gpu.txt /tmp/tunix-dg-smoke/
-rsync -a scripts/smoke_diffusion_gemma_tunix.py /tmp/tunix-dg-smoke/scripts/
-cd /tmp/tunix-dg-smoke
-jl run . --script scripts/smoke_diffusion_gemma_tunix.py --on <machine_id> --requirements requirements-gpu.txt --json --yes -- --steps 5 --use_lora
+mkdir -p /tmp/tunix-dg-validation/scripts
+rsync -a --delete --exclude __pycache__/ tunix/ /tmp/tunix-dg-validation/tunix/
+rsync -a pyproject.toml README.md requirements-gpu.txt /tmp/tunix-dg-validation/
+rsync -a scripts/run_diffusion_gemma_tiny_tunix.py /tmp/tunix-dg-validation/scripts/
+cd /tmp/tunix-dg-validation
+jl run . --script scripts/run_diffusion_gemma_tiny_tunix.py --on <machine_id> --requirements requirements-gpu.txt --json --yes -- --steps 5 --use_lora
 ```
 
 Latest verified H100 run:
@@ -281,7 +281,7 @@ Latest verified H100 run:
 - Run: `r_220b9ed9`
 - Result: `cuda:0`, finite initial loss, 5 training steps, checkpoint directory created, `base_params_unchanged=true`, `lora_params_changed=true`.
 
-## Public Checkpoint Generation Smoke
+## Public Checkpoint Generation Validation
 
 The public checkpoint is stored in Google Cloud Storage and can be mirrored with
 the small HTTP downloader in this branch:

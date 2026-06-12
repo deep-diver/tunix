@@ -76,7 +76,7 @@ class ModelConfig:
       head_dim: int = 8,
       num_kv_heads: int = 2,
   ) -> gemma4_model.ModelConfig:
-    """Small config for CPU/GPU smoke tests."""
+    """Small config for CPU/GPU validation tests."""
     return gemma4_model.ModelConfig(
         num_layers=num_layers,
         num_embed=vocab_size,

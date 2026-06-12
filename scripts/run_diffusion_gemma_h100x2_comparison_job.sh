@@ -54,6 +54,7 @@ DATASET_BATCH_SIZE="${DATASET_BATCH_SIZE:-2}"
 LORA_RANK="${LORA_RANK:-4}"
 GPU_POLL_SECONDS="${GPU_POLL_SECONDS:-60}"
 JAX_CUDA_EXTRA="${JAX_CUDA_EXTRA:-cuda12}"
+XLA_FLAGS="${XLA_FLAGS:---xla_disable_hlo_passes=constant_folding}"
 
 python_version_ok() {
   "$1" - <<'PY' >/dev/null 2>&1
@@ -109,7 +110,8 @@ json_event comparison_job_start \
   max_runtime_seconds="${MAX_RUNTIME_SECONDS}" \
   num_train_steps="${NUM_TRAIN_STEPS}" \
   dataset_batch_size="${DATASET_BATCH_SIZE}" \
-  lora_rank="${LORA_RANK}"
+  lora_rank="${LORA_RANK}" \
+  xla_flags="${XLA_FLAGS}"
 
 if [[ ! -x "${VENV}/bin/python" ]] || ! python_version_ok "${VENV}/bin/python"; then
   rm -rf "${VENV}"
@@ -231,6 +233,7 @@ export NCCL_ALGO="${NCCL_ALGO:-Ring}"
 export NCCL_PROTO="${NCCL_PROTO:-LL128}"
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
+export XLA_FLAGS
 
 set +e
 timeout --preserve-status --signal=TERM "${MAX_RUNTIME_SECONDS}" \
@@ -268,6 +271,7 @@ payload = {
     "summary_json": "${SUMMARY_JSON}",
     "gemma_revision": "$(git -C "${GEMMA_REF}" rev-parse HEAD)",
     "hackable_diffusion_revision": "$(git -C "${HACKABLE_DIFFUSION_REF}" rev-parse HEAD)",
+    "xla_flags": "${XLA_FLAGS}",
 }
 path = pathlib.Path("${RESULT_JSON}")
 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\\n")

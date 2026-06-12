@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tiny DiffusionGemma SFT smoke test for CPU/GPU/JarvisLabs."""
+"""Tiny DiffusionGemma SFT validation test for CPU/GPU/JarvisLabs."""
 
 from __future__ import annotations
 
@@ -205,9 +205,9 @@ def main() -> None:
     result["base_params_unchanged"] = _tree_all_equal(before_base, after_base)
     result["lora_params_changed"] = _tree_any_changed(before_lora, after_lora)
     if not result["base_params_unchanged"]:
-      raise RuntimeError("Non-LoRA parameters changed in LoRA smoke run.")
+      raise RuntimeError("Non-LoRA parameters changed in LoRA validation run.")
     if not result["lora_params_changed"]:
-      raise RuntimeError("LoRA parameters did not change in LoRA smoke run.")
+      raise RuntimeError("LoRA parameters did not change in LoRA validation run.")
   if not os.path.exists(ckpt_dir):
     raise RuntimeError(f"Checkpoint directory was not created: {ckpt_dir}")
   print(json.dumps(result))
