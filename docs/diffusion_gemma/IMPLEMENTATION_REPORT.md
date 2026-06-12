@@ -12,7 +12,7 @@ This fork provides a Tunix-hosted wrapper for the official DeepMind
 DiffusionGemma SFT recipe. The wrapper keeps the official Gemma Diffusion,
 Hackable Diffusion, and Kauldron training implementation as the source of
 truth, while adding a Tunix-side entrypoint for setup, configuration overrides,
-smoke runs, and repeatable GPU validation.
+controlled runs, and repeatable GPU validation.
 
 This report is intentionally scoped to the current Hackable Diffusion backend
 wrapper. It does not claim that the native Tunix NNX/Qwix implementation is a
@@ -23,13 +23,13 @@ production-ready replacement for the official recipe.
 The relevant implementation files are:
 
 - `tunix/models/diffusion_gemma/hackable_adapter.py`
-- `scripts/smoke_diffusion_gemma_official_backend.py`
+- `scripts/run_diffusion_gemma_official_backend.py`
 - `scripts/setup_diffusion_gemma_official_backend.sh`
 
 The wrapper entrypoint can be inspected with:
 
 ```bash
-python scripts/smoke_diffusion_gemma_official_backend.py --help
+python scripts/run_diffusion_gemma_official_backend.py --help
 ```
 
 ## Integration Shape
@@ -50,7 +50,7 @@ The Tunix fork is responsible for:
 - Importing and launching the official recipe from inside the Tunix repository.
 - Installing or preparing the official backend dependencies.
 - Overriding work directories, checkpoint paths, step counts, LoRA rank, batch
-  size, and selected recipe constants for smoke runs.
+  size, and selected recipe constants for validation runs.
 - Exposing a stable script interface for GPU validation.
 - Capturing concise run output that can be compared across GPU environments.
 
@@ -64,14 +64,14 @@ The wrapper currently exposes two execution modes:
 
 - `kauldron`: calls the official Kauldron trainer loop.
 - `hybrid`: reuses official model, data, loss, and train-step objects while
-  giving Tunix more control over selected smoke-test mechanics.
+  giving Tunix more control over selected validation mechanics.
 
 The main compatibility signal is the `kauldron` mode, because it exercises the
 official training loop directly.
 
 ## Validation Summary
 
-The wrapper was validated with the official PubMedQA LoRA smoke configuration:
+The wrapper was validated with the official PubMedQA LoRA configuration:
 
 - Recipe: `pubmedqa`
 - Train loop: `kauldron`
@@ -79,10 +79,10 @@ The wrapper was validated with the official PubMedQA LoRA smoke configuration:
 - Dataset batch size: 2
 - Prompt length: official recipe shape
 - Canvas layout: official recipe shape
-- Training length: 2 smoke steps
-- Step metrics: skipped for smoke-run stability
+- Training length: 2 validation steps
+- Step metrics: skipped for validation-run stability
 
-Passing GPU smoke results:
+Passing GPU validation results:
 
 | GPU runtime | Result |
 | --- | --- |
@@ -110,16 +110,16 @@ bash scripts/setup_diffusion_gemma_official_backend.sh
 Build the official recipe config without launching training:
 
 ```bash
-python scripts/smoke_diffusion_gemma_official_backend.py \
+python scripts/run_diffusion_gemma_official_backend.py \
   --recipe pubmedqa \
   --build_config_only \
   --workdir /tmp/diffusion_gemma_official_backend
 ```
 
-Run a short official-backend training smoke:
+Run a short official-backend validation:
 
 ```bash
-python scripts/smoke_diffusion_gemma_official_backend.py \
+python scripts/run_diffusion_gemma_official_backend.py \
   --recipe pubmedqa \
   --train_loop kauldron \
   --num_train_steps 2 \
@@ -139,7 +139,7 @@ The current fork demonstrates that:
 - Tunix can host a stable entrypoint for the official DiffusionGemma SFT recipe.
 - The official Hackable Diffusion and Kauldron backend can be imported,
   configured, and launched from the Tunix repository.
-- The official PubMedQA LoRA smoke path completes on real 2-GPU H100 and RTX
+- The official PubMedQA LoRA path completes on real 2-GPU H100 and RTX
   PRO 6000 runtimes.
 - The integration preserves the official backend as the behavioral authority
   instead of silently replacing it with a partial native rewrite.
@@ -150,16 +150,16 @@ This report does not claim:
 
 - Full native Tunix NNX/Qwix parity with the official implementation.
 - Long training convergence.
-- Full fine-tuning instead of LoRA smoke validation.
+- Full fine-tuning instead of LoRA validation.
 - Serving support.
-- DPO, GRPO, or other post-training methods beyond the official SFT smoke path.
+- DPO, GRPO, or other post-training methods beyond the official SFT path.
 
 ## Why This Wrapper Is Useful
 
 The wrapper gives Tunix a practical bridge to DiffusionGemma today:
 
 - It provides a known-good official reference path inside the Tunix fork.
-- It makes GPU smoke testing repeatable with one script.
+- It makes GPU validation repeatable with one script.
 - It gives future native Tunix work a concrete oracle for behavior and resource
   comparison.
 - It keeps the current integration honest: the official backend is still doing

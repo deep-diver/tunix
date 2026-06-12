@@ -61,18 +61,18 @@ class OfficialSFTConfig:
       `hackable_diffusion` package.
     workdir: Optional Kauldron workdir override.
     checkpoint_path: Optional public or local DiffusionGemma checkpoint path.
-    num_train_steps: Optional train step override for smoke runs.
+    num_train_steps: Optional train step override for controlled runs.
     checkpoint_every_n_steps: Optional checkpointer interval override.
     lora_rank: Optional LoRA rank override. This is applied before the official
       config factory is called so the official LoRA wrapper is constructed with
       the requested rank.
     dataset_batch_size: Optional batch-size override for official dataset
-      builder calls. Intended for smoke tests on smaller GPU slices; the
-      official recipes keep their default batch size when this is unset.
+      builder calls. The official recipes keep their default batch size when
+      this is unset.
     skip_step_metrics: If true, patches the resolved Kauldron writer to skip
-      per-step metric materialization. This is intended only for GPU smoke
-      tests on environments where the official multi-GPU metric all-gather
-      fails after the train step has run.
+      per-step metric materialization. This is intended only for controlled GPU
+      runs on environments where the official multi-GPU metric all-gather fails
+      after the train step has run.
     train_loop: Training loop implementation. `kauldron` delegates to the
       official `Trainer.train()`. `hybrid` uses the official resolved model,
       data, checkpoint loader, sharding, train step, optimizer, and LoRA mask,
@@ -80,7 +80,7 @@ class OfficialSFTConfig:
       materialization and final host sync.
     use_early_stopping: Optional PubMedQA early-stopping eval toggle.
     disable_evals: If true, drops official evals after the config is built.
-      Useful for GPU smoke runs that only need train-step evidence.
+      Useful for GPU runs that only need train-step evidence.
     module_overrides: Additional module-level overrides applied before
       `get_config()` is called. Use sparingly; this is intended for path-like
       constants in the official config modules.

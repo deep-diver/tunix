@@ -34,7 +34,7 @@ The native Tunix path in `tunix.models.diffusion_gemma.sft` is the long-term
 NNX/Qwix integration target. For a lower-risk 2-GPU path, this branch also
 adds `tunix.models.diffusion_gemma.hackable_adapter`, which loads the official
 Gemma Diffusion recipe modules directly and only applies run-environment
-overrides such as checkpoint path, workdir, LoRA rank, and smoke step count.
+overrides such as checkpoint path, workdir, LoRA rank, and training step count.
 
 This backend is intentionally not a rewrite. It preserves the official
 Flax/Linen model, Hackable Diffusion corruption/loss/sampling logic, Kauldron
@@ -50,7 +50,7 @@ Example PubMedQA smoke command on a machine where the official repos are
 available:
 
 ```bash
-python scripts/smoke_diffusion_gemma_official_backend.py \
+python scripts/run_diffusion_gemma_official_backend.py \
   --recipe pubmedqa \
   --gemma_ref /tmp/gemma-diffusion-reference \
   --hackable_diffusion_ref /tmp/hackable-diffusion-reference \

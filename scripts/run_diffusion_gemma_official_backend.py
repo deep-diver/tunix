@@ -18,7 +18,7 @@
 This is a Tunix compatibility entrypoint. It does not reimplement the official
 SFT math in NNX/Qwix; instead it loads the official Gemma/Hackable Diffusion
 recipe and applies only run-environment overrides such as checkpoint path,
-workdir, and smoke-test step count.
+workdir, and training step count.
 """
 
 from __future__ import annotations
@@ -68,8 +68,8 @@ def parse_args() -> argparse.Namespace:
       type=int,
       default=None,
       help=(
-          "Override official dataset builder batch_size kwargs. This is a "
-          "smoke-test escape hatch; unset keeps the official recipe default."
+          "Override official dataset builder batch_size kwargs. Unset keeps "
+          "the official recipe default."
       ),
   )
   parser.add_argument(
@@ -98,7 +98,7 @@ def parse_args() -> argparse.Namespace:
       default=False,
       help=(
           "Skip official Kauldron per-step metric materialization after the "
-          "train step. This is a smoke-test escape hatch for multi-GPU NCCL "
+          "train step. This is intended for environments with multi-GPU NCCL "
           "metric-gather failures."
       ),
   )
