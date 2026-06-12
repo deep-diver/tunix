@@ -146,6 +146,7 @@ python -m pip uninstall -y \
   nvidia-nccl-cu13 || true
 python -m pip install -U "jax[${JAX_CUDA_EXTRA}]" tensorboard
 
+rm -rf /tmp/pubmedqa_repo
 (
   cd "${GEMMA_REF}/gemma/diffusion/hackable_diffusion_adapter/data/pubmedqa"
   bash prepare_pubmedqa_dataset.sh
