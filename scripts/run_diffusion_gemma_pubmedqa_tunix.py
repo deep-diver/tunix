@@ -547,6 +547,27 @@ def _small_leaf_checksums(
   return checksums
 
 
+def _small_leaf_values(
+    state: Any,
+    *,
+    limit: int = 8,
+    max_size: int = 32768,
+) -> dict[tuple[Any, ...], jax.Array]:
+  pure = nnx.to_pure_dict(state)
+  flat = flax.traverse_util.flatten_dict(pure)
+  values = {}
+  for path, value in sorted(flat.items(), key=lambda item: str(item[0])):
+    if not hasattr(value, "shape") or value.size > max_size:
+      continue
+    try:
+      values[path] = value.astype(jnp.float32)
+    except (TypeError, NotImplementedError):
+      continue
+    if len(values) >= limit:
+      break
+  return values
+
+
 def _max_checksum_delta(
     before: dict[tuple[Any, ...], jax.Array],
     after_state: Any,
@@ -558,6 +579,23 @@ def _max_checksum_delta(
     after_value = flat[tuple(path)]
     deltas.append(
         jnp.abs(jnp.sum(after_value.astype(jnp.float32)) - before_value)
+    )
+  if not deltas:
+    return 0.0
+  return float(jax.device_get(jnp.max(jnp.stack(deltas))))
+
+
+def _max_leaf_value_delta(
+    before: dict[tuple[Any, ...], jax.Array],
+    after_state: Any,
+) -> float:
+  pure = nnx.to_pure_dict(after_state)
+  flat = flax.traverse_util.flatten_dict(pure)
+  deltas = []
+  for path, before_value in before.items():
+    after_value = flat[tuple(path)]
+    deltas.append(
+        jnp.max(jnp.abs(after_value.astype(jnp.float32) - before_value))
     )
   if not deltas:
     return 0.0
@@ -622,12 +660,12 @@ def _train_with_separate_loss_jits(
     train_batches: list[dict[str, jax.Array]],
     diffusion_config: diffusion_sft.DiffusionGemmaSFTConfig,
     max_runtime_seconds: float = 0.0,
+    gradient_accumulation_steps: int | None = None,
 ) -> bool:
   """Runs exact split-gradient training with separate JAX executables."""
-  if trainer.config.gradient_accumulation_steps not in (None, 1):
-    raise ValueError(
-        "--separate_loss_jits does not support gradient accumulation."
-    )
+  accumulation_steps = gradient_accumulation_steps or 1
+  if accumulation_steps < 1:
+    raise ValueError("--gradient_accumulation_steps must be >= 1.")
 
   grad_arg = nnx.DiffState(0, nnx.LoRAParam) if trainer._lora_enabled else 0
   decoder_config = dataclasses.replace(
@@ -715,13 +753,13 @@ def _train_with_separate_loss_jits(
   def apply_split_grad_step(
       model: nnx.Module,
       optimizer: nnx.Optimizer,
-      decoder_grads: Any,
-      encoder_grads: Any,
-  ) -> jax.Array:
-    grads = jax.tree.map(jnp.add, decoder_grads, encoder_grads)
+      grads: Any,
+  ) -> tuple[jax.Array, jax.Array, jax.Array]:
     grad_norm = optax.global_norm(grads)
-    optimizer.update(model, grads)
-    return grad_norm
+    trainable_grad_norm = optax.global_norm(nnx.state(grads, nnx.LoRAParam))
+    updates = optimizer.update(model, grads)
+    update_norm = optax.global_norm(updates)
+    return grad_norm, trainable_grad_norm, update_norm
 
   precompute_self_conditioning_prefill_step = nnx.jit(
       precompute_self_conditioning_prefill_step
@@ -733,94 +771,173 @@ def _train_with_separate_loss_jits(
   encoder_grad_step = nnx.jit(encoder_grad_step)
   apply_split_grad_step = nnx.jit(
       apply_split_grad_step,
-      donate_argnames=("optimizer", "decoder_grads", "encoder_grads"),
+      donate_argnames=("optimizer", "grads"),
   )
 
   max_steps = trainer.config.max_steps or len(train_batches)
   start_time = time.monotonic()
   timed_out = False
   for step in range(max_steps):
-    batch = train_batches[step % len(train_batches)]
-    phase_started = time.monotonic()
-    (encoder_loss, encoder_aux), encoder_grads = encoder_grad_step(
-        trainer.model, batch
-    )
-    _block_until_ready_first(encoder_loss)
-    _block_until_ready_state(encoder_grads)
-    if step == 0 or (step + 1) % 50 == 0:
-      _log(
-          "separate_loss_jit_phase",
-          step=step + 1,
-          phase="encoder_grad",
-          elapsed_seconds=time.monotonic() - phase_started,
+    accumulated_grads = None
+    decoder_loss_total = None
+    encoder_loss_total = None
+    total_loss_total = None
+    decoder_aux_total = None
+    encoder_aux_total = None
+    loss_scale = jnp.asarray(1.0 / accumulation_steps, dtype=jnp.float32)
+    should_log_phases = step == 0 or (step + 1) % 50 == 0
+    for micro_step in range(accumulation_steps):
+      batch_idx = (step * accumulation_steps + micro_step) % len(train_batches)
+      batch = train_batches[batch_idx]
+      phase_started = time.monotonic()
+      (encoder_loss, encoder_aux), encoder_grads = encoder_grad_step(
+          trainer.model, batch
       )
-    phase_started = time.monotonic()
-    sc_prefill = precompute_self_conditioning_prefill_step(trainer.model, batch)
-    jax.tree.leaves(sc_prefill)[0].block_until_ready()
-    if step == 0 or (step + 1) % 50 == 0:
-      _log(
-          "separate_loss_jit_phase",
-          step=step + 1,
-          phase="self_conditioning_prefill",
-          elapsed_seconds=time.monotonic() - phase_started,
+      _block_until_ready_first(encoder_loss)
+      _block_until_ready_state(encoder_grads)
+      if should_log_phases:
+        _log(
+            "separate_loss_jit_phase",
+            step=step + 1,
+            micro_step=micro_step + 1,
+            accumulation_steps=accumulation_steps,
+            phase="encoder_grad",
+            elapsed_seconds=time.monotonic() - phase_started,
+        )
+      phase_started = time.monotonic()
+      sc_prefill = precompute_self_conditioning_prefill_step(
+          trainer.model, batch
       )
-    phase_started = time.monotonic()
-    sc_logits, do_self_cond = precompute_self_conditioning_decode_step(
-        trainer.model, sc_prefill
-    )
-    sc_logits.block_until_ready()
-    if step == 0 or (step + 1) % 50 == 0:
-      _log(
-          "separate_loss_jit_phase",
-          step=step + 1,
-          phase="self_conditioning_decode",
-          elapsed_seconds=time.monotonic() - phase_started,
+      jax.tree.leaves(sc_prefill)[0].block_until_ready()
+      if should_log_phases:
+        _log(
+            "separate_loss_jit_phase",
+            step=step + 1,
+            micro_step=micro_step + 1,
+            accumulation_steps=accumulation_steps,
+            phase="self_conditioning_prefill",
+            elapsed_seconds=time.monotonic() - phase_started,
+        )
+      phase_started = time.monotonic()
+      sc_logits, do_self_cond = precompute_self_conditioning_decode_step(
+          trainer.model, sc_prefill
       )
-    phase_started = time.monotonic()
-    (decoder_loss, decoder_aux), decoder_grads = decoder_grad_step(
-        trainer.model, batch, sc_logits, do_self_cond
-    )
-    _block_until_ready_first(decoder_loss)
-    _block_until_ready_state(decoder_grads)
-    del sc_prefill, sc_logits, do_self_cond
-    if step == 0 or (step + 1) % 50 == 0:
-      _log(
-          "separate_loss_jit_phase",
-          step=step + 1,
-          phase="decoder_grad",
-          elapsed_seconds=time.monotonic() - phase_started,
+      sc_logits.block_until_ready()
+      if should_log_phases:
+        _log(
+            "separate_loss_jit_phase",
+            step=step + 1,
+            micro_step=micro_step + 1,
+            accumulation_steps=accumulation_steps,
+            phase="self_conditioning_decode",
+            elapsed_seconds=time.monotonic() - phase_started,
+        )
+      phase_started = time.monotonic()
+      (decoder_loss, decoder_aux), decoder_grads = decoder_grad_step(
+          trainer.model, batch, sc_logits, do_self_cond
       )
+      _block_until_ready_first(decoder_loss)
+      _block_until_ready_state(decoder_grads)
+      del sc_prefill, sc_logits, do_self_cond
+      if should_log_phases:
+        _log(
+            "separate_loss_jit_phase",
+            step=step + 1,
+            micro_step=micro_step + 1,
+            accumulation_steps=accumulation_steps,
+            phase="decoder_grad",
+            elapsed_seconds=time.monotonic() - phase_started,
+        )
+      micro_grads = jax.tree.map(
+          lambda decoder_grad, encoder_grad: (
+              decoder_grad + encoder_grad
+          )
+          * loss_scale.astype((decoder_grad + encoder_grad).dtype),
+          decoder_grads,
+          encoder_grads,
+      )
+      if accumulated_grads is None:
+        accumulated_grads = micro_grads
+      else:
+        accumulated_grads = jax.tree.map(
+            jnp.add, accumulated_grads, micro_grads
+        )
+      decoder_loss_scaled = decoder_loss * loss_scale.astype(decoder_loss.dtype)
+      encoder_loss_scaled = encoder_loss * loss_scale.astype(encoder_loss.dtype)
+      total_loss_scaled = decoder_loss_scaled + encoder_loss_scaled
+      decoder_loss_total = (
+          decoder_loss_scaled
+          if decoder_loss_total is None
+          else decoder_loss_total + decoder_loss_scaled
+      )
+      encoder_loss_total = (
+          encoder_loss_scaled
+          if encoder_loss_total is None
+          else encoder_loss_total + encoder_loss_scaled
+      )
+      total_loss_total = (
+          total_loss_scaled
+          if total_loss_total is None
+          else total_loss_total + total_loss_scaled
+      )
+      decoder_aux_scaled = {
+          name: value * loss_scale.astype(value.dtype)
+          for name, value in decoder_aux.items()
+      }
+      encoder_aux_scaled = {
+          name: value * loss_scale.astype(value.dtype)
+          for name, value in encoder_aux.items()
+      }
+      if decoder_aux_total is None:
+        decoder_aux_total = decoder_aux_scaled
+        encoder_aux_total = encoder_aux_scaled
+      else:
+        decoder_aux_total = jax.tree.map(
+            jnp.add, decoder_aux_total, decoder_aux_scaled
+        )
+        encoder_aux_total = jax.tree.map(
+            jnp.add, encoder_aux_total, encoder_aux_scaled
+        )
+      del encoder_grads, decoder_grads, micro_grads
+
+    if accumulated_grads is None:
+      raise RuntimeError("No gradients were accumulated.")
     phase_started = time.monotonic()
-    grad_norm = apply_split_grad_step(
-        trainer.model, trainer.optimizer, decoder_grads, encoder_grads
+    grad_norm, trainable_grad_norm, update_norm = apply_split_grad_step(
+        trainer.model, trainer.optimizer, accumulated_grads
     )
-    del decoder_grads, encoder_grads
-    loss = decoder_loss + encoder_loss
+    del accumulated_grads
+    loss = total_loss_total
     loss.block_until_ready()
     grad_norm.block_until_ready()
-    if step == 0 or (step + 1) % 50 == 0:
+    trainable_grad_norm.block_until_ready()
+    update_norm.block_until_ready()
+    if should_log_phases:
       _log(
           "separate_loss_jit_phase",
           step=step + 1,
           phase="apply_split_grad",
           elapsed_seconds=time.monotonic() - phase_started,
       )
-    aux = dict(decoder_aux)
-    aux["encoder_loss"] = encoder_aux["encoder_loss"]
+    aux = dict(decoder_aux_total)
+    aux["encoder_loss"] = encoder_aux_total["encoder_loss"]
     trainer.last_train_aux = aux
     trainer.last_train_loss = loss
     trainer._iter_steps += 1
     trainer._train_steps += 1
     total_value = float(jax.device_get(loss))
-    decoder_value = float(jax.device_get(decoder_aux["decoder_loss"]))
-    encoder_value = float(jax.device_get(encoder_aux["encoder_loss"]))
+    decoder_value = float(jax.device_get(decoder_loss_total))
+    encoder_value = float(jax.device_get(encoder_loss_total))
     _log(
         "separate_loss_jit_step",
         step=step + 1,
+        accumulation_steps=accumulation_steps,
         loss=total_value,
         decoder_loss=decoder_value,
         encoder_loss=encoder_value,
         grad_norm=float(jax.device_get(grad_norm)),
+        trainable_grad_norm=float(jax.device_get(trainable_grad_norm)),
+        update_norm=float(jax.device_get(update_norm)),
     )
     for metric, value in (
         ("losses/diffusion_loss", decoder_value),
@@ -1126,7 +1243,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
   lora_before_checksums = _small_leaf_checksums(
       nnx.state(model, nnx.LoRAParam), limit=32, max_size=262144
   )
+  lora_before_values = _small_leaf_values(
+      nnx.state(model, nnx.LoRAParam), limit=32, max_size=262144
+  )
   base_before_checksums = _small_leaf_checksums(_base_param_state(model))
+  base_before_values = _small_leaf_values(_base_param_state(model))
   ckpt_dir = _checkpoint_dir(args, prefix="diffusion_gemma_pubmedqa_ckpt_")
   optimizer = optax.chain(
       optax.clip_by_global_norm(args.max_grad_norm),
@@ -1141,7 +1262,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
   train_config = peft_trainer.TrainingConfig(
       eval_every_n_steps=max(1, args.steps),
       max_steps=args.steps,
-      gradient_accumulation_steps=args.gradient_accumulation_steps,
+      gradient_accumulation_steps=(
+          None if args.separate_loss_jits else args.gradient_accumulation_steps
+      ),
       checkpoint_root_directory=ckpt_dir if args.orbax_checkpoint else None,
       max_inflight_computations=1,
       pbar_description=None,
@@ -1164,6 +1287,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         train_batches,
         diffusion_config,
         max_runtime_seconds=args.max_runtime_seconds,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
   else:
     trainer.train(train_batches, cache_nnx_graph=False)
@@ -1180,8 +1304,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
   lora_checksum_delta = _max_checksum_delta(
       lora_before_checksums, nnx.state(model, nnx.LoRAParam)
   )
+  lora_max_abs_delta = _max_leaf_value_delta(
+      lora_before_values, nnx.state(model, nnx.LoRAParam)
+  )
   base_checksum_delta = _max_checksum_delta(
       base_before_checksums, _base_param_state(model)
+  )
+  base_max_abs_delta = _max_leaf_value_delta(
+      base_before_values, _base_param_state(model)
   )
   result = {
       "steps": trainer.train_steps,
@@ -1197,7 +1327,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       "lora_norm_after": float(jax.device_get(lora_after_norm)),
       "lora_norm_delta": lora_norm_delta,
       "lora_checksum_delta": lora_checksum_delta,
+      "lora_max_abs_delta": lora_max_abs_delta,
       "base_checksum_delta": base_checksum_delta,
+      "base_max_abs_delta": base_max_abs_delta,
       "first_pubmed_id": examples[0].pubmed_id,
       "prompt_len": args.prompt_len,
       "canvas_size": args.canvas_size,
@@ -1223,15 +1355,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       "trainable_state": trainable_summary,
       "frozen_state": frozen_summary,
   }
+  _log(
+      "train_delta_summary",
+      lora_norm_delta=lora_norm_delta,
+      lora_checksum_delta=lora_checksum_delta,
+      lora_max_abs_delta=lora_max_abs_delta,
+      base_checksum_delta=base_checksum_delta,
+      base_max_abs_delta=base_max_abs_delta,
+  )
   if trainer.train_steps < args.steps and not timed_out:
     raise RuntimeError(
         f"Expected {args.steps} train steps, got {trainer.train_steps}"
     )
   if not result["checkpoint_dir_exists"]:
     raise RuntimeError(f"Checkpoint directory was not created: {ckpt_dir}")
-  if lora_norm_delta <= 0 and lora_checksum_delta <= 0:
+  if (
+      lora_norm_delta <= 0
+      and lora_checksum_delta <= 0
+      and lora_max_abs_delta <= 0
+  ):
     raise RuntimeError("LoRA parameters did not change during training.")
-  if base_checksum_delta != 0:
+  if base_checksum_delta != 0 or base_max_abs_delta != 0:
     raise RuntimeError(
         "Sampled non-LoRA parameter checksums changed during LoRA training."
     )
