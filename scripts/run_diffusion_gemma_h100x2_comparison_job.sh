@@ -208,6 +208,8 @@ COMMON_ARGS=(
   --lora_rank "${LORA_RANK}"
   --no-use_early_stopping
   --disable_evals
+  --module_override "PUBMEDQA_TRAIN_PATH=${GEMMA_REF}/gemma/diffusion/hackable_diffusion_adapter/data/pubmedqa/pubmedqa_train.jsonl"
+  --module_override "PUBMEDQA_TEST_PATH=${GEMMA_REF}/gemma/diffusion/hackable_diffusion_adapter/data/pubmedqa/pubmedqa_test.jsonl"
 )
 
 if [[ "${MODE}" == "upstream" ]]; then

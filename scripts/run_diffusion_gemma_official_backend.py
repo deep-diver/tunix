@@ -24,6 +24,7 @@ workdir, and training step count.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import pathlib
 import sys
@@ -33,7 +34,23 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(REPO_ROOT))
 
-from tunix.models.diffusion_gemma import hackable_adapter
+
+def _load_hackable_adapter():
+  module_path = (
+      REPO_ROOT / "tunix" / "models" / "diffusion_gemma" / "hackable_adapter.py"
+  )
+  spec = importlib.util.spec_from_file_location(
+      "_tunix_diffusion_gemma_hackable_adapter", module_path
+  )
+  if spec is None or spec.loader is None:
+    raise ImportError(f"Could not load hackable_adapter from {module_path}")
+  module = importlib.util.module_from_spec(spec)
+  sys.modules[spec.name] = module
+  spec.loader.exec_module(module)
+  return module
+
+
+hackable_adapter = _load_hackable_adapter()
 
 
 def _parse_key_value(items: list[str]) -> dict[str, Any]:
