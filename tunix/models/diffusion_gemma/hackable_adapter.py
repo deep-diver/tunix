@@ -190,7 +190,7 @@ def build_official_sft_config(config: OfficialSFTConfig):
       module, module_overrides
   ), _patched_dataset_batch_size(
       module, config.dataset_batch_size
-  ), _patched_lora_backend(module, config):
+  ):
     cfg = _call_get_config(module, config)
 
   _apply_common_config_overrides(cfg, config)
@@ -211,7 +211,9 @@ def resolve_official_trainer(config: OfficialSFTConfig):
           "The official DiffusionGemma backend requires kauldron. Install the "
           "official gemma and hackable_diffusion checkouts, then retry."
       ) from exc
-    return konfig.resolve(build_official_sft_config(config))
+    trainer = konfig.resolve(build_official_sft_config(config))
+    _replace_resolved_lora_backend(trainer, config)
+    return trainer
 
 
 @dataclasses.dataclass(frozen=True)
@@ -444,66 +446,87 @@ def _validate_lora_backend(config: OfficialSFTConfig) -> None:
     )
 
 
-@contextlib.contextmanager
-def _patched_lora_backend(module: Any, config: OfficialSFTConfig):
-  """Temporarily patches an official recipe to construct Qwix Linen LoRA."""
+def _replace_resolved_lora_backend(
+    trainer: Any,
+    config: OfficialSFTConfig,
+) -> None:
+  """Replaces the resolved official LoRA module with a Qwix Linen bridge."""
   if config.lora_backend == "official":
-    yield
     return
 
-  recipe_lora_module = getattr(module, "lora", None)
-  if recipe_lora_module is None or not hasattr(recipe_lora_module, "LoRA"):
+  model_candidates = _resolved_sft_model_candidates(trainer)
+  if not model_candidates:
     raise OfficialBackendDependencyError(
-        f"Official recipe module {module.__name__!r} does not expose "
-        "a patchable lora.LoRA constructor."
+        "Resolved official DiffusionGemma trainer does not expose "
+        "an SFT model with gemma_network for Qwix LoRA replacement."
     )
+  gemma_network = getattr(model_candidates[0], "gemma_network")
 
-  original_lora = recipe_lora_module.LoRA
-  try:
-    recipe_lora_module.LoRA = _make_qwix_linen_lora_constructor(config)
-    yield
-  finally:
-    recipe_lora_module.LoRA = original_lora
-
-
-def _make_qwix_linen_lora_constructor(config: OfficialSFTConfig):
-  """Builds a constructor compatible with official hd.lora.LoRA call sites."""
-
-  def qwix_linen_lora(
-      *,
-      rank: int,
-      model: Any,
-      dtype: Any = None,
-      verbose: bool = False,
-      target_modules: Any = None,
-  ) -> Any:
-    del dtype, verbose
-    bridge = _load_linen_qwix_lora_module()
-    alpha = config.lora_alpha if config.lora_alpha is not None else float(rank)
-    module_path = _qwix_module_path_from_official_targets(
-        bridge,
-        target_modules,
-        override=config.qwix_lora_module_path,
+  bridge = _load_linen_qwix_lora_module()
+  rank = config.lora_rank or getattr(gemma_network, "rank", None)
+  if rank is None:
+    aux = getattr(getattr(trainer, "cfg", None), "aux", None)
+    rank = getattr(aux, "lora_rank", None)
+  if rank is None:
+    raise OfficialBackendDependencyError(
+        "Could not infer LoRA rank for resolved Qwix Linen backend."
     )
-    if config.lora_backend == "qwix_qlora":
-      return bridge.apply_qlora_to_linen_model(
-          model,
-          rank=rank,
-          alpha=alpha,
-          module_path=module_path,
-          weight_qtype=config.qlora_weight_qtype or "int4",
-          act_qtype=config.qlora_act_qtype,
-          tile_size=config.qlora_tile_size,
-      )
-    return bridge.apply_lora_to_linen_model(
-        model,
-        rank=rank,
-        alpha=alpha,
+  alpha = config.lora_alpha if config.lora_alpha is not None else float(rank)
+  base_network = getattr(gemma_network, "model", gemma_network)
+  target_modules = getattr(gemma_network, "target_modules", "all-linear")
+  module_path = _qwix_module_path_from_official_targets(
+      bridge,
+      target_modules,
+      override=config.qwix_lora_module_path,
+  )
+  if config.lora_backend == "qwix_qlora":
+    replacement = bridge.apply_qlora_to_linen_model(
+        base_network,
+        rank=int(rank),
+        alpha=float(alpha),
+        module_path=module_path,
+        weight_qtype=config.qlora_weight_qtype or "int4",
+        act_qtype=config.qlora_act_qtype,
+        tile_size=config.qlora_tile_size,
+    )
+  else:
+    replacement = bridge.apply_lora_to_linen_model(
+        base_network,
+        rank=int(rank),
+        alpha=float(alpha),
         module_path=module_path,
     )
 
-  qwix_linen_lora.__name__ = f"{config.lora_backend}_LoRA"
-  return qwix_linen_lora
+  for model in model_candidates:
+    object.__setattr__(model, "gemma_network", replacement)
+  print(
+      _json_dumps({
+          "event": "official_backend_qwix_lora_replaced",
+          "lora_backend": config.lora_backend,
+          "model_candidate_count": len(model_candidates),
+          "rank": int(rank),
+          "alpha": float(alpha),
+          "module_path": module_path,
+          "qlora_weight_qtype": config.qlora_weight_qtype,
+      }),
+      flush=True,
+  )
+
+
+def _resolved_sft_model_candidates(trainer: Any) -> list[Any]:
+  candidates = []
+  seen = set()
+  for owner in (trainer, getattr(trainer, "trainstep", None)):
+    if owner is None:
+      continue
+    model = getattr(owner, "model", None)
+    if model is None or not hasattr(model, "gemma_network"):
+      continue
+    marker = id(model)
+    if marker not in seen:
+      seen.add(marker)
+      candidates.append(model)
+  return candidates
 
 
 def _qwix_module_path_from_official_targets(
