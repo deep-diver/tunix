@@ -36,6 +36,10 @@ The Tunix wrapper is responsible for importing that backend inside this fork,
 applying run-environment overrides, launching comparable official-vs-wrapper
 runs, and collecting concise logs plus GPU memory telemetry.
 
+The wrapper can preserve the official LoRA layer or replace just that layer with
+Tunix/Qwix LoRA via `lora_backend="qwix_lora"`. Qwix QLoRA is not exposed for
+DiffusionGemma; `lora_backend="qwix_qlora"` is rejected.
+
 In `train_loop=hybrid` mode the wrapper still uses the official model, dataset,
 optimizer, loss, train step, checkpoint restore, and sharding. Tunix only drives
 the outer step loop and reads addressable loss shards so that GPU validation can
@@ -59,6 +63,7 @@ trainer = OfficialDiffusionGemmaTrainer(
         workdir="/home/ubuntu/diffusion_gemma_pubmedqa_wrapper",
         num_train_steps=2000,
         lora_rank=4,
+        lora_backend="qwix_lora",
         train_loop="hybrid",
         sync_after_step="losses",
         log_losses=True,
@@ -69,7 +74,7 @@ trainer = OfficialDiffusionGemmaTrainer(
 trainer.train()
 ```
 
-Equivalent CLI usage for the validated H100 x2 recipe:
+Equivalent CLI usage for the validated H100 x2 official-LoRA recipe:
 
 ```bash
 SAVE_FINAL_CHECKPOINT=true \
@@ -81,11 +86,42 @@ bash scripts/run_diffusion_gemma_h100x2_comparison_job.sh \
   --mode tunix \
   --max_runtime_seconds 10800 \
   --num_train_steps 2000 \
+  --lora_backend official \
   --log_losses true \
   --sync_after_step losses \
   --jax_package_spec "jax[cuda13]==0.10.1" \
   --run_name tunix_wrapper_2000step
 ```
+
+Qwix LoRA-only validation uses the same official backend and swaps only the
+LoRA layer:
+
+```bash
+LORA_RANK=4 LOG_PARAM_SUMMARY=true \
+bash scripts/run_diffusion_gemma_h100x2_comparison_job.sh \
+  --mode tunix \
+  --run_name qwix_lora_only_10step \
+  --lora_backend qwix_lora \
+  --run_steps 10 \
+  --num_train_steps 2000 \
+  --max_runtime_seconds 7200 \
+  --sync_after_step losses \
+  --log_losses true \
+  --encoder_loss_token_chunk_size 128 \
+  --gpu_poll_seconds 10
+```
+
+The latest Qwix LoRA-only H100x2 validation succeeded:
+
+- Run: `r_05256f15` on machine `426095` (`H100`, `IN2`, 2 GPUs, VM), exit `0`.
+- Steps: `10/10` with finite loss values.
+- Total loss: step 1 `13.511953353881836`, step 10
+  `14.651562213897705`, min/max `12.34370231628418` /
+  `14.945141792297363`.
+- Qwix LoRA inventory after restore: `1092` LoRA leaves,
+  `0.02474355697631836GiB`; dense frozen base leaves: `608`,
+  `47.033628053963184GiB`.
+- Peak HBM: GPU0 `65665MiB`, GPU1 `65635MiB`.
 
 ## Local Parity Evidence
 

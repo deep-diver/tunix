@@ -131,6 +131,14 @@ def _official_reference_masked_ce(logits, targets, mask):
   return jnp.mean(per_example_loss / per_example_denom)
 
 
+def _official_reference_masked_ce_from_token_loss(loss, mask):
+  mask = mask.astype(loss.dtype)
+  reduce_axes = tuple(range(1, loss.ndim))
+  per_example_loss = jnp.sum(loss * mask, axis=reduce_axes)
+  per_example_denom = jnp.maximum(jnp.sum(mask, axis=reduce_axes), 1.0)
+  return jnp.mean(per_example_loss / per_example_denom)
+
+
 class _ToyLinenAttention(linen_nn.Module):
 
   @linen_nn.compact
@@ -149,6 +157,54 @@ class _ToyLinenMLP(linen_nn.Module):
     down = linen_nn.Dense(4, use_bias=False, name="linear")(x)
     router = linen_nn.Dense(4, use_bias=False, name="router_logits")(x)
     return gate + down + router
+
+
+class _ToyLinenDirectParamMLP(linen_nn.Module):
+
+  @linen_nn.compact
+  def __call__(self, x):
+    gate = self.param(
+        "gating_einsum",
+        linen_nn.initializers.ones,
+        (x.shape[-1], 4),
+    )
+    down = self.param(
+        "linear",
+        linen_nn.initializers.ones,
+        (x.shape[-1], 4),
+    )
+    return jnp.einsum("...d,df->...f", x, gate) + jnp.einsum(
+        "...d,df->...f", x, down
+    )
+
+
+class _Weight(linen_nn.Module):
+  shape: tuple[int, ...]
+  weight_name: str = "w"
+
+  @linen_nn.compact
+  def __call__(self):
+    return self.param(self.weight_name, linen_nn.initializers.ones, self.shape)
+
+
+class _ToyLinenRaggedMLP(linen_nn.Module):
+
+  @linen_nn.compact
+  def __call__(self, x):
+    gate = _Weight(
+        shape=(2, 2, 3, x.shape[-1]),
+        name="gating_einsum",
+    )()
+    down = _Weight(
+        shape=(2, 3, x.shape[-1]),
+        name="linear",
+    )()
+    group_sizes = jnp.array([x.shape[0], 0], dtype=jnp.int32)
+    gate = jnp.transpose(gate, (0, 3, 1, 2)).reshape(2, x.shape[-1], 6)
+    gate_out = jax.lax.ragged_dot(x, gate, group_sizes=group_sizes)
+    gate_out = gate_out.reshape(x.shape[0], 2, 3)
+    activation = jax.nn.gelu(gate_out[:, 0, :]) * gate_out[:, 1, :]
+    return jax.lax.ragged_dot(activation, down, group_sizes=group_sizes)
 
 
 class _ToyLinenSelfConditioner(linen_nn.Module):
@@ -198,6 +254,42 @@ class _ToyLinenDiffusionGemmaMethods(linen_nn.Module):
     return attn(x)
 
 
+class _ToyLinenDirectParamMethods(linen_nn.Module):
+
+  @linen_nn.compact
+  def __call__(self, x):
+    mlp = _ToyLinenDirectParamMLP(name="mlp")
+    return mlp(x)
+
+  @linen_nn.compact
+  def encoder_call(self, x):
+    mlp = _ToyLinenDirectParamMLP(name="mlp")
+    return mlp(x)
+
+  @linen_nn.compact
+  def init_cache(self, x):
+    mlp = _ToyLinenDirectParamMLP(name="mlp")
+    return mlp(x)
+
+
+class _ToyLinenRaggedMethods(linen_nn.Module):
+
+  @linen_nn.compact
+  def __call__(self, x):
+    mlp = _ToyLinenRaggedMLP(name="mlp")
+    return mlp(x)
+
+  @linen_nn.compact
+  def encoder_call(self, x):
+    mlp = _ToyLinenRaggedMLP(name="mlp")
+    return mlp(x)
+
+  @linen_nn.compact
+  def init_cache(self, x):
+    mlp = _ToyLinenRaggedMLP(name="mlp")
+    return mlp(x)
+
+
 def _set_lora_b_leaves_to_constant(variables, value: float):
   mutable = unfreeze(variables)
   flat_params = flax.traverse_util.flatten_dict(mutable["params"])
@@ -223,7 +315,9 @@ class DiffusionGemmaTest(absltest.TestCase):
                 }
             }
         },
-        "self_conditioner": {"ffw": {"down_proj": {"kernel": jnp.zeros((3, 2))}}},
+        "self_conditioner": {
+            "ffw": {"down_proj": {"kernel": jnp.zeros((3, 2))}}
+        },
     }
 
     info = low_peak_params.build_restore_target(
@@ -232,14 +326,9 @@ class DiffusionGemmaTest(absltest.TestCase):
         dtype=jnp.bfloat16,
     )
     flat_target = jax.tree_util.tree_flatten_with_path(info.target)[0]
-    target_paths = {
-        tuple(part.key for part in path)
-        for path, _ in flat_target
-    }
+    target_paths = {tuple(part.key for part in path) for path, _ in flat_target}
 
-    self.assertIn(
-        ("layers", 0, "attn", "q_einsum", "kernel"), target_paths
-    )
+    self.assertIn(("layers", 0, "attn", "q_einsum", "kernel"), target_paths)
     self.assertIn(
         ("self_conditioner", "ffw", "down_proj", "kernel"), target_paths
     )
@@ -356,6 +445,35 @@ class DiffusionGemmaTest(absltest.TestCase):
     self.assertIn("available", report)
     self.assertIn("missing", report)
     self.assertIn("versions", report)
+
+  def test_official_chunked_encoder_ce_matches_optax(self):
+    key = jax.random.PRNGKey(0)
+    logits = jax.random.normal(key, (2, 7, 19), dtype=jnp.float32)
+    targets = jax.random.randint(
+        jax.random.PRNGKey(1), (2, 7), 0, 19, dtype=jnp.int32
+    )
+    mask = jnp.array(
+        [[1, 1, 1, 0, 1, 0, 0], [1, 1, 0, 1, 1, 1, 0]],
+        dtype=jnp.float32,
+    )
+
+    full_token_loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits, targets
+    )
+    chunked_token_loss = (
+        hackable_adapter.chunked_softmax_cross_entropy_with_integer_labels(
+            logits, targets, token_chunk_size=3
+        )
+    )
+    np.testing.assert_allclose(
+        chunked_token_loss, full_token_loss, rtol=1e-6, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        _official_reference_masked_ce_from_token_loss(chunked_token_loss, mask),
+        _official_reference_masked_ce(logits, targets, mask),
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
   def test_official_backend_builds_fake_recipe_with_overrides(self):
     module_name = hackable_adapter.recipe_module_name("pubmedqa")
@@ -715,31 +833,17 @@ class DiffusionGemmaTest(absltest.TestCase):
 
     self.assertTrue(bool(jnp.any(before != after)))
 
-  def test_linen_qwix_qlora_bridge_quantizes_base_and_affects_outputs(self):
-    model = linen_qwix_lora.apply_qlora_to_linen_model(
-        _ToyLinenDiffusionGemmaMethods(),
-        rank=2,
-        alpha=4.0,
-        weight_qtype="int4",
+  def test_qwix_lora_select_patterns_include_official_and_qwix_names(self):
+    self.assertEqual(
+        hackable_adapter._qwix_lora_select_patterns("lora"),  # pylint: disable=protected-access
+        ("lora", r".*_lora_a", r".*_lora_b"),
     )
-    x = jnp.ones((1, 4), dtype=jnp.float32)
-    variables = model.init(jax.random.PRNGKey(0), x)
-    inventory = linen_qwix_lora.inventory_from_linen_params(
-        variables["params"]
+    self.assertEqual(
+        hackable_adapter._qwix_lora_select_patterns(  # pylint: disable=protected-access
+            ("lora", "head")
+        ),
+        ("lora", r".*_lora_a", r".*_lora_b", "head"),
     )
-
-    self.assertTrue(linen_qwix_lora.has_quantized_base_leaves(
-        variables["params"]
-    ))
-    self.assertTrue(lora_inventory.LoRATargetComparison(
-        inventory
-    ).matches_official)
-
-    changed_variables = _set_lora_b_leaves_to_constant(variables, 0.01)
-    before = model.apply(variables, x)
-    after = model.apply(changed_variables, x)
-
-    self.assertTrue(bool(jnp.any(before != after)))
 
   def test_qwix_lora_paths_are_checkpoint_lora_paths(self):
     self.assertTrue(
@@ -763,59 +867,13 @@ class DiffusionGemmaTest(absltest.TestCase):
         )
     )
 
-  def test_qwix_qlora_checkpoint_values_stay_quantized(self):
-    model = linen_qwix_lora.apply_qlora_to_linen_model(
-        _ToyLinenDiffusionGemmaMethods(),
-        rank=2,
-        alpha=4.0,
-        weight_qtype="int4",
-    )
-    x = jnp.ones((1, 4), dtype=jnp.float32)
-    variables = model.init(jax.random.PRNGKey(0), x)
-    flat = flax.traverse_util.flatten_dict(variables["params"], sep="/")
-    base_path, model_value = next(
-        (path, value)
-        for path, value in flat.items()
-        if hackable_adapter._is_qwix_quantized_value(value)  # pylint: disable=protected-access
-    )
-    checkpoint_value = jnp.ones(model_value.shape, dtype=jnp.float32)
+  def test_qwix_lora_backend_rejects_qlora(self):
+    config = hackable_adapter.OfficialSFTConfig(lora_backend="qwix_qlora")
 
-    restored_value = hackable_adapter._checkpoint_value_for_model_value(  # pylint: disable=protected-access
-        model_value,
-        checkpoint_value,
-    )
-    model_param_spec = jax.tree.map(
-        lambda leaf: jax.ShapeDtypeStruct(
-            dtype=leaf.dtype,
-            shape=leaf.shape,
-            sharding=leaf.sharding,
-        ),
-        variables["params"],
-    )
-    spec_value = flax.traverse_util.flatten_dict(
-        model_param_spec,
-        sep="/",
-    )[base_path]
-    restored_device_value = jax.tree.map(
-        lambda value, spec: jax.device_put(
-            value.astype(spec.dtype),
-            device=spec.sharding,
-        ),
-        restored_value,
-        spec_value,
-    )
+    with self.assertRaisesRegex(ValueError, "lora_backend"):
+      hackable_adapter._validate_lora_backend(config)  # pylint: disable=protected-access
 
-    self.assertEqual(base_path, "layer_0/attn/q_einsum/kernel")
-    self.assertTrue(
-        hackable_adapter._is_qwix_quantized_value(restored_value)  # pylint: disable=protected-access
-    )
-    self.assertTrue(
-        hackable_adapter._is_qwix_quantized_value(restored_device_value)  # pylint: disable=protected-access
-    )
-    self.assertEqual(restored_value.shape, model_value.shape)
-    self.assertTrue(hasattr(restored_value.array, "qvalue"))
-
-  def test_qwix_apply_updates_keeps_quantized_base_frozen(self):
+  def test_qwix_apply_updates_keeps_base_frozen(self):
     original_apply_updates = optax.apply_updates
     original_patch_flag = hackable_adapter._QWIX_OPTAX_PATCHED  # pylint: disable=protected-access
     original_optax_marker = getattr(
@@ -873,9 +931,7 @@ class DiffusionGemmaTest(absltest.TestCase):
           np.asarray(int_param),
       )
       np.testing.assert_allclose(
-          np.asarray(
-              updated["layer_0"]["attn"]["q_einsum"]["kernel_lora_a"]
-          ),
+          np.asarray(updated["layer_0"]["attn"]["q_einsum"]["kernel_lora_a"]),
           np.asarray([2.0, 2.0], dtype=np.float32),
       )
     finally:

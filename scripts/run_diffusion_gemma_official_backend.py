@@ -91,19 +91,17 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--lora_rank", type=int, default=None)
   parser.add_argument(
       "--lora_backend",
-      choices=["official", "qwix_lora", "qwix_qlora"],
+      choices=["official", "qwix_lora"],
       default="official",
       help=(
-          "LoRA implementation inside the official recipe. 'official' keeps "
-          "DeepMind Hackable Diffusion LoRA; Qwix modes patch only the Linen "
-          "LoRA constructor while retaining the official model/loss/trainstep."
+          "LoRA implementation inside the official recipe. 'official' keeps"
+          " DeepMind Hackable Diffusion LoRA; 'qwix_lora' patches only the"
+          " Linen LoRA constructor while retaining the official"
+          " model/loss/trainstep."
       ),
   )
   parser.add_argument("--lora_alpha", type=float, default=None)
   parser.add_argument("--qwix_lora_module_path", default=None)
-  parser.add_argument("--qlora_weight_qtype", default="int4")
-  parser.add_argument("--qlora_act_qtype", default=None)
-  parser.add_argument("--qlora_tile_size", type=float, default=None)
   parser.add_argument(
       "--dataset_batch_size",
       type=int,
@@ -183,6 +181,26 @@ def parse_args() -> argparse.Namespace:
       ),
   )
   parser.add_argument(
+      "--log_param_summary",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "In the hybrid loop, write metadata-only parameter summaries that "
+          "separate LoRA leaves from dense non-LoRA leaves."
+      ),
+  )
+  parser.add_argument(
+      "--encoder_loss_token_chunk_size",
+      type=int,
+      default=None,
+      help=(
+          "Replace the official encoder AR loss with an exact chunked CE "
+          "implementation using this many sequence tokens per chunk. This "
+          "preserves the official loss value while reducing full-vocab CE "
+          "intermediates."
+      ),
+  )
+  parser.add_argument(
       "--config_override",
       action="append",
       default=[],
@@ -218,15 +236,14 @@ def main() -> None:
       lora_backend=args.lora_backend,
       lora_alpha=args.lora_alpha,
       qwix_lora_module_path=args.qwix_lora_module_path,
-      qlora_weight_qtype=args.qlora_weight_qtype,
-      qlora_act_qtype=args.qlora_act_qtype,
-      qlora_tile_size=args.qlora_tile_size,
       dataset_batch_size=args.dataset_batch_size,
       skip_step_metrics=args.skip_step_metrics,
       log_losses=args.log_losses,
       sync_after_step=args.sync_after_step,
       save_final_checkpoint=args.save_final_checkpoint,
       train_loop=args.train_loop,
+      log_param_summary=args.log_param_summary,
+      encoder_loss_token_chunk_size=args.encoder_loss_token_chunk_size,
       use_early_stopping=args.use_early_stopping,
       disable_evals=args.disable_evals,
       module_overrides=_parse_key_value(args.module_override),
@@ -272,8 +289,10 @@ def main() -> None:
                 "lora_alpha": getattr(
                     getattr(cfg, "aux", None), "lora_alpha", None
                 ),
-                "qlora_weight_qtype": getattr(
-                    getattr(cfg, "aux", None), "qlora_weight_qtype", None
+                "encoder_loss_token_chunk_size": getattr(
+                    getattr(cfg, "aux", None),
+                    "encoder_loss_token_chunk_size",
+                    None,
                 ),
                 "dataset_batch_size": args.dataset_batch_size,
                 "prompt_len": getattr(
@@ -302,11 +321,12 @@ def main() -> None:
           "run_steps": args.run_steps,
           "lora_backend": args.lora_backend,
           "lora_alpha": args.lora_alpha,
-          "qlora_weight_qtype": args.qlora_weight_qtype,
           "skip_step_metrics": args.skip_step_metrics,
           "log_losses": args.log_losses,
           "sync_after_step": args.sync_after_step,
           "train_loop": args.train_loop,
+          "log_param_summary": args.log_param_summary,
+          "encoder_loss_token_chunk_size": args.encoder_loss_token_chunk_size,
       }),
       flush=True,
   )

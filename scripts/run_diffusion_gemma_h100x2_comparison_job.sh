@@ -26,9 +26,9 @@ CLI_RUN_NAME=""
 CLI_LORA_BACKEND=""
 CLI_LORA_ALPHA=""
 CLI_QWIX_LORA_MODULE_PATH=""
-CLI_QLORA_WEIGHT_QTYPE=""
-CLI_QLORA_ACT_QTYPE=""
-CLI_QLORA_TILE_SIZE=""
+CLI_LOG_PARAM_SUMMARY=""
+CLI_ENCODER_LOSS_TOKEN_CHUNK_SIZE=""
+CLI_GPU_POLL_SECONDS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode)
@@ -75,16 +75,16 @@ while [[ $# -gt 0 ]]; do
       CLI_QWIX_LORA_MODULE_PATH="$2"
       shift 2
       ;;
-    --qlora_weight_qtype)
-      CLI_QLORA_WEIGHT_QTYPE="$2"
+    --log_param_summary)
+      CLI_LOG_PARAM_SUMMARY="$2"
       shift 2
       ;;
-    --qlora_act_qtype)
-      CLI_QLORA_ACT_QTYPE="$2"
+    --encoder_loss_token_chunk_size)
+      CLI_ENCODER_LOSS_TOKEN_CHUNK_SIZE="$2"
       shift 2
       ;;
-    --qlora_tile_size)
-      CLI_QLORA_TILE_SIZE="$2"
+    --gpu_poll_seconds)
+      CLI_GPU_POLL_SECONDS="$2"
       shift 2
       ;;
     *)
@@ -121,10 +121,7 @@ LORA_RANK="${LORA_RANK:-4}"
 LORA_BACKEND="${CLI_LORA_BACKEND:-${LORA_BACKEND:-official}}"
 LORA_ALPHA="${CLI_LORA_ALPHA:-${LORA_ALPHA:-}}"
 QWIX_LORA_MODULE_PATH="${CLI_QWIX_LORA_MODULE_PATH:-${QWIX_LORA_MODULE_PATH:-}}"
-QLORA_WEIGHT_QTYPE="${CLI_QLORA_WEIGHT_QTYPE:-${QLORA_WEIGHT_QTYPE:-int4}}"
-QLORA_ACT_QTYPE="${CLI_QLORA_ACT_QTYPE:-${QLORA_ACT_QTYPE:-}}"
-QLORA_TILE_SIZE="${CLI_QLORA_TILE_SIZE:-${QLORA_TILE_SIZE:-}}"
-GPU_POLL_SECONDS="${GPU_POLL_SECONDS:-60}"
+GPU_POLL_SECONDS="${CLI_GPU_POLL_SECONDS:-${GPU_POLL_SECONDS:-60}}"
 JAX_CUDA_EXTRA="${JAX_CUDA_EXTRA:-cuda13}"
 JAX_PACKAGE_SPEC="${CLI_JAX_PACKAGE_SPEC:-${JAX_PACKAGE_SPEC:-jax[${JAX_CUDA_EXTRA}]}}"
 XLA_FLAGS="${XLA_FLAGS:---xla_disable_hlo_passes=constant_folding}"
@@ -132,6 +129,8 @@ TRAIN_LOOP="${TRAIN_LOOP:-hybrid}"
 LOG_LOSSES="${CLI_LOG_LOSSES:-${LOG_LOSSES:-true}}"
 SYNC_AFTER_STEP="${CLI_SYNC_AFTER_STEP:-${SYNC_AFTER_STEP:-state}}"
 SAVE_FINAL_CHECKPOINT="${SAVE_FINAL_CHECKPOINT:-false}"
+LOG_PARAM_SUMMARY="${CLI_LOG_PARAM_SUMMARY:-${LOG_PARAM_SUMMARY:-false}}"
+ENCODER_LOSS_TOKEN_CHUNK_SIZE="${CLI_ENCODER_LOSS_TOKEN_CHUNK_SIZE:-${ENCODER_LOSS_TOKEN_CHUNK_SIZE:-}}"
 
 python_version_ok() {
   "$1" - <<'PY' >/dev/null 2>&1
@@ -200,10 +199,12 @@ json_event comparison_job_start \
   lora_rank="${LORA_RANK}" \
   lora_backend="${LORA_BACKEND}" \
   lora_alpha="${LORA_ALPHA:-}" \
-  qlora_weight_qtype="${QLORA_WEIGHT_QTYPE}" \
   train_loop="${TRAIN_LOOP}" \
   log_losses="${LOG_LOSSES}" \
   sync_after_step="${SYNC_AFTER_STEP}" \
+  log_param_summary="${LOG_PARAM_SUMMARY}" \
+  encoder_loss_token_chunk_size="${ENCODER_LOSS_TOKEN_CHUNK_SIZE:-}" \
+  gpu_poll_seconds="${GPU_POLL_SECONDS}" \
   jax_package_spec="${JAX_PACKAGE_SPEC}" \
   xla_flags="${XLA_FLAGS}"
 
@@ -337,15 +338,6 @@ fi
 if [[ -n "${QWIX_LORA_MODULE_PATH}" ]]; then
   COMMON_ARGS+=(--qwix_lora_module_path "${QWIX_LORA_MODULE_PATH}")
 fi
-if [[ -n "${QLORA_WEIGHT_QTYPE}" ]]; then
-  COMMON_ARGS+=(--qlora_weight_qtype "${QLORA_WEIGHT_QTYPE}")
-fi
-if [[ -n "${QLORA_ACT_QTYPE}" ]]; then
-  COMMON_ARGS+=(--qlora_act_qtype "${QLORA_ACT_QTYPE}")
-fi
-if [[ -n "${QLORA_TILE_SIZE}" ]]; then
-  COMMON_ARGS+=(--qlora_tile_size "${QLORA_TILE_SIZE}")
-fi
 
 if [[ -n "${RUN_STEPS}" ]]; then
   COMMON_ARGS+=(--run_steps "${RUN_STEPS}")
@@ -358,6 +350,14 @@ else
 fi
 
 COMMON_ARGS+=(--sync_after_step "${SYNC_AFTER_STEP}")
+
+if [[ "${MODE}" == "tunix" ]] && [[ "${LOG_PARAM_SUMMARY}" == "true" || "${LOG_PARAM_SUMMARY}" == "1" ]]; then
+  COMMON_ARGS+=(--log_param_summary)
+fi
+
+if [[ "${MODE}" == "tunix" ]] && [[ -n "${ENCODER_LOSS_TOKEN_CHUNK_SIZE}" ]]; then
+  COMMON_ARGS+=(--encoder_loss_token_chunk_size "${ENCODER_LOSS_TOKEN_CHUNK_SIZE}")
+fi
 
 if [[ "${MODE}" == "tunix" ]] && [[ "${SAVE_FINAL_CHECKPOINT}" == "true" || "${SAVE_FINAL_CHECKPOINT}" == "1" ]]; then
   COMMON_ARGS+=(--save_final_checkpoint)
@@ -416,9 +416,9 @@ payload = {
     "train_loop": "${TRAIN_LOOP}",
     "lora_backend": "${LORA_BACKEND}",
     "lora_alpha": "${LORA_ALPHA}",
-    "qlora_weight_qtype": "${QLORA_WEIGHT_QTYPE}",
     "log_losses": "${LOG_LOSSES}",
     "sync_after_step": "${SYNC_AFTER_STEP}",
+    "log_param_summary": "${LOG_PARAM_SUMMARY}",
     "jax_package_spec": "${JAX_PACKAGE_SPEC}",
     "xla_flags": "${XLA_FLAGS}",
 }

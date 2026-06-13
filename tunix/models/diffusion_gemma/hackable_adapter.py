@@ -45,6 +45,7 @@ _RECIPE_MODULES = {
 
 _LOGGED_DEVICE_LOSS_KEYS: set[tuple[str, int]] = set()
 _QWIX_CHECKPOINTER_PATCHED = False
+_QWIX_KAULDRON_SELECT_PATCHED = False
 _QWIX_OPTAX_PATCHED = False
 
 
@@ -74,17 +75,13 @@ class OfficialSFTConfig:
       config factory is called so the official LoRA wrapper is constructed with
       the requested rank.
     lora_backend: LoRA implementation used by the official recipe. `official`
-      preserves the DeepMind Hackable Diffusion wrapper. `qwix_lora` and
-      `qwix_qlora` patch only the recipe's LoRA constructor so the Linen model
-      is wrapped by Tunix/Qwix while the rest of the official backend remains
-      intact.
+      preserves the DeepMind Hackable Diffusion wrapper. `qwix_lora` patches
+      only the recipe's LoRA constructor so the Linen model is wrapped by
+      Tunix/Qwix while the rest of the official backend remains intact.
     lora_alpha: Optional Qwix LoRA alpha. When unset, Qwix Linen LoRA uses
       `rank` so the adapter scale is 1.0, matching the official unscaled LoRA
       adapter more closely than the common `alpha=2*rank` recipe.
     qwix_lora_module_path: Optional Qwix `module_path` regex override.
-    qlora_weight_qtype: Qwix QLoRA weight quantization type.
-    qlora_act_qtype: Optional Qwix activation quantization type.
-    qlora_tile_size: Optional Qwix QLoRA tile size.
     dataset_batch_size: Optional batch-size override for official dataset
       builder calls. The official recipes keep their default batch size when
       this is unset.
@@ -110,6 +107,13 @@ class OfficialSFTConfig:
     use_early_stopping: Optional PubMedQA early-stopping eval toggle.
     disable_evals: If true, drops official evals after the config is built.
       Useful for GPU runs that only need train-step evidence.
+    log_param_summary: If true, the hybrid loop writes metadata-only parameter
+      summaries that separate LoRA leaves from dense non-LoRA leaves without
+      materializing parameter values on host.
+    encoder_loss_token_chunk_size: Optional token chunk size for a
+      memory-safer exact encoder AR cross-entropy loss. When unset, the
+      official EncoderARLoss is preserved. This is useful for LoRA runs where
+      full-sequence full-vocab softmax intermediates dominate peak memory.
     module_overrides: Additional module-level overrides applied before
       `get_config()` is called. Use sparingly; this is intended for path-like
       constants in the official config modules.
@@ -129,9 +133,6 @@ class OfficialSFTConfig:
   lora_backend: str = "official"
   lora_alpha: float | None = None
   qwix_lora_module_path: str | None = None
-  qlora_weight_qtype: str | None = "int4"
-  qlora_act_qtype: str | None = None
-  qlora_tile_size: int | float | None = None
   dataset_batch_size: int | None = None
   skip_step_metrics: bool = False
   log_losses: bool = True
@@ -140,6 +141,8 @@ class OfficialSFTConfig:
   train_loop: str = "kauldron"
   use_early_stopping: bool | None = None
   disable_evals: bool = False
+  log_param_summary: bool = False
+  encoder_loss_token_chunk_size: int | None = None
   module_overrides: Mapping[str, Any] = dataclasses.field(default_factory=dict)
   config_overrides: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
@@ -177,11 +180,81 @@ def check_dependencies(
   }
 
 
+def chunked_softmax_cross_entropy_with_integer_labels(
+    logits: Any,
+    labels: Any,
+    *,
+    token_chunk_size: int | None,
+):
+  """Computes exact token CE while chunking the sequence dimension."""
+  import jax  # pylint: disable=g-import-not-at-top
+  import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+
+  logits = jnp.asarray(logits, dtype=jnp.float32)
+  labels = jnp.asarray(labels)
+  if logits.ndim < 2:
+    raise ValueError(
+        f"logits must have at least 2 dimensions, got {logits.ndim}."
+    )
+  if labels.shape != logits.shape[:-1]:
+    raise ValueError(
+        "labels shape must match logits without the vocab dimension: "
+        f"{labels.shape} vs {logits.shape[:-1]}."
+    )
+
+  seq_len = logits.shape[1] if logits.ndim >= 3 else 1
+  if (
+      token_chunk_size is None
+      or token_chunk_size <= 0
+      or token_chunk_size >= seq_len
+  ):
+    target_logits = jnp.take_along_axis(
+        logits, labels[..., None], axis=-1
+    ).squeeze(axis=-1)
+    return jax.nn.logsumexp(logits, axis=-1) - target_logits
+
+  if logits.ndim != 3:
+    raise ValueError(
+        "token_chunk_size currently expects rank-3 logits [batch, seq, vocab], "
+        f"got shape {logits.shape}."
+    )
+
+  pad_len = (-seq_len) % token_chunk_size
+  if pad_len:
+    logits = jnp.pad(logits, ((0, 0), (0, pad_len), (0, 0)))
+    labels = jnp.pad(labels, ((0, 0), (0, pad_len)), constant_values=0)
+
+  batch_size, padded_seq_len, vocab_size = logits.shape
+  num_chunks = padded_seq_len // token_chunk_size
+  logits_chunks = logits.reshape(
+      batch_size, num_chunks, token_chunk_size, vocab_size
+  )
+  label_chunks = labels.reshape(batch_size, num_chunks, token_chunk_size)
+
+  def scan_body(_, chunk_inputs):
+    logits_chunk, labels_chunk = chunk_inputs
+    target_logits = jnp.take_along_axis(
+        logits_chunk, labels_chunk[..., None], axis=-1
+    ).squeeze(axis=-1)
+    ce = jax.nn.logsumexp(logits_chunk, axis=-1) - target_logits
+    return None, ce
+
+  _, ce_chunks = jax.lax.scan(
+      scan_body,
+      None,
+      (jnp.swapaxes(logits_chunks, 0, 1), jnp.swapaxes(label_chunks, 0, 1)),
+  )
+  ce = jnp.swapaxes(ce_chunks, 0, 1).reshape(batch_size, padded_seq_len)
+  return ce[:, :seq_len]
+
+
 def build_official_sft_config(config: OfficialSFTConfig):
   """Builds an official Kauldron config with Tunix-side overrides applied."""
   _validate_lora_backend(config)
   initialize_jax_before_tensorflow(_extra_paths(config))
   module = _import_recipe_module(config)
+  if config.lora_backend != "official":
+    _patch_kauldron_lora_select_for_qwix()
   module_overrides = dict(config.module_overrides)
   if config.checkpoint_path is not None:
     module_overrides["CHECKPOINT_PATH"] = str(config.checkpoint_path)
@@ -190,9 +263,7 @@ def build_official_sft_config(config: OfficialSFTConfig):
 
   with _patched_module_attrs(
       module, module_overrides
-  ), _patched_dataset_batch_size(
-      module, config.dataset_batch_size
-  ):
+  ), _patched_dataset_batch_size(module, config.dataset_batch_size):
     cfg = _call_get_config(module, config)
 
   _apply_common_config_overrides(cfg, config)
@@ -215,6 +286,7 @@ def resolve_official_trainer(config: OfficialSFTConfig):
       ) from exc
     trainer = konfig.resolve(build_official_sft_config(config))
     _replace_resolved_lora_backend(trainer, config)
+    _replace_resolved_encoder_ar_loss_with_memory_safe(trainer, config)
     return trainer
 
 
@@ -241,6 +313,7 @@ class OfficialDiffusionGemmaTrainer:
           log_losses=self.config.log_losses,
           sync_after_step=self.config.sync_after_step,
           save_final_checkpoint=self.config.save_final_checkpoint,
+          log_param_summary=self.config.log_param_summary,
       )
     if self.config.train_loop != "kauldron":
       raise ValueError(
@@ -259,6 +332,7 @@ def run_hybrid_official_loop(
     log_losses: bool = True,
     sync_after_step: str = "state",
     save_final_checkpoint: bool = False,
+    log_param_summary: bool = False,
 ) -> dict[str, Any]:
   """Runs official DiffusionGemma train steps without Kauldron loop syncs."""
   if num_steps < 1:
@@ -305,6 +379,12 @@ def run_hybrid_official_loop(
           "workdir": str(workdir),
       },
   )
+  if log_param_summary:
+    _emit_param_tree_summary(
+        state,
+        label="post_restore",
+        workdir=workdir,
+    )
 
   for loop_step in range(num_steps):
     batch = next(ds_iter)
@@ -351,6 +431,12 @@ def run_hybrid_official_loop(
               "sync_after_step": sync_after_step,
               "workdir": str(workdir),
           },
+      )
+    if log_param_summary and (loop_step == 0 or loop_step + 1 == num_steps):
+      _emit_param_tree_summary(
+          state,
+          label=f"after_step_{loop_step + 1}",
+          workdir=workdir,
       )
 
   result = {
@@ -440,7 +526,7 @@ def _import_recipe_module(config: OfficialSFTConfig):
 
 
 def _validate_lora_backend(config: OfficialSFTConfig) -> None:
-  valid = {"official", "qwix_lora", "qwix_qlora"}
+  valid = {"official", "qwix_lora"}
   if config.lora_backend not in valid:
     raise ValueError(
         "Official DiffusionGemma lora_backend must be one of "
@@ -477,29 +563,23 @@ def _replace_resolved_lora_backend(
     )
   alpha = config.lora_alpha if config.lora_alpha is not None else float(rank)
   base_network = getattr(gemma_network, "model", gemma_network)
+  qwix_methods = None
+  if config.encoder_loss_token_chunk_size is not None:
+    base_network = _with_encoder_hidden_methods(base_network)
+    qwix_methods = _qwix_methods_with_encoder_hidden(bridge)
   target_modules = getattr(gemma_network, "target_modules", "all-linear")
   module_path = _qwix_module_path_from_official_targets(
       bridge,
       target_modules,
       override=config.qwix_lora_module_path,
   )
-  if config.lora_backend == "qwix_qlora":
-    replacement = bridge.apply_qlora_to_linen_model(
-        base_network,
-        rank=int(rank),
-        alpha=float(alpha),
-        module_path=module_path,
-        weight_qtype=config.qlora_weight_qtype or "int4",
-        act_qtype=config.qlora_act_qtype,
-        tile_size=config.qlora_tile_size,
-    )
-  else:
-    replacement = bridge.apply_lora_to_linen_model(
-        base_network,
-        rank=int(rank),
-        alpha=float(alpha),
-        module_path=module_path,
-    )
+  replacement = bridge.apply_lora_to_linen_model(
+      base_network,
+      rank=int(rank),
+      alpha=float(alpha),
+      module_path=module_path,
+      methods=qwix_methods or bridge.DIFFUSION_GEMMA_LINEN_LORA_METHODS,
+  )
 
   for model in model_candidates:
     object.__setattr__(model, "gemma_network", replacement)
@@ -511,7 +591,7 @@ def _replace_resolved_lora_backend(
           "rank": int(rank),
           "alpha": float(alpha),
           "module_path": module_path,
-          "qlora_weight_qtype": config.qlora_weight_qtype,
+          "encoder_hidden_methods": bool(qwix_methods),
       }),
       flush=True,
   )
@@ -571,12 +651,563 @@ def _load_linen_qwix_lora_module():
   return module
 
 
+def _qwix_methods_with_encoder_hidden(bridge: Any) -> tuple[str, ...]:
+  return tuple(
+      dict.fromkeys(
+          tuple(bridge.DIFFUSION_GEMMA_LINEN_LORA_METHODS)
+          + ("encoder_hidden_call", "decode_hidden")
+      )
+  )
+
+
+@functools.cache
+def _encoder_hidden_network_cls(base_cls: type[Any]):
+  try:
+    from flax import linen as nn  # pylint: disable=g-import-not-at-top
+    import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    raise OfficialBackendDependencyError(
+        "Encoder-hidden DiffusionGemma network wrapping requires flax and jax."
+    ) from exc
+
+  class EncoderHiddenNetwork(base_cls):
+    """Adds hidden-state encoder/decode methods for memory-safe CE."""
+
+    @nn.compact
+    def encoder_hidden_call(
+        self,
+        *,
+        x: Any,
+        conditioning_embeddings: dict[str, Any],
+    ) -> Any:
+      if len(x.shape) == 3:
+        tokens = x[..., 0]
+      else:
+        tokens = x
+      cache = conditioning_embeddings.get("kv_cache", None)
+      positions = conditioning_embeddings.get("positions", None)
+      attention_mask = conditioning_embeddings.get("attention_mask", None)
+      return self.gemma_model(
+          tokens=tokens,
+          cache=cache,
+          positions=positions,
+          attention_mask=attention_mask,
+          return_hidden_states=True,
+      )
+
+    @nn.compact
+    def decode_hidden(self, hidden: Any) -> Any:
+      logits = self.gemma_model.embedder.decode(hidden)
+      softcap = self.gemma_model.config.final_logit_softcap
+      if softcap is not None:
+        logits /= softcap
+        logits = jnp.tanh(logits) * softcap
+      return logits
+
+  EncoderHiddenNetwork.__name__ = f"EncoderHidden{base_cls.__name__}"
+  return EncoderHiddenNetwork
+
+
+def _with_encoder_hidden_methods(network: Any) -> Any:
+  if hasattr(network, "encoder_hidden_call") and hasattr(
+      network, "decode_hidden"
+  ):
+    return network
+  cls = _encoder_hidden_network_cls(network.__class__)
+  kwargs = _linen_module_init_values(network)
+  return cls(**kwargs)
+
+
+def _linen_module_init_values(module: Any) -> dict[str, Any]:
+  values = {}
+  for field in dataclasses.fields(module):
+    if not field.init or field.name in ("parent", "name"):
+      continue
+    if hasattr(module, field.name):
+      values[field.name] = getattr(module, field.name)
+  return values
+
+
+def _qwix_lora_select_patterns(pattern: str | Sequence[str]) -> tuple[str, ...]:
+  """Expands official LoRA optimizer masks to include Qwix Linen names."""
+  if isinstance(pattern, str):
+    patterns = (pattern,)
+  else:
+    patterns = tuple(str(item) for item in pattern)
+  expanded: list[str] = []
+  for item in patterns:
+    expanded.append(item)
+    if item == "lora":
+      expanded.extend((r".*_lora_a", r".*_lora_b"))
+  return tuple(dict.fromkeys(expanded))
+
+
+def _patch_kauldron_lora_select_for_qwix() -> None:
+  """Makes the official LoRA optimizer mask include Qwix LoRA leaves."""
+  global _QWIX_KAULDRON_SELECT_PATCHED
+  if _QWIX_KAULDRON_SELECT_PATCHED:
+    return
+  try:
+    from kauldron import kd  # pylint: disable=g-import-not-at-top
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    raise OfficialBackendDependencyError(
+        "Qwix LoRA optimizer mask patching requires kauldron."
+    ) from exc
+
+  if getattr(kd.optim, "_tunix_qwix_lora_select_patched", False):
+    _QWIX_KAULDRON_SELECT_PATCHED = True
+    return
+
+  original_select = kd.optim.select
+
+  def select(pattern):
+    return original_select(_qwix_lora_select_patterns(pattern))
+
+  kd.optim._tunix_original_select = original_select
+  kd.optim.select = select
+  kd.optim._tunix_qwix_lora_select_patched = True
+  _QWIX_KAULDRON_SELECT_PATCHED = True
+  print(
+      _json_dumps({
+          "event": "official_backend_qwix_kauldron_select_patched",
+          "lora_patterns": _qwix_lora_select_patterns("lora"),
+      }),
+      flush=True,
+  )
+
+
+def _replace_resolved_encoder_ar_loss_with_memory_safe(
+    trainer: Any,
+    config: OfficialSFTConfig,
+) -> None:
+  """Moves resolved encoder AR loss behind a memory-safe model wrapper."""
+  chunk_size = config.encoder_loss_token_chunk_size
+  if chunk_size is None:
+    return
+  if chunk_size <= 0:
+    raise ValueError(
+        "encoder_loss_token_chunk_size must be positive when set, got "
+        f"{chunk_size}."
+    )
+  _replace_resolved_sft_model_with_memory_safe_encoder_loss(
+      trainer, int(chunk_size)
+  )
+  train_losses = getattr(trainer, "train_losses", None)
+  if train_losses is None or "encoder_loss" not in train_losses:
+    raise OfficialBackendDependencyError(
+        "The resolved official trainer has no train_losses['encoder_loss'] "
+        "to replace."
+    )
+  original = train_losses.get("encoder_loss")
+  replacement_cls = _encoder_loss_value_cls()
+  kwargs = {
+      key: value
+      for key, value in _dataclass_init_values(original).items()
+      if key in ("step", "mask", "weight", "normalize_by")
+  }
+  replacement = replacement_cls(**kwargs)
+  updated_losses = dict(train_losses)
+  updated_losses["encoder_loss"] = replacement
+  object.__setattr__(trainer, "train_losses", updated_losses)
+  _replace_trainstep_aux_losses(
+      getattr(trainer, "trainstep", None), updated_losses
+  )
+  aux = getattr(trainer, "aux", None)
+  if isinstance(aux, MutableMapping):
+    aux["encoder_loss_token_chunk_size"] = int(chunk_size)
+  elif aux is not None:
+    aux.encoder_loss_token_chunk_size = int(chunk_size)
+  print(
+      _json_dumps({
+          "event": "official_backend_memory_safe_encoder_loss_replaced",
+          "token_chunk_size": int(chunk_size),
+          "original_loss": type(original).__name__,
+          "replacement_loss": replacement_cls.__name__,
+          "model_output": "preds.encoder_loss",
+      }),
+      flush=True,
+  )
+
+
+def _replace_resolved_sft_model_with_memory_safe_encoder_loss(
+    trainer: Any,
+    chunk_size: int,
+) -> None:
+  model = getattr(trainer, "model", None)
+  if model is None or not hasattr(model, "gemma_network"):
+    raise OfficialBackendDependencyError(
+        "The resolved official trainer model cannot be wrapped for "
+        "memory-safe encoder loss because it has no gemma_network."
+    )
+  gemma_network = getattr(model, "gemma_network")
+  if not hasattr(gemma_network, "encoder_hidden_call") or not hasattr(
+      gemma_network, "decode_hidden"
+  ):
+    raise OfficialBackendDependencyError(
+        "Memory-safe encoder loss requires a gemma_network with "
+        "encoder_hidden_call() and decode_hidden(). Use lora_backend "
+        "'qwix_lora' for this path."
+    )
+  wrapper_cls = _memory_safe_sft_diffusion_cls(model.__class__)
+  kwargs = _linen_module_init_values(model)
+  kwargs["encoder_loss_token_chunk_size"] = int(chunk_size)
+  replacement = wrapper_cls(**kwargs)
+  for owner in (trainer, getattr(trainer, "trainstep", None)):
+    if owner is not None and getattr(owner, "model", None) is model:
+      object.__setattr__(owner, "model", replacement)
+  print(
+      _json_dumps({
+          "event": "official_backend_memory_safe_sft_model_replaced",
+          "original_model": type(model).__name__,
+          "replacement_model": wrapper_cls.__name__,
+          "token_chunk_size": int(chunk_size),
+      }),
+      flush=True,
+  )
+
+
+def _replace_trainstep_aux_losses(
+    trainstep: Any, losses: Mapping[str, Any]
+) -> None:
+  """Keeps the resolved Kauldron TrainStep loss collection in sync."""
+  if trainstep is None:
+    return
+  aux = getattr(trainstep, "aux", None)
+  if aux is None or not hasattr(aux, "losses"):
+    return
+  replacement_losses = _losses_like(getattr(aux, "losses"), losses)
+  try:
+    new_aux = dataclasses.replace(aux, losses=replacement_losses)
+  except TypeError:
+    if hasattr(aux, "replace"):
+      new_aux = aux.replace(losses=replacement_losses)
+    else:
+      object.__setattr__(aux, "losses", replacement_losses)
+      new_aux = aux
+  object.__setattr__(trainstep, "aux", new_aux)
+
+
+def _losses_like(original: Any, losses: Mapping[str, Any]) -> Any:
+  if original is None:
+    return dict(losses)
+  try:
+    return type(original)(losses)
+  except Exception:  # pylint: disable=broad-exception-caught
+    return dict(losses)
+
+
+@functools.cache
+def _memory_safe_sft_diffusion_cls(base_cls: type[Any]):
+  try:
+    from flax import linen as nn  # pylint: disable=g-import-not-at-top
+    import jax  # pylint: disable=g-import-not-at-top
+    import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+    from gemma.diffusion.hackable_diffusion_adapter.hd import sft_model  # pylint: disable=g-import-not-at-top
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    raise OfficialBackendDependencyError(
+        "Memory-safe SFTDiffusion wrapping requires flax, jax, and the "
+        "official gemma DiffusionGemma SFT module."
+    ) from exc
+
+  class MemorySafeSFTDiffusion(base_cls):
+    """Official SFTDiffusion with model-integrated chunked encoder CE."""
+
+    encoder_loss_token_chunk_size: int = 128
+
+    @nn.compact
+    def __call__(
+        self,
+        x0: Any,
+        prompt: Any,
+        canvas_id: Any,
+        canvas_mask: Any,
+        encoder_target: Any,
+        encoder_target_mask: Any,
+        is_training: bool = True,
+    ):
+      time = self.time_sampler(self.make_rng("sampling"), x0)
+      xt, target_info = self.corruption_process.corrupt(
+          self.make_rng("sampling"), x0, time
+      )
+
+      first_token_indices = jnp.arange(self.num_canvases) * self.canvas_size
+      canvas_validity = canvas_mask[:, first_token_indices]
+      num_valid_canvases = jnp.sum(canvas_validity, axis=-1)
+      num_valid_canvases = jnp.maximum(num_valid_canvases, 1)
+      selected_canvas_idx = jax.random.randint(
+          self.make_rng("sampling"),
+          shape=num_valid_canvases.shape,
+          minval=0,
+          maxval=num_valid_canvases,
+      )
+
+      x0_tokens = x0[..., 0] if x0.ndim == 3 else x0
+      encoder_hidden, kv_cache, positions, prompt_mask = _sft_encode_hidden(
+          gemma_network=self.gemma_network,
+          prompt=prompt,
+          x0_tokens=x0_tokens,
+          canvas_mask=canvas_mask,
+          selected_canvas_idx=selected_canvas_idx,
+          prompt_len=self.prompt_len,
+          total_canvas_len=self.total_canvas_len,
+          canvas_size=self.canvas_size,
+          pad_token=self.pad_token,
+      )
+      encoder_loss = _encoder_loss_from_hidden(
+          self.gemma_network,
+          encoder_hidden,
+          encoder_target,
+          encoder_target_mask,
+          chunk_size=self.encoder_loss_token_chunk_size,
+      )
+
+      if self.stop_gradient_from_denoiser_to_encoder:
+        kv_cache = jax.lax.stop_gradient(kv_cache)
+
+      decoder_kwargs = dict(
+          gemma_network=self.gemma_network,
+          xt=xt,
+          time=time,
+          kv_cache=kv_cache,
+          positions=positions,
+          prompt_mask=prompt_mask,
+          canvas_mask=canvas_mask,
+          selected_canvas_idx=selected_canvas_idx,
+          prompt_len=self.prompt_len,
+          total_canvas_len=self.total_canvas_len,
+          canvas_size=self.canvas_size,
+          is_training=is_training,
+      )
+      denoiser_output_first_pass = sft_model.sft_decode(**decoder_kwargs)
+
+      target_mask = canvas_mask & (canvas_id == selected_canvas_idx[:, None])
+      target_info["is_corrupted"] = (
+          target_info["is_corrupted"] & target_mask[..., None]
+      )
+      target_info["target_mask"] = target_mask[..., None]
+
+      converted_first_pass = self.corruption_process.convert_predictions(
+          denoiser_output_first_pass, xt, time
+      )
+      converted_first_pass = jax.lax.stop_gradient(converted_first_pass)
+      sc_logits = converted_first_pass["logits"]
+      zero_logits = jnp.zeros_like(sc_logits)
+
+      batch_size = xt.shape[0]
+      do_self_cond = (
+          jax.random.uniform(self.make_rng("sampling"), shape=(batch_size,))
+          < self.self_cond_prob
+      )
+      do_self_cond = do_self_cond.reshape(
+          (batch_size,) + (1,) * (sc_logits.ndim - 1)
+      )
+      sc_logits = jnp.where(do_self_cond, sc_logits, zero_logits)
+
+      denoiser_output = sft_model.sft_decode(
+          **decoder_kwargs, sc_logits=sc_logits
+      )
+      converted = self.corruption_process.convert_predictions(
+          denoiser_output, xt, time
+      )
+      noise_info = self.corruption_process.get_schedule_info(time)
+      return {
+          "output": converted,
+          "target": target_info,
+          "xt": xt,
+          "noise_info": noise_info,
+          "encoder_loss": encoder_loss,
+          "encoder_target": encoder_target,
+          "encoder_target_mask": encoder_target_mask,
+      }
+
+  MemorySafeSFTDiffusion.__name__ = f"MemorySafe{base_cls.__name__}"
+  return MemorySafeSFTDiffusion
+
+
+def _sft_encode_hidden(
+    gemma_network: Any,
+    *,
+    prompt: Any,
+    x0_tokens: Any,
+    canvas_mask: Any,
+    selected_canvas_idx: Any,
+    prompt_len: int,
+    total_canvas_len: int,
+    canvas_size: int,
+    pad_token: int,
+) -> tuple[Any, Any, Any, Any]:
+  del total_canvas_len
+  import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+  from gemma.diffusion.hackable_diffusion_adapter.hd import mask_helpers  # pylint: disable=g-import-not-at-top
+
+  full_seq = jnp.concatenate([prompt, x0_tokens], axis=1)
+  prompt_mask = prompt != pad_token
+  full_seq_mask = jnp.concatenate([prompt_mask, canvas_mask], axis=1)
+  batch_size, full_seq_len = full_seq.shape
+  kv_cache = gemma_network.init_cache(
+      batch_size=batch_size,
+      cache_length=full_seq_len,
+  )
+  positions = mask_helpers.build_positions_from_mask(full_seq_mask)
+  attention_mask = mask_helpers.make_causal_prefill_mask(
+      full_seq_mask, full_seq_len
+  )
+  encoder_out = gemma_network.encoder_hidden_call(
+      x=full_seq,
+      conditioning_embeddings={
+          "kv_cache": kv_cache,
+          "positions": positions,
+          "attention_mask": attention_mask,
+      },
+  )
+  kv_cache = encoder_out.cache
+  encoder_hidden = encoder_out.hidden_states
+  if kv_cache is None:
+    raise ValueError("KV cache should not be None after encoder pass.")
+  if encoder_hidden is None:
+    raise ValueError("Encoder hidden states should not be None.")
+  end_index = prompt_len + selected_canvas_idx * canvas_size
+  kv_cache = mask_helpers.set_cache_end_index(kv_cache, end_index)
+  return encoder_hidden, kv_cache, positions, prompt_mask
+
+
+def _encoder_loss_from_hidden(
+    gemma_network: Any,
+    hidden: Any,
+    targets: Any,
+    mask: Any,
+    *,
+    chunk_size: int | None,
+) -> Any:
+  import jax  # pylint: disable=g-import-not-at-top
+  import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+
+  hidden = jnp.asarray(hidden)
+  targets = jnp.asarray(targets)
+  mask = jnp.asarray(mask)
+  if chunk_size is None or chunk_size <= 0 or chunk_size >= hidden.shape[1]:
+    logits = gemma_network.decode_hidden(hidden).astype(jnp.float32)
+    token_loss = _token_ce_from_logits(logits, targets)
+    token_mask = mask.astype(token_loss.dtype)
+    return jnp_sum_over_nonbatch(token_loss * token_mask) / jnp_maximum(
+        jnp_sum_over_nonbatch(token_mask), 1.0
+    )
+
+  seq_len = hidden.shape[1]
+  pad_len = (-seq_len) % chunk_size
+  if pad_len:
+    hidden = jnp.pad(hidden, ((0, 0), (0, pad_len), (0, 0)))
+    targets = jnp.pad(targets, ((0, 0), (0, pad_len)), constant_values=0)
+    mask = jnp.pad(mask, ((0, 0), (0, pad_len)), constant_values=0)
+  num_chunks = hidden.shape[1] // chunk_size
+  hidden_chunks = hidden.reshape(
+      hidden.shape[0], num_chunks, chunk_size, hidden.shape[-1]
+  )
+  target_chunks = targets.reshape(targets.shape[0], num_chunks, chunk_size)
+  mask_chunks = mask.reshape(mask.shape[0], num_chunks, chunk_size)
+
+  def scan_body(carry, chunk_inputs):
+    total_loss, total_weight = carry
+    hidden_chunk, target_chunk, mask_chunk = chunk_inputs
+    logits = gemma_network.decode_hidden(hidden_chunk).astype(jnp.float32)
+    token_loss = _token_ce_from_logits(logits, target_chunk)
+    token_mask = mask_chunk.astype(token_loss.dtype)
+    return (
+        total_loss + jnp.sum(token_loss * token_mask, axis=1),
+        total_weight + jnp.sum(token_mask, axis=1),
+    ), None
+
+  init = (
+      jnp.zeros((hidden.shape[0],), dtype=jnp.float32),
+      jnp.zeros((hidden.shape[0],), dtype=jnp.float32),
+  )
+  (loss_sum, weight_sum), _ = jax.lax.scan(
+      scan_body,
+      init,
+      (
+          jnp.swapaxes(hidden_chunks, 0, 1),
+          jnp.swapaxes(target_chunks, 0, 1),
+          jnp.swapaxes(mask_chunks, 0, 1),
+      ),
+  )
+  return loss_sum / jnp.maximum(weight_sum, 1.0)
+
+
+def _token_ce_from_logits(logits: Any, targets: Any) -> Any:
+  import jax  # pylint: disable=g-import-not-at-top
+  import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+
+  target_logits = jnp.take_along_axis(
+      logits, targets[..., None], axis=-1
+  ).squeeze(axis=-1)
+  return jax.nn.logsumexp(logits, axis=-1) - target_logits
+
+
+def _dataclass_init_values(instance: Any) -> dict[str, Any]:
+  try:
+    fields = dataclasses.fields(instance)
+  except TypeError:
+    fields = ()
+  values = {}
+  for field in fields:
+    if field.init and hasattr(instance, field.name):
+      values[field.name] = getattr(instance, field.name)
+  if values:
+    return values
+  for field_name in (
+      "encoder_logits",
+      "encoder_target",
+      "encoder_target_mask",
+      "weight",
+      "mask",
+      "normalize_by",
+  ):
+    if hasattr(instance, field_name):
+      values[field_name] = getattr(instance, field_name)
+  return values
+
+
+@functools.cache
+def _encoder_loss_value_cls():
+  try:
+    from kauldron import kd  # pylint: disable=g-import-not-at-top
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    raise OfficialBackendDependencyError(
+        "Encoder loss value replacement requires kauldron."
+    ) from exc
+
+  @dataclasses.dataclass(frozen=True, kw_only=True)
+  class EncoderLossValue(kd.losses.Loss):
+    """Reads model-integrated per-example encoder loss values."""
+
+    encoder_loss: kd.kontext.Key = "preds.encoder_loss"
+
+    def get_values(self, encoder_loss):
+      return encoder_loss
+
+  EncoderLossValue.__name__ = "EncoderLossValue"
+  EncoderLossValue.__annotations__ = {"encoder_loss": kd.kontext.Key}
+  return EncoderLossValue
+
+
+def jnp_sum_over_nonbatch(value: Any):
+  import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+
+  if value.ndim <= 1:
+    return value
+  return jnp.sum(value, axis=tuple(range(1, value.ndim)))
+
+
+def jnp_maximum(lhs: Any, rhs: Any):
+  import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+
+  return jnp.maximum(lhs, rhs)
+
+
 def _is_qwix_or_official_lora_path(path: str) -> bool:
   leaf = path.rsplit("/", 1)[-1]
   return (
-      "/lora/" in path
-      or leaf.endswith("_lora_a")
-      or leaf.endswith("_lora_b")
+      "/lora/" in path or leaf.endswith("_lora_a") or leaf.endswith("_lora_b")
   )
 
 
@@ -602,14 +1233,14 @@ def _checkpoint_value_for_model_value(
     model_value: Any,
     checkpoint_value: Any,
 ) -> Any:
-  """Converts checkpoint leaves to the model leaf shape for Qwix QLoRA."""
+  """Converts checkpoint leaves to the model leaf shape."""
   if not _is_qwix_quantized_value(model_value):
     return checkpoint_value
   try:
     qwix_ptq = importlib.import_module("qwix._src.providers.ptq")
   except Exception as exc:  # pylint: disable=broad-exception-caught
     raise OfficialBackendDependencyError(
-        "Qwix QLoRA checkpoint restore requires qwix."
+        "Qwix quantized checkpoint restore requires qwix."
     ) from exc
   return qwix_ptq.WithAux(
       qwix_ptq.qarray.quantize(checkpoint_value, model_value.how),
@@ -624,7 +1255,7 @@ def _delete_jax_arrays_in_tree(value: Any, jax_module: Any) -> None:
 
 
 def _patch_qwix_optax_apply_updates() -> None:
-  """Keeps Qwix LoRA/QLoRA base params frozen during Optax updates."""
+  """Keeps Qwix LoRA base params frozen during Optax updates."""
   global _QWIX_OPTAX_PATCHED
   if _QWIX_OPTAX_PATCHED:
     return
@@ -669,7 +1300,7 @@ def _patch_qwix_optax_apply_updates() -> None:
 
 
 def _patch_qwix_checkpoint_loader(config: OfficialSFTConfig) -> None:
-  """Extends the official memory-safe loader for Qwix LoRA/QLoRA leaves."""
+  """Extends the official memory-safe loader for Qwix LoRA leaves."""
   del config
   global _QWIX_CHECKPOINTER_PATCHED
   if _QWIX_CHECKPOINTER_PATCHED:
@@ -752,8 +1383,8 @@ def _patch_qwix_checkpoint_loader(config: OfficialSFTConfig) -> None:
   def cheaply_load_params(params_from_state, checkpoint_path):
     existing = params_from_state
     model_param_spec = (
-        gemma_checkpointer._convert_to_element_spec_with_sharding(existing)  # pylint: disable=protected-access
-    )
+        gemma_checkpointer._convert_to_element_spec_with_sharding(existing)
+    )  # pylint: disable=protected-access
 
     existing_flat_arrays = gemma_checkpointer.flax.traverse_util.flatten_dict(
         existing, sep="/"
@@ -815,7 +1446,6 @@ def _patch_qwix_checkpoint_loader(config: OfficialSFTConfig) -> None:
       _json_dumps({
           "event": "official_backend_qwix_checkpoint_loader_patched",
           "lora_key_predicate": "official_or_qwix",
-          "qlora_restore": "quantize_checkpoint_value_like_model",
       }),
       flush=True,
   )
@@ -842,9 +1472,6 @@ def _apply_common_config_overrides(cfg: Any, config: OfficialSFTConfig) -> None:
     aux.lora_backend = config.lora_backend
     aux.lora_alpha = config.lora_alpha
     aux.qwix_lora_module_path = config.qwix_lora_module_path
-    aux.qlora_weight_qtype = config.qlora_weight_qtype
-    aux.qlora_act_qtype = config.qlora_act_qtype
-    aux.qlora_tile_size = config.qlora_tile_size
   if config.num_train_steps is not None:
     cfg.num_train_steps = config.num_train_steps
   if config.checkpoint_every_n_steps is not None:
@@ -957,6 +1584,184 @@ def _emit_device_loss_values(
         flush=True,
     )
   return list(values)
+
+
+def _emit_param_tree_summary(
+    tree: Any,
+    *,
+    label: str,
+    workdir: pathlib.Path,
+) -> dict[str, Any]:
+  """Writes a metadata-only parameter summary for Qwix LoRA runs."""
+  summary = _param_tree_memory_summary(tree)
+  summary.update({
+      "event": "official_backend_param_tree_summary",
+      "label": label,
+  })
+  _write_json(workdir / f"param_tree_summary_{label}.json", summary)
+  print(_json_dumps(summary), flush=True)
+  return summary
+
+
+def _param_tree_memory_summary(
+    tree: Any,
+    *,
+    sample_limit: int = 12,
+) -> dict[str, Any]:
+  """Summarizes quantized, LoRA, and dense leaf storage without host reads."""
+  try:
+    import jax  # pylint: disable=g-import-not-at-top
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    raise OfficialBackendDependencyError(
+        "Parameter summary requires jax."
+    ) from exc
+
+  summary: dict[str, Any] = {
+      "total_leaves": 0,
+      "quantized_base_leaves": 0,
+      "quantized_base_storage_bytes": 0,
+      "quantized_base_dense_equivalent_bf16_bytes": 0,
+      "quantized_base_qvalue_bytes": 0,
+      "quantized_base_scale_bytes": 0,
+      "quantized_base_zero_point_bytes": 0,
+      "lora_path_leaves": 0,
+      "lora_path_storage_bytes": 0,
+      "dense_non_lora_leaves": 0,
+      "dense_non_lora_storage_bytes": 0,
+      "other_leaves": 0,
+      "qtypes": {},
+      "sample_quantized_base_paths": [],
+      "sample_lora_paths": [],
+      "sample_dense_non_lora_paths": [],
+  }
+
+  leaves = jax.tree_util.tree_flatten_with_path(
+      tree,
+      is_leaf=_is_param_summary_leaf,
+  )[0]
+  for path, leaf in leaves:
+    path_str = _jax_path_to_string(path)
+    summary["total_leaves"] += 1
+    if _is_qwix_quantized_value(leaf):
+      _add_quantized_leaf_summary(
+          summary,
+          path_str,
+          leaf.array,
+          sample_limit=sample_limit,
+      )
+      continue
+    if _is_qwix_qarray(leaf):
+      _add_quantized_leaf_summary(
+          summary,
+          path_str,
+          leaf,
+          sample_limit=sample_limit,
+      )
+      continue
+
+    leaf_bytes = _array_nbytes_metadata(leaf)
+    if leaf_bytes is None:
+      summary["other_leaves"] += 1
+      continue
+    if _is_qwix_or_official_lora_path(path_str):
+      summary["lora_path_leaves"] += 1
+      summary["lora_path_storage_bytes"] += leaf_bytes
+      _append_sample(summary["sample_lora_paths"], path_str, sample_limit)
+    else:
+      summary["dense_non_lora_leaves"] += 1
+      summary["dense_non_lora_storage_bytes"] += leaf_bytes
+      _append_sample(
+          summary["sample_dense_non_lora_paths"], path_str, sample_limit
+      )
+
+  for key in (
+      "quantized_base_storage_bytes",
+      "quantized_base_dense_equivalent_bf16_bytes",
+      "lora_path_storage_bytes",
+      "dense_non_lora_storage_bytes",
+  ):
+    summary[f"{key}_gib"] = summary[key] / float(1024**3)
+  q_storage = summary["quantized_base_storage_bytes"]
+  dense_equiv = summary["quantized_base_dense_equivalent_bf16_bytes"]
+  summary["quantized_base_vs_bf16_ratio"] = (
+      None if dense_equiv == 0 else q_storage / dense_equiv
+  )
+  return summary
+
+
+def _is_param_summary_leaf(value: Any) -> bool:
+  return _is_qwix_quantized_value(value) or _is_qwix_qarray(value)
+
+
+def _is_qwix_qarray(value: Any) -> bool:
+  return hasattr(value, "qvalue") and hasattr(value, "scale")
+
+
+def _add_quantized_leaf_summary(
+    summary: dict[str, Any],
+    path: str,
+    qarray: Any,
+    *,
+    sample_limit: int,
+) -> None:
+  qvalue_bytes = _array_nbytes_metadata(getattr(qarray, "qvalue", None)) or 0
+  scale_bytes = _array_nbytes_metadata(getattr(qarray, "scale", None)) or 0
+  zero_point = getattr(qarray, "zero_point", None)
+  zero_point_bytes = (
+      0 if zero_point is None else (_array_nbytes_metadata(zero_point) or 0)
+  )
+  original_elements = _shape_num_elements(getattr(qarray, "shape", ()))
+  dense_equivalent_bf16_bytes = original_elements * 2
+  qtype = str(getattr(qarray, "qtype", None))
+
+  summary["quantized_base_leaves"] += 1
+  summary["quantized_base_qvalue_bytes"] += qvalue_bytes
+  summary["quantized_base_scale_bytes"] += scale_bytes
+  summary["quantized_base_zero_point_bytes"] += zero_point_bytes
+  summary["quantized_base_storage_bytes"] += (
+      qvalue_bytes + scale_bytes + zero_point_bytes
+  )
+  summary[
+      "quantized_base_dense_equivalent_bf16_bytes"
+  ] += dense_equivalent_bf16_bytes
+  summary["qtypes"][qtype] = summary["qtypes"].get(qtype, 0) + 1
+  _append_sample(summary["sample_quantized_base_paths"], path, sample_limit)
+
+
+def _append_sample(samples: list[str], value: str, limit: int) -> None:
+  if len(samples) < limit:
+    samples.append(value)
+
+
+def _array_nbytes_metadata(value: Any) -> int | None:
+  shape = getattr(value, "shape", None)
+  dtype = getattr(value, "dtype", None)
+  if shape is None or dtype is None:
+    return None
+  return _shape_num_elements(shape) * _dtype_itemsize(dtype)
+
+
+def _shape_num_elements(shape: Any) -> int:
+  size = 1
+  try:
+    parts = tuple(shape)
+  except TypeError:
+    parts = (shape,)
+  for dim in parts:
+    size *= int(dim)
+  return int(size)
+
+
+def _dtype_itemsize(dtype: Any) -> int:
+  itemsize = getattr(dtype, "itemsize", None)
+  if itemsize is not None:
+    return int(itemsize)
+  try:
+    import numpy as np  # pylint: disable=g-import-not-at-top
+
+    return int(np.dtype(dtype).itemsize)
+  except Exception:
+    return 0
 
 
 @functools.lru_cache(maxsize=None)

@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Experimental Qwix LoRA bridge for Linen DiffusionGemma models.
+"""Qwix LoRA bridge for Linen DiffusionGemma models.
 
-The validated H100x2 path still uses the official Hackable Diffusion LoRA
-wrapper. This module is the first small step toward replacing that LoRA layer
-with a Tunix/Qwix policy while keeping the official Linen model and method
+This module replaces the official Hackable Diffusion LoRA layer with a
+Tunix/Qwix LoRA policy while keeping the official Linen model and method
 surface intact.
 """
 
@@ -57,28 +56,21 @@ DIFFUSION_GEMMA_LINEN_LORA_METHODS: tuple[str, ...] = (
 
 OFFICIAL_COMPATIBLE_LINEN_TARGET_PATTERNS: tuple[str, ...] = (
     r"(.*/)?attn/(q_einsum|kv_einsum|k_einsum|attn_vec_einsum)$",
+    r"(.*/)?(mlp|mlp2)$",
     r"(.*/)?(mlp|mlp2)/(gating_einsum|linear|router_logits)$",
+    r"(.*/)?self_conditioner/ffw$",
     r"(.*/)?self_conditioner/ffw/(gating_einsum|linear)$",
 )
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class LinenQwixLoRAConfig:
-  """Qwix LoRA/QLoRA configuration for Linen DiffusionGemma models."""
+  """Qwix LoRA configuration for Linen DiffusionGemma models."""
 
   rank: int
   alpha: float
   module_path: str | None = None
   dropout: float = 0.0
-  weight_qtype: str | type[Any] | jnp.dtype | None = None
-  act_qtype: str | type[Any] | jnp.dtype | None = None
-  tile_size: int | float | None = None
-  weight_calibration_method: str = "absmax"
-  act_calibration_method: str | None = None
-
-  @property
-  def is_qlora(self) -> bool:
-    return self.weight_qtype is not None or self.act_qtype is not None
 
 
 def official_compatible_module_path(
@@ -96,13 +88,8 @@ def create_linen_lora_provider(
     alpha: float,
     module_path: str | None = None,
     dropout: float = 0.0,
-    weight_qtype: str | type[Any] | jnp.dtype | None = None,
-    act_qtype: str | type[Any] | jnp.dtype | None = None,
-    tile_size: int | float | None = None,
-    weight_calibration_method: str = "absmax",
-    act_calibration_method: str | None = None,
 ):
-  """Creates a Qwix LoRA/QLoRA provider for Linen DiffusionGemma modules."""
+  """Creates a Qwix LoRA provider for Linen DiffusionGemma modules."""
   import qwix  # pylint: disable=g-import-not-at-top
 
   kwargs = {
@@ -111,16 +98,6 @@ def create_linen_lora_provider(
       "alpha": alpha,
       "dropout": dropout,
   }
-  if weight_qtype is not None:
-    kwargs["weight_qtype"] = weight_qtype
-  if act_qtype is not None:
-    kwargs["act_qtype"] = act_qtype
-  if tile_size is not None:
-    kwargs["tile_size"] = tile_size
-  if weight_calibration_method is not None:
-    kwargs["weight_calibration_method"] = weight_calibration_method
-  if act_calibration_method is not None:
-    kwargs["act_calibration_method"] = act_calibration_method
   return _NoDebugAttrLoraProvider(**kwargs)
 
 
@@ -131,11 +108,6 @@ def create_linen_lora_provider_from_config(config: LinenQwixLoRAConfig):
       alpha=config.alpha,
       module_path=config.module_path,
       dropout=config.dropout,
-      weight_qtype=config.weight_qtype,
-      act_qtype=config.act_qtype,
-      tile_size=config.tile_size,
-      weight_calibration_method=config.weight_calibration_method,
-      act_calibration_method=config.act_calibration_method,
   )
 
 
@@ -145,7 +117,7 @@ def apply_lora_to_linen_model_from_config(
     *,
     methods: Sequence[str] = DIFFUSION_GEMMA_LINEN_LORA_METHODS,
 ) -> Any:
-  """Applies Qwix LoRA/QLoRA to a Linen model from a structured config."""
+  """Applies Qwix LoRA to a Linen model from a structured config."""
   return _apply_provider_to_linen_model(
       model,
       create_linen_lora_provider_from_config(config),
@@ -170,38 +142,6 @@ def apply_lora_to_linen_model(
           alpha=alpha,
           module_path=module_path,
           dropout=dropout,
-      ),
-      methods=methods,
-  )
-
-
-def apply_qlora_to_linen_model(
-    model: Any,
-    *,
-    rank: int,
-    alpha: float,
-    weight_qtype: str | type[Any] | jnp.dtype = "int4",
-    module_path: str | None = None,
-    methods: Sequence[str] = DIFFUSION_GEMMA_LINEN_LORA_METHODS,
-    dropout: float = 0.0,
-    act_qtype: str | type[Any] | jnp.dtype | None = None,
-    tile_size: int | float | None = None,
-    weight_calibration_method: str = "absmax",
-    act_calibration_method: str | None = None,
-) -> Any:
-  """Applies Qwix QLoRA to a Linen model with DiffusionGemma call coverage."""
-  return apply_lora_to_linen_model_from_config(
-      model,
-      LinenQwixLoRAConfig(
-          rank=rank,
-          alpha=alpha,
-          module_path=module_path,
-          dropout=dropout,
-          weight_qtype=weight_qtype,
-          act_qtype=act_qtype,
-          tile_size=tile_size,
-          weight_calibration_method=weight_calibration_method,
-          act_calibration_method=act_calibration_method,
       ),
       methods=methods,
   )
@@ -236,17 +176,202 @@ class _NoDebugAttrLoraProvider:
 
   def __new__(cls, *args, **kwargs):
     qwix_lora = _qwix_lora_module()
+    from qwix._src.core import dot_general as qwix_dot_general  # pylint: disable=g-import-not-at-top
+    from qwix._src.core import einsum as qwix_einsum  # pylint: disable=g-import-not-at-top
+    from qwix._src.core import ragged_dot as qwix_ragged_dot  # pylint: disable=g-import-not-at-top
+
+    def _force_fast_dot_general(
+        lhs,
+        rhs,
+        dimension_numbers,
+        precision=None,
+        preferred_element_type=None,
+        **dot_general_kwargs,
+    ):
+      if not _contains_qarray(lhs, rhs, qwix_lora):
+        return qwix_dot_general.dot_general(
+            lhs,
+            rhs,
+            dimension_numbers,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+            **dot_general_kwargs,
+        )
+      return qwix_dot_general._fast_dot_general(  # pylint: disable=protected-access
+          _unwrap_with_aux(lhs, qwix_lora),
+          _unwrap_with_aux(rhs, qwix_lora),
+          dimension_numbers,
+          precision=precision,
+          preferred_element_type=preferred_element_type,
+          **dot_general_kwargs,
+      )
+
+    def _force_fast_einsum(
+        einsum_str,
+        *einsum_operands,
+        preferred_element_type=None,
+        **einsum_kwargs,
+    ):
+      return qwix_einsum.einsum(
+          einsum_str,
+          *einsum_operands,
+          _qwix_dot_general=_force_fast_dot_general,
+          preferred_element_type=preferred_element_type,
+          **einsum_kwargs,
+      )
 
     class Provider(qwix_lora.LoraProvider):
 
-      def einsum(self, einsum_str: str, *operands, **kwargs):  # pylint: disable=missing-function-docstring
-        res = qwix_lora.ptq.PtqProvider.einsum(
-            self, einsum_str, *operands, **kwargs
+      def __init__(self, *provider_args, **provider_kwargs):
+        super().__init__(*provider_args, **provider_kwargs)
+        self._dot_general_fn = _force_fast_dot_general
+        self._einsum_fn = _force_fast_einsum
+
+      def nn_param(self, module, name: str, *args, **kwargs):  # pylint: disable=missing-function-docstring
+        if not _is_linen_ragged_moe_weight(module, name):
+          return super().nn_param(module, name, *args, **kwargs)
+
+        rule, _ = self._get_current_rule_and_op_id("ragged_weight_param")
+        if (
+            not isinstance(rule, qwix_lora.LoraRule)
+            or rule.weight_qtype is None
+        ):
+          return super().nn_param(module, name, *args, **kwargs)
+
+        existing_param = module.get_variable("params", name)
+        if existing_param is not None:
+          unboxed = qwix_lora.nn.unbox(existing_param)
+          if isinstance(unboxed, qwix_lora.ptq.WithAux):
+            return _stop_gradient_qarray(unboxed.array, qwix_lora)
+          if not module.is_initializing():
+            raise ValueError(
+                "It seems you're feeding an unquantized ragged MoE expert "
+                "weight to a quantized Qwix LoRA model."
+            )
+
+        value = module.param(name, *args, **kwargs)
+        how = _ragged_moe_weight_how(module, rule, qwix_lora.qarray)
+        quantized = qwix_lora.ptq.create_quantized_param(
+            name,
+            value,
+            how,
+            _qarray_module=self._qarray_module,
+        )
+        return _stop_gradient_qarray(quantized.array, qwix_lora)
+
+      def ragged_dot(  # pylint: disable=missing-function-docstring
+          self,
+          lhs,
+          rhs,
+          group_sizes,
+          precision=None,
+          preferred_element_type=None,
+          group_offset=None,
+          out_sharding=None,
+      ):
+        if not _contains_qarray(lhs, rhs, qwix_lora):
+          return jax.lax.ragged_dot(
+              lhs,
+              rhs,
+              group_sizes,
+              precision=precision,
+              preferred_element_type=preferred_element_type,
+              group_offset=group_offset,
+              out_sharding=out_sharding,
+          )
+        if out_sharding is not None:
+          raise NotImplementedError(
+              "Qwix ragged_dot QArray bridge does not support out_sharding."
+          )
+        lhs = _quantize_dense_lhs_for_qarray_ragged_dot(
+            lhs,
+            rhs,
+            qwix_lora,
+            qwix_ragged_dot._BASIC_RAGGED_DOT_DIMENSION_NUMBERS,  # pylint: disable=protected-access
+        )
+        # Qwix's public ragged_dot currently takes a dense/dequantize path for
+        # bf16 activations against QArray weights. DiffusionGemma MoE weights
+        # are too large for that temporary, so force the quantized fast path.
+        return qwix_ragged_dot._fast_ragged_dot_general(  # pylint: disable=protected-access
+            _unwrap_with_aux(lhs, qwix_lora),
+            _unwrap_with_aux(rhs, qwix_lora),
+            group_sizes,
+            qwix_ragged_dot._BASIC_RAGGED_DOT_DIMENSION_NUMBERS,  # pylint: disable=protected-access
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+            group_offset=group_offset,
         )
 
-        rule, _ = self._get_current_rule_and_op_id(
-            "einsum", repeated_call=True
+      def ragged_dot_general(  # pylint: disable=missing-function-docstring
+          self,
+          lhs,
+          rhs,
+          group_sizes,
+          ragged_dot_dimension_numbers,
+          precision=None,
+          preferred_element_type=None,
+          group_offset=None,
+          out_sharding=None,
+      ):
+        if not _contains_qarray(lhs, rhs, qwix_lora):
+          return jax.lax.ragged_dot_general(
+              lhs,
+              rhs,
+              group_sizes,
+              ragged_dot_dimension_numbers,
+              precision=precision,
+              preferred_element_type=preferred_element_type,
+              group_offset=group_offset,
+              out_sharding=out_sharding,
+          )
+        if out_sharding is not None:
+          raise NotImplementedError(
+              "Qwix ragged_dot_general QArray bridge does not support "
+              "out_sharding."
+          )
+        lhs = _quantize_dense_lhs_for_qarray_ragged_dot(
+            lhs,
+            rhs,
+            qwix_lora,
+            ragged_dot_dimension_numbers,
         )
+        # See ragged_dot above: the public wrapper may dequantize full expert
+        # weights before dispatching. Keep QArray operands on the fast path.
+        return qwix_ragged_dot._fast_ragged_dot_general(  # pylint: disable=protected-access
+            _unwrap_with_aux(lhs, qwix_lora),
+            _unwrap_with_aux(rhs, qwix_lora),
+            group_sizes,
+            ragged_dot_dimension_numbers,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+            group_offset=group_offset,
+        )
+
+      def transpose(self, a, axes=None):  # pylint: disable=missing-function-docstring
+        a = _unwrap_with_aux(a, qwix_lora)
+        if isinstance(a, qwix_lora.qarray.QArray):
+          if axes is None:
+            return a.transpose()
+          return a.transpose(*tuple(axes))
+        return jnp.transpose(a, axes=axes)
+
+      def einsum(self, einsum_str: str, *operands, **kwargs):  # pylint: disable=missing-function-docstring
+        pre_ptq_weight_name = None
+        if len(operands) == 2:
+          pre_ptq_weight_name = qwix_lora.flax_util.find_param(operands[1])
+        base_operands = (
+            (
+                operands[0],
+                _stop_gradient_base_operand(operands[1], qwix_lora),
+            )
+            if len(operands) == 2
+            else operands
+        )
+        res = qwix_lora.ptq.PtqProvider.einsum(
+            self, einsum_str, *base_operands, **kwargs
+        )
+
+        rule, _ = self._get_current_rule_and_op_id("einsum", repeated_call=True)
         if not isinstance(rule, qwix_lora.LoraRule):
           return res
         if len(operands) != 2:
@@ -254,9 +379,9 @@ class _NoDebugAttrLoraProvider:
               f"Unsupported einsum format: {einsum_str=} {operands=}"
           )
         lhs, rhs = operands
-        weight_name = qwix_lora.flax_util.find_param(
-            rhs, qwix_lora.ptq.WithAux
-        )
+        weight_name = qwix_lora.flax_util.find_param(rhs, qwix_lora.ptq.WithAux)
+        if weight_name is None:
+          weight_name = pre_ptq_weight_name
         if weight_name is None:
           return res
 
@@ -279,16 +404,119 @@ class _NoDebugAttrLoraProvider:
         )
 
         if rule.dropout > 0:
-          lhs = qwix_lora.nnx.Dropout(
-              rule.dropout, deterministic=False
-          )(lhs, rngs=qwix_lora.flax_util.make_rng("dropout"))
+          lhs = qwix_lora.nnx.Dropout(rule.dropout, deterministic=False)(
+              lhs, rngs=qwix_lora.flax_util.make_rng("dropout")
+          )
 
         return res + (
             jnp.einsum(lora_einsum_str, lhs, lora_a, lora_b, **kwargs)
             * (rule.alpha / rule.rank)
         )
 
+      def get_intercept_map(self):  # pylint: disable=missing-function-docstring
+        return super().get_intercept_map() | {
+            "jax.lax.ragged_dot": self.ragged_dot,
+            "jax.lax.ragged_dot_general": self.ragged_dot_general,
+            "jax.numpy.transpose": self.transpose,
+        }
+
     return Provider(*args, **kwargs)
+
+
+def _unwrap_with_aux(value: Any, qwix_lora_module: Any) -> Any:
+  if isinstance(value, qwix_lora_module.ptq.WithAux):
+    return value.array
+  return value
+
+
+def _contains_qarray(lhs: Any, rhs: Any, qwix_lora_module: Any) -> bool:
+  return isinstance(
+      _unwrap_with_aux(lhs, qwix_lora_module), qwix_lora_module.qarray.QArray
+  ) or isinstance(
+      _unwrap_with_aux(rhs, qwix_lora_module), qwix_lora_module.qarray.QArray
+  )
+
+
+def _stop_gradient_base_operand(value: Any, qwix_lora_module: Any) -> Any:
+  if isinstance(value, qwix_lora_module.ptq.WithAux):
+    return qwix_lora_module.ptq.WithAux(
+        _stop_gradient_qarray(value.array, qwix_lora_module),
+        value.how,
+    )
+  return _stop_gradient_qarray(value, qwix_lora_module)
+
+
+def _stop_gradient_qarray(value: Any, qwix_lora_module: Any) -> Any:
+  if isinstance(value, qwix_lora_module.qarray.QArray):
+    return jax.tree.map(jax.lax.stop_gradient, value)
+  return value
+
+
+def _quantize_dense_lhs_for_qarray_ragged_dot(
+    lhs: Any,
+    rhs: Any,
+    qwix_lora_module: Any,
+    dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
+) -> Any:
+  """Quantizes small activation lhs to keep QArray ragged dot memory-safe."""
+  lhs = _unwrap_with_aux(lhs, qwix_lora_module)
+  rhs = _unwrap_with_aux(rhs, qwix_lora_module)
+  if isinstance(lhs, qwix_lora_module.qarray.QArray):
+    return lhs
+  if not isinstance(rhs, qwix_lora_module.qarray.QArray):
+    return lhs
+  if not isinstance(lhs, jax.Array):
+    return lhs
+  if not jnp.issubdtype(lhs.dtype, jnp.floating):
+    return lhs
+
+  (lhs_contracting_axes, _), _ = dimension_numbers.dot_dimension_numbers
+  contracting = {int(axis) for axis in lhs_contracting_axes}
+  channelwise_axes = tuple(
+      axis for axis in range(len(lhs.shape)) if axis not in contracting
+  )
+  return qwix_lora_module.qarray.quantize(
+      lhs,
+      qwix_lora_module.qarray.HowToQuantize(
+          qtype="int8",
+          channelwise_axes=channelwise_axes,
+      ),
+  )
+
+
+def _is_linen_ragged_moe_weight(module: Any, name: str) -> bool:
+  if module.__class__.__name__ != "_Weight":
+    return False
+  if name != getattr(module, "weight_name", "w"):
+    return False
+  try:
+    path_parts = tuple(str(part) for part in module.path)
+  except AttributeError:
+    path_parts = (getattr(module, "name", "") or "",)
+  return len(path_parts) >= 2 and path_parts[-2:] in (
+      ("mlp", "gating_einsum"),
+      ("mlp", "linear"),
+      ("mlp2", "gating_einsum"),
+      ("mlp2", "linear"),
+  )
+
+
+def _ragged_moe_weight_how(module: Any, rule: Any, qarray_module: Any) -> Any:
+  path = "/".join(str(part) for part in module.path)
+  shape = tuple(int(dim) for dim in module.shape)
+  if path.endswith("/linear"):
+    contract_axis = 1
+  else:
+    contract_axis = len(shape) - 1
+  tiled_axes = {contract_axis: rule.tile_size} if rule.tile_size else {}
+  return qarray_module.HowToQuantize(
+      qtype=rule.weight_qtype,
+      channelwise_axes=tuple(
+          axis for axis in range(len(shape)) if axis != contract_axis
+      ),
+      tiled_axes=tiled_axes,
+      calibration_method=rule.weight_calibration_method,
+  )
 
 
 def quantized_base_leaf_paths(params: Mapping[str, Any]) -> tuple[str, ...]:

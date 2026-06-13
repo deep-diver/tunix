@@ -14,8 +14,9 @@ This directory is the runbook for the Tunix DiffusionGemma MVP integration.
 - Includes a tiny synthetic validation script that checks finite loss, LoRA-only updates, and checkpoint directory creation.
 - Includes a PubMedQA real-data LoRA SFT validation script that mirrors the official DeepMind PubMedQA split and prompt/answer formatting without importing Kauldron or Grain.
 - Includes an optional official Hackable Diffusion compatibility backend that keeps the official Flax/Linen + Kauldron SFT path intact and wraps it with a Tunix entrypoint for 2-GPU parity/resource checks.
+- Includes a Qwix-based LoRA replacement for the official Linen model surface via `lora_backend="qwix_lora"`. The official model, dataset, diffusion loss, encoder AR loss, trainstep, checkpoint restore, and sharding stay intact.
 - Includes a no-tuning generation demo with official-style confidence selection, annealed temperature, token-stability plus entropy early stopping, JSON trace export, and a self-contained HTML animation of every denoising frame.
-- The recommended H100 80GB x2 path is the official Hackable Diffusion backend wrapper: Tunix owns the entrypoint/config overrides/run telemetry, while the official backend owns the GPU-heavy model, dataset, loss, LoRA, checkpoint restore, train step, and sharding.
+- The recommended H100 80GB x2 path is the official Hackable Diffusion backend wrapper: Tunix owns the entrypoint/config overrides/run telemetry, while the official backend owns the GPU-heavy model, dataset, loss, checkpoint restore, train step, and sharding. LoRA can use either the official wrapper or Tunix/Qwix LoRA.
 - The native NNX/Qwix path completes a public 26B PubMedQA LoRA train step on H100 80GB x2 using the official prompt/canvas geometry (`prompt_len=1024`, `canvas_size=128`, `num_canvases=2`), TP=2, selected-canvas slice decoding, cuDNN local attention, full rematerialization, split encoder/decoder gradients, and the official-compatible ragged-MoE router LoRA target set. It is still experimental for multi-step H100x2 training.
 
 ## Current Limitations
@@ -30,6 +31,7 @@ This directory is the runbook for the Tunix DiffusionGemma MVP integration.
 - Decoder rematerialization is compatible with Qwix LoRA materialization in this MVP. The SFT adapter temporarily disables decoder remat while Qwix discovers LoRA targets, then restores remat for the actual forward/train path; GPU logs verify the same 366 LoRA leaves with `--remat_decoder`.
 - For public 26B validation runs, `scripts/run_diffusion_gemma_pubmedqa_tunix.py` defaults to a minimal `minimal_state.json` proof artifact instead of Tunix/Orbax optimizer checkpointing. Use `--orbax_checkpoint` only when the shape is known to fit; the public 26B optimizer checkpoint path can exceed memory.
 - The default LoRA target set is intentionally official-compatible for the ragged MoE implementation: Qwix handles regular attention/MLP/self-conditioner projections, and Tunix adds explicit router LoRA for `MoERagged.router_logits`. Raw expert weights (`gating_einsum`, `linear`) can be enabled with `--moe_lora_targets router_logits,gating_einsum,linear`, but that broader experimental path OOMs on H100x2 in the current implementation.
+- Qwix QLoRA is intentionally not exposed for DiffusionGemma. The Qwix bridge supports LoRA only; `lora_backend="qwix_qlora"` is rejected.
 
 ## Official Hackable Backend
 
@@ -41,7 +43,9 @@ overrides such as checkpoint path, workdir, LoRA rank, and training step count.
 
 This backend is intentionally not a rewrite. It preserves the official
 Flax/Linen model, Hackable Diffusion corruption/loss/sampling logic, Kauldron
-trainer, official LoRA wrapper, FSDP sharding, and dataset factories.
+trainer, FSDP sharding, and dataset factories. By default it also preserves the
+official LoRA wrapper. With `lora_backend="qwix_lora"`, it replaces only the
+official LoRA module with the Tunix/Qwix Linen LoRA bridge.
 
 For debugging environments where Kauldron's multi-GPU writer/final-sync path
 fails, `--train_loop hybrid` reuses the official model, dataset, optimizer, loss,
@@ -67,8 +71,23 @@ for the Tunix wrapper; last-50 total-loss means were `1.872822265625` and
 Local evidence is under
 `evidence/diffusion_gemma/h100x2_2000step_comparison_2026-06-13/`.
 
-Example PubMedQA validation command on a machine where the official repos are
-available:
+Latest Qwix LoRA-only H100x2 validation:
+
+- Machine: `426095` (`H100`, `IN2`, 2 GPUs, VM), left running per request.
+- Run: `r_05256f15`, exit `0`.
+- Backend: official DiffusionGemma Hackable Diffusion trainer objects with
+  `lora_backend=qwix_lora`, `train_loop=hybrid`, `sync_after_step=losses`,
+  `encoder_loss_token_chunk_size=128`, LoRA rank `4`.
+- Steps: `10/10` completed with finite `diffusion_loss`, `encoder_loss`, and
+  `total` loss.
+- Step 1 total loss: `13.511953353881836`; step 10 total loss:
+  `14.651562213897705`; min/max total loss over 10 steps:
+  `12.34370231628418` / `14.945141792297363`.
+- Qwix LoRA leaves after restore: `1092` leaves, about `0.0247GiB`.
+- Peak HBM: GPU0 `65665MiB`, GPU1 `65635MiB`.
+
+Example PubMedQA Qwix LoRA validation command on a machine where the official
+repos are available:
 
 ```bash
 python scripts/run_diffusion_gemma_official_backend.py \
@@ -77,10 +96,14 @@ python scripts/run_diffusion_gemma_official_backend.py \
   --hackable_diffusion_ref /tmp/hackable-diffusion-reference \
   --checkpoint_path /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it \
   --workdir /home/ubuntu/diffusion_gemma_official_pubmedqa_validation \
-  --num_train_steps 1 \
-  --checkpoint_every_n_steps 1 \
-  --config_override schedules.learning_rate.warmup_steps=0 \
-  --config_override schedules.learning_rate.decay_steps=1 \
+  --num_train_steps 2000 \
+  --run_steps 10 \
+  --lora_backend qwix_lora \
+  --train_loop hybrid \
+  --sync_after_step losses \
+  --log_losses \
+  --log_param_summary \
+  --encoder_loss_token_chunk_size 128 \
   --no-use_early_stopping \
   --disable_evals
 ```
@@ -106,6 +129,7 @@ trainer = OfficialDiffusionGemmaTrainer(
         workdir="/home/ubuntu/diffusion_gemma_pubmedqa_wrapper",
         num_train_steps=2000,
         lora_rank=4,
+        lora_backend="qwix_lora",
         train_loop="hybrid",
         sync_after_step="losses",
         log_losses=True,
