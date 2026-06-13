@@ -240,7 +240,9 @@ class _NoDebugAttrLoraProvider:
     class Provider(qwix_lora.LoraProvider):
 
       def einsum(self, einsum_str: str, *operands, **kwargs):  # pylint: disable=missing-function-docstring
-        res = super().einsum(einsum_str, *operands, **kwargs)
+        res = qwix_lora.ptq.PtqProvider.einsum(
+            self, einsum_str, *operands, **kwargs
+        )
 
         rule, _ = self._get_current_rule_and_op_id(
             "einsum", repeated_call=True
