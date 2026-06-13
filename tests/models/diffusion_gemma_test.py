@@ -815,6 +815,83 @@ class DiffusionGemmaTest(absltest.TestCase):
     self.assertEqual(restored_value.shape, model_value.shape)
     self.assertTrue(hasattr(restored_value.array, "qvalue"))
 
+  def test_qwix_apply_updates_keeps_quantized_base_frozen(self):
+    original_apply_updates = optax.apply_updates
+    original_patch_flag = hackable_adapter._QWIX_OPTAX_PATCHED  # pylint: disable=protected-access
+    original_optax_marker = getattr(
+        optax,
+        "_tunix_qwix_apply_updates_patched",
+        None,
+    )
+    original_optax_apply_updates = getattr(
+        optax,
+        "_tunix_original_apply_updates",
+        None,
+    )
+    if hasattr(optax, "_tunix_qwix_apply_updates_patched"):
+      delattr(optax, "_tunix_qwix_apply_updates_patched")
+    if hasattr(optax, "_tunix_original_apply_updates"):
+      delattr(optax, "_tunix_original_apply_updates")
+    hackable_adapter._QWIX_OPTAX_PATCHED = False  # pylint: disable=protected-access
+    try:
+      hackable_adapter._patch_qwix_optax_apply_updates()  # pylint: disable=protected-access
+      int_param = jnp.array([1, 2], dtype=jnp.int32)
+
+      def _constant_loss(value):
+        del value
+        return jnp.asarray(0.0, dtype=jnp.float32)
+
+      float0_update = jax.grad(_constant_loss, allow_int=True)(int_param)
+      params = {
+          "layer_0": {
+              "attn": {
+                  "q_einsum": {
+                      "kernel": int_param,
+                      "kernel_lora_a": jnp.ones((2,), dtype=jnp.float32),
+                  }
+              }
+          }
+      }
+      updates = {
+          "layer_0": {
+              "attn": {
+                  "q_einsum": {
+                      "kernel": float0_update,
+                      "kernel_lora_a": jnp.ones(
+                          (2,),
+                          dtype=jnp.float32,
+                      ),
+                  }
+              }
+          }
+      }
+
+      updated = optax.apply_updates(params, updates)
+
+      np.testing.assert_array_equal(
+          np.asarray(updated["layer_0"]["attn"]["q_einsum"]["kernel"]),
+          np.asarray(int_param),
+      )
+      np.testing.assert_allclose(
+          np.asarray(
+              updated["layer_0"]["attn"]["q_einsum"]["kernel_lora_a"]
+          ),
+          np.asarray([2.0, 2.0], dtype=np.float32),
+      )
+    finally:
+      optax.apply_updates = original_apply_updates
+      hackable_adapter._QWIX_OPTAX_PATCHED = original_patch_flag  # pylint: disable=protected-access
+      if original_optax_marker is None:
+        if hasattr(optax, "_tunix_qwix_apply_updates_patched"):
+          delattr(optax, "_tunix_qwix_apply_updates_patched")
+      else:
+        optax._tunix_qwix_apply_updates_patched = original_optax_marker
+      if original_optax_apply_updates is None:
+        if hasattr(optax, "_tunix_original_apply_updates"):
+          delattr(optax, "_tunix_original_apply_updates")
+      else:
+        optax._tunix_original_apply_updates = original_optax_apply_updates
+
   def test_sft_loss_is_finite(self):
     vocab_size = 32
     model = diffusion_model.DiffusionGemma_A26B_A4B(

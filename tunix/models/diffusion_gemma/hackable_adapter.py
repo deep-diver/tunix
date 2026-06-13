@@ -45,6 +45,7 @@ _RECIPE_MODULES = {
 
 _LOGGED_DEVICE_LOSS_KEYS: set[tuple[str, int]] = set()
 _QWIX_CHECKPOINTER_PATCHED = False
+_QWIX_OPTAX_PATCHED = False
 
 
 class OfficialBackendDependencyError(ImportError):
@@ -455,6 +456,7 @@ def _replace_resolved_lora_backend(
   if config.lora_backend == "official":
     return
   _patch_qwix_checkpoint_loader(config)
+  _patch_qwix_optax_apply_updates()
 
   model_candidates = _resolved_sft_model_candidates(trainer)
   if not model_candidates:
@@ -578,6 +580,20 @@ def _is_qwix_or_official_lora_path(path: str) -> bool:
   )
 
 
+def _jax_key_path_to_string(path: Sequence[Any]) -> str:
+  parts = []
+  for part in path:
+    if hasattr(part, "key"):
+      parts.append(str(part.key))
+    elif hasattr(part, "name"):
+      parts.append(str(part.name))
+    elif hasattr(part, "idx"):
+      parts.append(str(part.idx))
+    else:
+      parts.append(str(part))
+  return "/".join(parts)
+
+
 def _is_qwix_quantized_value(value: Any) -> bool:
   return hasattr(value, "array") and hasattr(value, "how")
 
@@ -605,6 +621,51 @@ def _delete_jax_arrays_in_tree(value: Any, jax_module: Any) -> None:
   for leaf in jax_module.tree_util.tree_leaves(value):
     if isinstance(leaf, jax_module.Array):
       leaf.delete()
+
+
+def _patch_qwix_optax_apply_updates() -> None:
+  """Keeps Qwix LoRA/QLoRA base params frozen during Optax updates."""
+  global _QWIX_OPTAX_PATCHED
+  if _QWIX_OPTAX_PATCHED:
+    return
+  try:
+    import jax  # pylint: disable=g-import-not-at-top
+    import jax.numpy as jnp  # pylint: disable=g-import-not-at-top
+    import optax  # pylint: disable=g-import-not-at-top
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    raise OfficialBackendDependencyError(
+        "Qwix LoRA update patching requires jax and optax."
+    ) from exc
+
+  if getattr(optax, "_tunix_qwix_apply_updates_patched", False):
+    _QWIX_OPTAX_PATCHED = True
+    return
+
+  def apply_updates(params, updates):
+
+    def _apply_one(path, param, update):
+      if param is None:
+        return None
+      path_str = _jax_key_path_to_string(path)
+      if not _is_qwix_or_official_lora_path(path_str):
+        return param
+      if update is None:
+        return param
+      return jnp.asarray(param + update).astype(jnp.asarray(param).dtype)
+
+    return jax.tree_util.tree_map_with_path(_apply_one, params, updates)
+
+  optax._tunix_original_apply_updates = optax.apply_updates
+  optax.apply_updates = apply_updates
+  optax._tunix_qwix_apply_updates_patched = True
+  _QWIX_OPTAX_PATCHED = True
+  print(
+      _json_dumps({
+          "event": "official_backend_qwix_optax_apply_updates_patched",
+          "update_predicate": "official_or_qwix_lora_only",
+      }),
+      flush=True,
+  )
 
 
 def _patch_qwix_checkpoint_loader(config: OfficialSFTConfig) -> None:
