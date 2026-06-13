@@ -741,6 +741,80 @@ class DiffusionGemmaTest(absltest.TestCase):
 
     self.assertTrue(bool(jnp.any(before != after)))
 
+  def test_qwix_lora_paths_are_checkpoint_lora_paths(self):
+    self.assertTrue(
+        hackable_adapter._is_qwix_or_official_lora_path(  # pylint: disable=protected-access
+            "layer_0/attn/q_einsum/w_lora_a"
+        )
+    )
+    self.assertTrue(
+        hackable_adapter._is_qwix_or_official_lora_path(  # pylint: disable=protected-access
+            "layer_0/attn/q_einsum/w_lora_b"
+        )
+    )
+    self.assertTrue(
+        hackable_adapter._is_qwix_or_official_lora_path(  # pylint: disable=protected-access
+            "layer_0/attn/q_einsum/lora/a"
+        )
+    )
+    self.assertFalse(
+        hackable_adapter._is_qwix_or_official_lora_path(  # pylint: disable=protected-access
+            "layer_0/attn/q_einsum/w"
+        )
+    )
+
+  def test_qwix_qlora_checkpoint_values_stay_quantized(self):
+    model = linen_qwix_lora.apply_qlora_to_linen_model(
+        _ToyLinenDiffusionGemmaMethods(),
+        rank=2,
+        alpha=4.0,
+        weight_qtype="int4",
+    )
+    x = jnp.ones((1, 4), dtype=jnp.float32)
+    variables = model.init(jax.random.PRNGKey(0), x)
+    flat = flax.traverse_util.flatten_dict(variables["params"], sep="/")
+    base_path, model_value = next(
+        (path, value)
+        for path, value in flat.items()
+        if hackable_adapter._is_qwix_quantized_value(value)  # pylint: disable=protected-access
+    )
+    checkpoint_value = jnp.ones(model_value.shape, dtype=jnp.float32)
+
+    restored_value = hackable_adapter._checkpoint_value_for_model_value(  # pylint: disable=protected-access
+        model_value,
+        checkpoint_value,
+    )
+    model_param_spec = jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(
+            dtype=leaf.dtype,
+            shape=leaf.shape,
+            sharding=leaf.sharding,
+        ),
+        variables["params"],
+    )
+    spec_value = flax.traverse_util.flatten_dict(
+        model_param_spec,
+        sep="/",
+    )[base_path]
+    restored_device_value = jax.tree.map(
+        lambda value, spec: jax.device_put(
+            value.astype(spec.dtype),
+            device=spec.sharding,
+        ),
+        restored_value,
+        spec_value,
+    )
+
+    self.assertEqual(base_path, "layer_0/attn/q_einsum/kernel")
+    self.assertTrue(
+        hackable_adapter._is_qwix_quantized_value(restored_value)  # pylint: disable=protected-access
+    )
+    self.assertTrue(
+        hackable_adapter._is_qwix_quantized_value(restored_device_value)  # pylint: disable=protected-access
+    )
+    self.assertEqual(restored_value.shape, model_value.shape)
+    self.assertTrue(hasattr(restored_value.array, "qvalue"))
+
   def test_sft_loss_is_finite(self):
     vocab_size = 32
     model = diffusion_model.DiffusionGemma_A26B_A4B(

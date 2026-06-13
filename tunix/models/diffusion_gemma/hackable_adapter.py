@@ -44,6 +44,7 @@ _RECIPE_MODULES = {
 }
 
 _LOGGED_DEVICE_LOSS_KEYS: set[tuple[str, int]] = set()
+_QWIX_CHECKPOINTER_PATCHED = False
 
 
 class OfficialBackendDependencyError(ImportError):
@@ -453,6 +454,7 @@ def _replace_resolved_lora_backend(
   """Replaces the resolved official LoRA module with a Qwix Linen bridge."""
   if config.lora_backend == "official":
     return
+  _patch_qwix_checkpoint_loader(config)
 
   model_candidates = _resolved_sft_model_candidates(trainer)
   if not model_candidates:
@@ -565,6 +567,197 @@ def _load_linen_qwix_lora_module():
   sys.modules[spec.name] = module
   spec.loader.exec_module(module)
   return module
+
+
+def _is_qwix_or_official_lora_path(path: str) -> bool:
+  leaf = path.rsplit("/", 1)[-1]
+  return (
+      "/lora/" in path
+      or leaf.endswith("_lora_a")
+      or leaf.endswith("_lora_b")
+  )
+
+
+def _is_qwix_quantized_value(value: Any) -> bool:
+  return hasattr(value, "array") and hasattr(value, "how")
+
+
+def _checkpoint_value_for_model_value(
+    model_value: Any,
+    checkpoint_value: Any,
+) -> Any:
+  """Converts checkpoint leaves to the model leaf shape for Qwix QLoRA."""
+  if not _is_qwix_quantized_value(model_value):
+    return checkpoint_value
+  try:
+    qwix_ptq = importlib.import_module("qwix._src.providers.ptq")
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    raise OfficialBackendDependencyError(
+        "Qwix QLoRA checkpoint restore requires qwix."
+    ) from exc
+  return qwix_ptq.WithAux(
+      qwix_ptq.qarray.quantize(checkpoint_value, model_value.how),
+      model_value.how,
+  )
+
+
+def _delete_jax_arrays_in_tree(value: Any, jax_module: Any) -> None:
+  for leaf in jax_module.tree_util.tree_leaves(value):
+    if isinstance(leaf, jax_module.Array):
+      leaf.delete()
+
+
+def _patch_qwix_checkpoint_loader(config: OfficialSFTConfig) -> None:
+  """Extends the official memory-safe loader for Qwix LoRA/QLoRA leaves."""
+  del config
+  global _QWIX_CHECKPOINTER_PATCHED
+  if _QWIX_CHECKPOINTER_PATCHED:
+    return
+
+  try:
+    gemma_checkpointer = importlib.import_module(
+        "gemma.diffusion.hackable_diffusion_adapter.hd.gemma_checkpointer"
+    )
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    raise OfficialBackendDependencyError(
+        "Could not import the official DiffusionGemma checkpointer for Qwix "
+        "checkpoint compatibility patching."
+    ) from exc
+
+  if getattr(gemma_checkpointer, "_tunix_qwix_patch_applied", False):
+    _QWIX_CHECKPOINTER_PATCHED = True
+    return
+
+  def _remap_and_match_params(
+      model_flat: dict[str, Any],
+      ckpt_flat: dict[str, Any],
+      lora_init_values: dict[str, Any] | None = None,
+  ) -> dict[str, Any]:
+    if lora_init_values is None:
+      lora_init_values = {}
+
+    remapped_ckpt = {}
+    for ckpt_path, value in ckpt_flat.items():
+      if ckpt_path.endswith("/w"):
+        stripped = ckpt_path.rsplit("/w", 1)[0]
+        if stripped in model_flat and ckpt_path not in model_flat:
+          remapped_ckpt[stripped] = value
+          continue
+      remapped_ckpt[ckpt_path] = value
+
+    loaded_count = 0
+    for path, model_value in model_flat.items():
+      if path in remapped_ckpt:
+        model_flat[path] = _checkpoint_value_for_model_value(
+            model_value, remapped_ckpt[path]
+        )
+        loaded_count += 1
+
+    for key, value in lora_init_values.items():
+      model_flat[key] = value
+
+    ckpt_only = set(remapped_ckpt) - set(model_flat)
+    if ckpt_only:
+      gemma_checkpointer.logging.warning(
+          "Discarding %d checkpoint-only key(s) not present in the model: %s",
+          len(ckpt_only),
+          sorted(ckpt_only),
+      )
+
+    model_only = set(model_flat) - set(remapped_ckpt)
+    lora_keys = {
+        key for key in model_only if _is_qwix_or_official_lora_path(key)
+    }
+    non_lora_model_only = model_only - lora_keys
+    if lora_keys:
+      gemma_checkpointer.logging.info(
+          "Keeping %d LoRA key(s) with their initialized values.",
+          len(lora_keys),
+      )
+    if non_lora_model_only:
+      raise KeyError(
+          f"Found {len(non_lora_model_only)} model-only key(s) "
+          f"(excluding LoRA): {sorted(non_lora_model_only)}"
+      )
+
+    gemma_checkpointer.logging.info(
+        "Checkpoint loading complete: %d params loaded, "
+        "%d checkpoint-only (discarded).",
+        loaded_count,
+        len(ckpt_only),
+    )
+    return model_flat
+
+  def cheaply_load_params(params_from_state, checkpoint_path):
+    existing = params_from_state
+    model_param_spec = (
+        gemma_checkpointer._convert_to_element_spec_with_sharding(existing)  # pylint: disable=protected-access
+    )
+
+    existing_flat_arrays = gemma_checkpointer.flax.traverse_util.flatten_dict(
+        existing, sep="/"
+    )
+    lora_init_values = {
+        key: value
+        for key, value in existing_flat_arrays.items()
+        if _is_qwix_or_official_lora_path(key)
+    }
+
+    for key, value in existing_flat_arrays.items():
+      if key not in lora_init_values:
+        _delete_jax_arrays_in_tree(value, gemma_checkpointer.jax)
+
+    with gemma_checkpointer.jax.default_device(
+        gemma_checkpointer.jax.devices("cpu")[0]
+    ):
+
+      def _make_empty_cpu_array(spec):
+        return gemma_checkpointer.jnp.empty(
+            spec.shape,
+            spec.dtype,
+            device=gemma_checkpointer.jax.devices("cpu")[0],
+        )
+
+      ckpt = gemma_checkpointer.ocp.PyTreeCheckpointer()
+      metadata = ckpt.metadata(checkpoint_path)
+      lparams_empty = gemma_checkpointer.jax.tree.map(
+          _make_empty_cpu_array, metadata.item_metadata.tree
+      )
+      gemma_params = ckpt.restore(checkpoint_path, item=lparams_empty)
+
+    existing_flat = gemma_checkpointer.flax.traverse_util.flatten_dict(
+        model_param_spec, sep="/"
+    )
+    ckpt_flat = gemma_checkpointer.flax.traverse_util.flatten_dict(
+        gemma_params, sep="/"
+    )
+    existing_flat = _remap_and_match_params(
+        existing_flat, ckpt_flat, lora_init_values
+    )
+    merged = gemma_checkpointer.flax.traverse_util.unflatten_dict(
+        existing_flat, sep="/"
+    )
+
+    return gemma_checkpointer.jax.tree.map(
+        lambda x, y: gemma_checkpointer.jax.device_put(
+            x.astype(y.dtype), device=y.sharding
+        ),
+        merged,
+        model_param_spec,
+    )
+
+  gemma_checkpointer._remap_and_match_params = _remap_and_match_params  # pylint: disable=protected-access
+  gemma_checkpointer.cheaply_load_params = cheaply_load_params
+  gemma_checkpointer._tunix_qwix_patch_applied = True
+  _QWIX_CHECKPOINTER_PATCHED = True
+  print(
+      _json_dumps({
+          "event": "official_backend_qwix_checkpoint_loader_patched",
+          "lora_key_predicate": "official_or_qwix",
+          "qlora_restore": "quantize_checkpoint_value_like_model",
+      }),
+      flush=True,
+  )
 
 
 def _call_get_config(module: Any, config: OfficialSFTConfig):
