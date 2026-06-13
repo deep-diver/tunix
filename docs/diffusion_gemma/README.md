@@ -57,6 +57,16 @@ DiffusionGemma CUDA13 NCCL/XLA settings, and addressable loss-shard
 synchronization. Latest evidence is in
 `evidence/diffusion_gemma/h100x2_cuda13_preinit_2026-06-12.md`.
 
+The longer matched H100 80GB x2 comparison also completed successfully: the
+official reference run (`r_5c5a20f2`) and Tunix wrapper run (`r_014dadd5`) both
+finished `2000/2000` PubMedQA LoRA steps with the same official revisions,
+`jax[cuda13]==0.10.1`, `train_loop=hybrid`, and `sync_after_step=losses`.
+Final total loss was `2.07421875` for the official reference and `2.099609375`
+for the Tunix wrapper; last-50 total-loss means were `1.872822265625` and
+`1.87337890625`. Peak HBM was effectively identical at about `65.6GB` per GPU.
+Local evidence is under
+`evidence/diffusion_gemma/h100x2_2000step_comparison_2026-06-13/`.
+
 Example PubMedQA validation command on a machine where the official repos are
 available:
 
@@ -98,10 +108,33 @@ trainer = OfficialDiffusionGemmaTrainer(
         lora_rank=4,
         train_loop="hybrid",
         sync_after_step="losses",
+        log_losses=True,
+        save_final_checkpoint=True,
         disable_evals=True,
     )
 )
 trainer.train()
+```
+
+To restore a saved wrapper checkpoint and generate a sample:
+
+```bash
+python scripts/generate_diffusion_gemma_official_backend.py \
+  --gemma_ref /home/ubuntu/gemma_official_reference \
+  --hackable_diffusion_ref /home/ubuntu/hackable_diffusion_reference \
+  --workdir /home/ubuntu/diffusion_gemma_pubmedqa_wrapper \
+  --checkpoint_path /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it \
+  --step 2000 \
+  --denoising_steps 8 \
+  --max_num_canvases 1 \
+  --tokenizer_path /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model \
+  --output_json generation.json \
+  --trace_json generation_trace.json
+python scripts/render_diffusion_gemma_trace_gif.py generation_trace.json \
+  --output diffusion_gemma_tuned_generation.gif \
+  --width 1280 \
+  --height 720 \
+  --final_hold_frames 3
 ```
 
 Latest A100-80GB x2 official-backend check:

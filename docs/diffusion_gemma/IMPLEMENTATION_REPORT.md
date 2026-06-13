@@ -21,6 +21,8 @@ is the official Hackable Diffusion backend wrapped by Tunix.
 - `scripts/run_diffusion_gemma_official_backend.py`
 - `scripts/run_diffusion_gemma_official_reference.py`
 - `scripts/run_diffusion_gemma_h100x2_comparison_job.sh`
+- `scripts/generate_diffusion_gemma_official_backend.py`
+- `scripts/render_diffusion_gemma_trace_gif.py`
 - `scripts/summarize_diffusion_gemma_training.py`
 
 ## What The Wrapper Does
@@ -59,10 +61,30 @@ trainer = OfficialDiffusionGemmaTrainer(
         lora_rank=4,
         train_loop="hybrid",
         sync_after_step="losses",
+        log_losses=True,
+        save_final_checkpoint=True,
         disable_evals=True,
     )
 )
 trainer.train()
+```
+
+Equivalent CLI usage for the validated H100 x2 recipe:
+
+```bash
+SAVE_FINAL_CHECKPOINT=true \
+TRAIN_LOOP=hybrid \
+LOG_LOSSES=true \
+SYNC_AFTER_STEP=losses \
+XLA_FLAGS="--xla_disable_hlo_passes=constant_folding" \
+bash scripts/run_diffusion_gemma_h100x2_comparison_job.sh \
+  --mode tunix \
+  --max_runtime_seconds 10800 \
+  --num_train_steps 2000 \
+  --log_losses true \
+  --sync_after_step losses \
+  --jax_package_spec "jax[cuda13]==0.10.1" \
+  --run_name tunix_wrapper_2000step
 ```
 
 ## Local Parity Evidence
@@ -87,7 +109,7 @@ The local parity checks pass against official source checkouts:
 These checks validate the deterministic helper and tiny-model math paths. They
 do not prove full 26B training completion.
 
-## H100 x2 Comparison
+## H100 x2 One-Step Bring-Up
 
 One H100 x2 JarvisLabs VM was used for sequential official-vs-wrapper
 validation:
@@ -126,12 +148,83 @@ Evidence is stored in
 `evidence/diffusion_gemma/h100x2_cuda13_preinit_2026-06-12.md` and the sibling
 JSON/CSV artifacts.
 
+## H100 x2 2000-Step Comparison
+
+The longer comparison was run under matched H100 80GB x2 conditions with the
+same official Gemma and Hackable Diffusion revisions:
+
+- Official Gemma revision:
+  `a7e33454206ca24984565992f5c903191baecc22`
+- Hackable Diffusion revision:
+  `03ce88ed0acec3b17f4f284502a6053c5f2b3a15`
+- JAX package: `jax[cuda13]==0.10.1`
+- Training loop: `hybrid`
+- Loss synchronization: `sync_after_step=losses`
+- Public recipe: PubMedQA, batch size `2`, LoRA rank `4`, prompt length
+  `1024`, two canvases of size `128`, `2000` train steps
+
+Both runs completed all `2000` steps with finite losses and no OOM, NCCL,
+traceback, or runtime-error events in the logs:
+
+| Path | Run id | Steps | First total | Final total | Last-50 total mean | Peak HBM |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Official reference | `r_5c5a20f2` | `2000` | `13.921875` | `2.07421875` | `1.872822265625` | `65661/65631` MiB |
+| Tunix wrapper | `r_014dadd5` | `2000` | `13.921875` | `2.099609375` | `1.87337890625` | `65659/65629` MiB |
+
+The first loss is identical. The final total-loss delta is `0.025390625`
+(`~1.22%` of the official final loss), while the last-50 total-loss means differ
+by only `0.000556640625`. Peak memory is effectively identical.
+
+The runs are independent stochastic training jobs, so exact step-by-step loss
+identity is not expected. The result is practical training parity for the
+official-backend wrapper: same recipe, same backend revisions, same runtime
+knobs, same 2-GPU HBM profile, same successful 2000-step completion.
+
+Local artifacts for this comparison are under
+`evidence/diffusion_gemma/h100x2_2000step_comparison_2026-06-13/`.
+
+## Generation From A Tuned Checkpoint
+
+The wrapper includes a generation helper for checkpoints produced by the
+official backend path:
+
+```bash
+python scripts/generate_diffusion_gemma_official_backend.py \
+  --gemma_ref /home/ubuntu/gemma_official_reference \
+  --hackable_diffusion_ref /home/ubuntu/hackable_diffusion_reference \
+  --workdir /home/ubuntu/diffusion_gemma_run/workdir \
+  --checkpoint_path /home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it \
+  --step 2000 \
+  --denoising_steps 8 \
+  --max_num_canvases 1 \
+  --tokenizer_path /home/ubuntu/checkpoints/tokenizers/tokenizer_gemma4.model \
+  --output_json generation.json \
+  --trace_json generation_trace.json
+```
+
+`generation.json` records the decoded prompt and generated text. The optional
+`generation_trace.json` can be rendered as a GIF:
+
+```bash
+python scripts/render_diffusion_gemma_trace_gif.py generation_trace.json \
+  --output diffusion_gemma_tuned_generation.gif \
+  --width 1280 \
+  --height 720 \
+  --final_hold_frames 3
+```
+
+The trace uses the generated token ids from the restored checkpoint. Intermediate
+frames are a denoising-style reveal visualization because the current official
+AR sampler returns final generated tokens but does not expose every internal
+diffusion trajectory frame.
+
 ## Current Verdict
 
 The wrapper correctly imports, configures, and executes the official
 DiffusionGemma backend on H100 x2 when the official CUDA13/JAX runtime guidance
 is applied. It matches official helper/logit parity checks locally and completes
-a real 26B PubMedQA LoRA train step through the Tunix wrapper path.
+matched 2000-step 26B PubMedQA LoRA training through the Tunix wrapper path with
+near-identical loss and memory behavior to the official reference runner.
 
 Treat this integration as a practical official-backend wrapper plus parity
 scaffold. For H100 x2 use, prefer the wrapper path. The native NNX/Qwix path is
@@ -142,7 +235,5 @@ experimental for multi-step public 26B training on H100 80GB x2.
 
 - Add a shared-seed deterministic GPU comparison if exact stochastic loss parity
   is required.
-- Compare the hybrid wrapper against a longer official Kauldron run now that the
-  CUDA13/JAX preinit setup is known-good.
 - Keep the official wrapper as the oracle while native NNX/Qwix memory work
   continues.
