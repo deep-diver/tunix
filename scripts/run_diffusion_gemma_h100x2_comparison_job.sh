@@ -233,6 +233,7 @@ fi
 
 python -m pip install -e "${HACKABLE_DIFFUSION_REF}"
 python -m pip install -e "${GEMMA_REF}"
+python -m pip install -e "${REPO_ROOT}"
 python -m pip uninstall -y \
   jax \
   jaxlib \
