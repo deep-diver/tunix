@@ -658,6 +658,23 @@ def _block_until_ready_first(value: Any) -> None:
     leaves[0].block_until_ready()
 
 
+def _host_scalar_tree(value: Any) -> Any:
+  def _to_host_scalar(leaf: Any) -> Any:
+    leaf = jax.device_get(leaf)
+    array = np.asarray(leaf)
+    if array.shape:
+      return {"shape": tuple(array.shape), "dtype": str(array.dtype)}
+    if array.dtype == np.bool_:
+      return bool(array)
+    if np.issubdtype(array.dtype, np.integer):
+      return int(array)
+    if np.issubdtype(array.dtype, np.floating):
+      return float(array)
+    return array.item()
+
+  return jax.tree.map(_to_host_scalar, value)
+
+
 def _base_param_state(model: nnx.Module) -> Any:
   return nnx.state(
       model, nnx.filterlib.All(nnx.Param, nnx.filterlib.Not(nnx.LoRAParam))
@@ -694,6 +711,7 @@ def _train_with_separate_loss_jits(
     diffusion_config: diffusion_sft.DiffusionGemmaSFTConfig,
     max_runtime_seconds: float = 0.0,
     gradient_accumulation_steps: int | None = None,
+    clear_caches_between_steps: bool = False,
 ) -> bool:
   """Runs exact split-gradient training with separate JAX executables."""
   accumulation_steps = gradient_accumulation_steps or 1
@@ -798,9 +816,16 @@ def _train_with_separate_loss_jits(
       precompute_self_conditioning_prefill_step
   )
   precompute_self_conditioning_decode_step = nnx.jit(
-      precompute_self_conditioning_decode_step
+      precompute_self_conditioning_decode_step,
+      donate_argnames=("prefill",),
   )
-  decoder_grad_step = nnx.jit(decoder_grad_step)
+  decoder_grad_step = nnx.jit(
+      decoder_grad_step,
+      donate_argnames=(
+          "precomputed_sc_logits",
+          "precomputed_self_conditioning_mask",
+      ),
+  )
   encoder_grad_step = nnx.jit(encoder_grad_step)
   apply_split_grad_step = nnx.jit(
       apply_split_grad_step,
@@ -931,7 +956,20 @@ def _train_with_separate_loss_jits(
         encoder_aux_total = jax.tree.map(
             jnp.add, encoder_aux_total, encoder_aux_scaled
         )
-      del encoder_grads, decoder_grads, micro_grads
+      del (
+          encoder_loss,
+          encoder_aux,
+          encoder_grads,
+          decoder_loss,
+          decoder_aux,
+          decoder_grads,
+          micro_grads,
+          decoder_loss_scaled,
+          encoder_loss_scaled,
+          total_loss_scaled,
+          decoder_aux_scaled,
+          encoder_aux_scaled,
+      )
 
     if accumulated_grads is None:
       raise RuntimeError("No gradients were accumulated.")
@@ -952,15 +990,18 @@ def _train_with_separate_loss_jits(
           phase="apply_split_grad",
           elapsed_seconds=time.monotonic() - phase_started,
       )
-    aux = dict(decoder_aux_total)
-    aux["encoder_loss"] = encoder_aux_total["encoder_loss"]
-    trainer.last_train_aux = aux
-    trainer.last_train_loss = loss
-    trainer._iter_steps += 1
-    trainer._train_steps += 1
     total_value = float(jax.device_get(loss))
     decoder_value = float(jax.device_get(decoder_loss_total))
     encoder_value = float(jax.device_get(encoder_loss_total))
+    aux = dict(decoder_aux_total)
+    aux["encoder_loss"] = encoder_aux_total["encoder_loss"]
+    trainer.last_train_aux = _host_scalar_tree(aux)
+    trainer.last_train_loss = total_value
+    trainer._iter_steps += 1
+    trainer._train_steps += 1
+    grad_norm_value = float(jax.device_get(grad_norm))
+    trainable_grad_norm_value = float(jax.device_get(trainable_grad_norm))
+    update_norm_value = float(jax.device_get(update_norm))
     _log(
         "separate_loss_jit_step",
         step=step + 1,
@@ -968,9 +1009,9 @@ def _train_with_separate_loss_jits(
         loss=total_value,
         decoder_loss=decoder_value,
         encoder_loss=encoder_value,
-        grad_norm=float(jax.device_get(grad_norm)),
-        trainable_grad_norm=float(jax.device_get(trainable_grad_norm)),
-        update_norm=float(jax.device_get(update_norm)),
+        grad_norm=grad_norm_value,
+        trainable_grad_norm=trainable_grad_norm_value,
+        update_norm=update_norm_value,
     )
     for metric, value in (
         ("losses/diffusion_loss", decoder_value),
@@ -984,13 +1025,33 @@ def _train_with_separate_loss_jits(
           step=trainer.train_steps,
           loop_step=step,
       )
-    if max_runtime_seconds and time.monotonic() - start_time >= max_runtime_seconds:
+    reached_max_runtime = (
+        max_runtime_seconds and time.monotonic() - start_time >= max_runtime_seconds
+    )
+    if reached_max_runtime:
       timed_out = True
       _log(
           "native_max_runtime_reached",
           step=trainer.train_steps,
           max_runtime_seconds=max_runtime_seconds,
       )
+    del (
+        loss,
+        grad_norm,
+        trainable_grad_norm,
+        update_norm,
+        decoder_loss_total,
+        encoder_loss_total,
+        total_loss_total,
+        decoder_aux_total,
+        encoder_aux_total,
+        aux,
+    )
+    gc.collect()
+    if clear_caches_between_steps:
+      jax.clear_caches()
+      _log("jax_caches_cleared_between_steps", step=trainer.train_steps)
+    if reached_max_runtime:
       break
   return timed_out
 
@@ -1356,6 +1417,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         diffusion_config,
         max_runtime_seconds=args.max_runtime_seconds,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        clear_caches_between_steps=args.clear_caches_between_steps,
     )
   else:
     trainer.train(train_batches, cache_nnx_graph=False)
@@ -1417,6 +1479,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       "encoder_loss_chunk_size": args.encoder_loss_chunk_size,
       "split_loss_gradients": args.split_loss_gradients,
       "separate_loss_jits": args.separate_loss_jits,
+      "clear_caches_between_steps": args.clear_caches_between_steps,
       "precomputed_self_conditioning": args.separate_loss_jits,
       "max_runtime_seconds": args.max_runtime_seconds,
       "timed_out": timed_out,
@@ -1500,6 +1563,16 @@ def parse_args() -> argparse.Namespace:
           "Clear JAX compilation caches after the optional initial loss check "
           "so memory-constrained train-step executables do not coexist with "
           "the pre-train loss executable."
+      ),
+  )
+  parser.add_argument(
+      "--clear_caches_between_steps",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Clear JAX compilation caches at each step boundary in "
+          "--separate_loss_jits mode. This is slower, but can be useful for "
+          "memory-constrained long H100x2 validation runs."
       ),
   )
   parser.add_argument("--steps", type=int, default=2)
