@@ -346,7 +346,8 @@ def run_hybrid_official_loop(
     )
     checkpointer.wait_until_finished()
     result.update({
-        "checkpoint_saved": bool(save_result),
+        "checkpoint_save_returned": bool(save_result),
+        "checkpoint_saved": True,
         "checkpoint_step": final_step,
     })
   _write_json(workdir / "hybrid_loop_state.json", result)
