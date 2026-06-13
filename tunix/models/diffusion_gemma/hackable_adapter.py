@@ -85,6 +85,9 @@ class OfficialSFTConfig:
       strict device-state block. `losses` synchronizes by reading addressable
       loss shards only, avoiding full host all-gathers. `none` only dispatches
       the official step.
+    save_final_checkpoint: If true, the hybrid loop writes a forced final
+      Kauldron checkpoint after the last train step. This is disabled by
+      default to preserve the lowest-memory validation path.
     train_loop: Training loop implementation. `kauldron` delegates to the
       official `Trainer.train()`. `hybrid` uses the official resolved model,
       data, checkpoint loader, sharding, train step, optimizer, and LoRA mask,
@@ -113,6 +116,7 @@ class OfficialSFTConfig:
   skip_step_metrics: bool = False
   log_losses: bool = True
   sync_after_step: str = "state"
+  save_final_checkpoint: bool = False
   train_loop: str = "kauldron"
   use_early_stopping: bool | None = None
   disable_evals: bool = False
@@ -211,6 +215,7 @@ class OfficialDiffusionGemmaTrainer:
           num_steps=self.config.run_steps or self.config.num_train_steps or 1,
           log_losses=self.config.log_losses,
           sync_after_step=self.config.sync_after_step,
+          save_final_checkpoint=self.config.save_final_checkpoint,
       )
     if self.config.train_loop != "kauldron":
       raise ValueError(
@@ -228,6 +233,7 @@ def run_hybrid_official_loop(
     num_steps: int,
     log_losses: bool = True,
     sync_after_step: str = "state",
+    save_final_checkpoint: bool = False,
 ) -> dict[str, Any]:
   """Runs official DiffusionGemma train steps without Kauldron loop syncs."""
   if num_steps < 1:
@@ -328,6 +334,21 @@ def run_hybrid_official_loop(
       "workdir": str(workdir),
       "state_step": num_steps,
   }
+  if save_final_checkpoint:
+    final_step = _safe_train_step(getattr(state, "step", num_steps), num_steps)
+    checkpoint_state = train_loop.checkpoint_state.CheckpointState(
+        state, chrono, ds_iter
+    )
+    save_result = checkpointer.save(
+        checkpoint_state,
+        step=final_step,
+        force=True,
+    )
+    checkpointer.wait_until_finished()
+    result.update({
+        "checkpoint_saved": bool(save_result),
+        "checkpoint_step": final_step,
+    })
   _write_json(workdir / "hybrid_loop_state.json", result)
   print(_json_dumps(result), flush=True)
   return result
@@ -662,6 +683,13 @@ def _safe_array_scalar(value: Any) -> float:
   if host_value.size == 0:
     return 0.0
   return float(host_value.reshape(-1)[0])
+
+
+def _safe_train_step(value: Any, fallback: int) -> int:
+  try:
+    return int(_safe_array_scalar(value))
+  except Exception:  # pylint: disable=broad-exception-caught
+    return fallback
 
 
 def _jax_path_to_string(path: Any) -> str:

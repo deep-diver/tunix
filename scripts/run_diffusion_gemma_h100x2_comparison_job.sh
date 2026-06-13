@@ -95,6 +95,7 @@ XLA_FLAGS="${XLA_FLAGS:---xla_disable_hlo_passes=constant_folding}"
 TRAIN_LOOP="${TRAIN_LOOP:-hybrid}"
 LOG_LOSSES="${CLI_LOG_LOSSES:-${LOG_LOSSES:-true}}"
 SYNC_AFTER_STEP="${CLI_SYNC_AFTER_STEP:-${SYNC_AFTER_STEP:-state}}"
+SAVE_FINAL_CHECKPOINT="${SAVE_FINAL_CHECKPOINT:-false}"
 
 python_version_ok() {
   "$1" - <<'PY' >/dev/null 2>&1
@@ -300,6 +301,10 @@ else
 fi
 
 COMMON_ARGS+=(--sync_after_step "${SYNC_AFTER_STEP}")
+
+if [[ "${MODE}" == "tunix" ]] && [[ "${SAVE_FINAL_CHECKPOINT}" == "true" || "${SAVE_FINAL_CHECKPOINT}" == "1" ]]; then
+  COMMON_ARGS+=(--save_final_checkpoint)
+fi
 
 if [[ "${MODE}" == "upstream" ]]; then
   RUNNER=(

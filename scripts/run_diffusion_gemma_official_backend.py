@@ -149,6 +149,15 @@ def parse_args() -> argparse.Namespace:
       ),
   )
   parser.add_argument(
+      "--save_final_checkpoint",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "In the hybrid loop, force-save the final Kauldron checkpoint after "
+          "the last train step. This is useful for post-train generation."
+      ),
+  )
+  parser.add_argument(
       "--train_loop",
       choices=["kauldron", "hybrid"],
       default="kauldron",
@@ -195,6 +204,7 @@ def main() -> None:
       skip_step_metrics=args.skip_step_metrics,
       log_losses=args.log_losses,
       sync_after_step=args.sync_after_step,
+      save_final_checkpoint=args.save_final_checkpoint,
       train_loop=args.train_loop,
       use_early_stopping=args.use_early_stopping,
       disable_evals=args.disable_evals,
