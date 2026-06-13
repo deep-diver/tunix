@@ -27,6 +27,7 @@ import dataclasses
 from typing import Any
 
 import flax.traverse_util
+import jax
 import jax.numpy as jnp
 
 try:
@@ -120,7 +121,7 @@ def create_linen_lora_provider(
     kwargs["weight_calibration_method"] = weight_calibration_method
   if act_calibration_method is not None:
     kwargs["act_calibration_method"] = act_calibration_method
-  return qwix.LoraProvider(**kwargs)
+  return _NoDebugAttrLoraProvider(**kwargs)
 
 
 def create_linen_lora_provider_from_config(config: LinenQwixLoRAConfig):
@@ -216,6 +217,76 @@ def _apply_provider_to_linen_model(
   import qwix  # pylint: disable=g-import-not-at-top
 
   return qwix.apply_lora_to_model(model, provider, methods=tuple(methods))
+
+
+def _qwix_lora_module():
+  import qwix._src.providers.lora as qwix_lora  # pylint: disable=g-import-not-at-top
+
+  return qwix_lora
+
+
+class _NoDebugAttrLoraProvider:
+  """Qwix LoRA provider that does not mutate frozen Linen modules for debug.
+
+  Qwix's standard Linen einsum path stores ``*_lora_einsum_str`` on the current
+  module for debugging. Official Gemma custom Linen modules can be frozen at
+  that interception point, so this bridge keeps Qwix's math and parameter
+  creation but skips that debug-only attribute write.
+  """
+
+  def __new__(cls, *args, **kwargs):
+    qwix_lora = _qwix_lora_module()
+
+    class Provider(qwix_lora.LoraProvider):
+
+      def einsum(self, einsum_str: str, *operands, **kwargs):  # pylint: disable=missing-function-docstring
+        res = super().einsum(einsum_str, *operands, **kwargs)
+
+        rule, _ = self._get_current_rule_and_op_id(
+            "einsum", repeated_call=True
+        )
+        if not isinstance(rule, qwix_lora.LoraRule):
+          return res
+        if len(operands) != 2:
+          raise ValueError(
+              f"Unsupported einsum format: {einsum_str=} {operands=}"
+          )
+        lhs, rhs = operands
+        weight_name = qwix_lora.flax_util.find_param(
+            rhs, qwix_lora.ptq.WithAux
+        )
+        if weight_name is None:
+          return res
+
+        (
+            a_shape,
+            b_shape,
+            lora_einsum_str,
+            a_sharding_transpose,
+            b_sharding_transpose,
+        ) = qwix_lora._parse_einsum_str_for_lora(
+            lhs.shape, rhs.shape, einsum_str, rule.rank
+        )
+        lora_a, lora_b = qwix_lora._get_or_create_lora_params(
+            name=weight_name,
+            rule=rule,
+            a_shape=a_shape,
+            b_shape=b_shape,
+            a_sharding_transpose=a_sharding_transpose,
+            b_sharding_transpose=b_sharding_transpose,
+        )
+
+        if rule.dropout > 0:
+          lhs = qwix_lora.nnx.Dropout(
+              rule.dropout, deterministic=False
+          )(lhs, rngs=qwix_lora.flax_util.make_rng("dropout"))
+
+        return res + (
+            jnp.einsum(lora_einsum_str, lhs, lora_a, lora_b, **kwargs)
+            * (rule.alpha / rule.rank)
+        )
+
+    return Provider(*args, **kwargs)
 
 
 def quantized_base_leaf_paths(params: Mapping[str, Any]) -> tuple[str, ...]:
