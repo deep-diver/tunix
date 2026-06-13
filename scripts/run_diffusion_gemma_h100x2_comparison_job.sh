@@ -23,6 +23,12 @@ CLI_LOG_LOSSES=""
 CLI_JAX_PACKAGE_SPEC=""
 CLI_SYNC_AFTER_STEP=""
 CLI_RUN_NAME=""
+CLI_LORA_BACKEND=""
+CLI_LORA_ALPHA=""
+CLI_QWIX_LORA_MODULE_PATH=""
+CLI_QLORA_WEIGHT_QTYPE=""
+CLI_QLORA_ACT_QTYPE=""
+CLI_QLORA_TILE_SIZE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode)
@@ -57,6 +63,30 @@ while [[ $# -gt 0 ]]; do
       CLI_RUN_NAME="$2"
       shift 2
       ;;
+    --lora_backend)
+      CLI_LORA_BACKEND="$2"
+      shift 2
+      ;;
+    --lora_alpha)
+      CLI_LORA_ALPHA="$2"
+      shift 2
+      ;;
+    --qwix_lora_module_path)
+      CLI_QWIX_LORA_MODULE_PATH="$2"
+      shift 2
+      ;;
+    --qlora_weight_qtype)
+      CLI_QLORA_WEIGHT_QTYPE="$2"
+      shift 2
+      ;;
+    --qlora_act_qtype)
+      CLI_QLORA_ACT_QTYPE="$2"
+      shift 2
+      ;;
+    --qlora_tile_size)
+      CLI_QLORA_TILE_SIZE="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 2
@@ -88,6 +118,12 @@ RUN_STEPS="${CLI_RUN_STEPS:-${RUN_STEPS:-}}"
 CHECKPOINT_EVERY_N_STEPS="${CHECKPOINT_EVERY_N_STEPS:-1000}"
 DATASET_BATCH_SIZE="${DATASET_BATCH_SIZE:-2}"
 LORA_RANK="${LORA_RANK:-4}"
+LORA_BACKEND="${CLI_LORA_BACKEND:-${LORA_BACKEND:-official}}"
+LORA_ALPHA="${CLI_LORA_ALPHA:-${LORA_ALPHA:-}}"
+QWIX_LORA_MODULE_PATH="${CLI_QWIX_LORA_MODULE_PATH:-${QWIX_LORA_MODULE_PATH:-}}"
+QLORA_WEIGHT_QTYPE="${CLI_QLORA_WEIGHT_QTYPE:-${QLORA_WEIGHT_QTYPE:-int4}}"
+QLORA_ACT_QTYPE="${CLI_QLORA_ACT_QTYPE:-${QLORA_ACT_QTYPE:-}}"
+QLORA_TILE_SIZE="${CLI_QLORA_TILE_SIZE:-${QLORA_TILE_SIZE:-}}"
 GPU_POLL_SECONDS="${GPU_POLL_SECONDS:-60}"
 JAX_CUDA_EXTRA="${JAX_CUDA_EXTRA:-cuda13}"
 JAX_PACKAGE_SPEC="${CLI_JAX_PACKAGE_SPEC:-${JAX_PACKAGE_SPEC:-jax[${JAX_CUDA_EXTRA}]}}"
@@ -162,6 +198,9 @@ json_event comparison_job_start \
   run_steps="${RUN_STEPS:-}" \
   dataset_batch_size="${DATASET_BATCH_SIZE}" \
   lora_rank="${LORA_RANK}" \
+  lora_backend="${LORA_BACKEND}" \
+  lora_alpha="${LORA_ALPHA:-}" \
+  qlora_weight_qtype="${QLORA_WEIGHT_QTYPE}" \
   train_loop="${TRAIN_LOOP}" \
   log_losses="${LOG_LOSSES}" \
   sync_after_step="${SYNC_AFTER_STEP}" \
@@ -290,6 +329,23 @@ COMMON_ARGS=(
   --module_override "PUBMEDQA_TEST_PATH=${GEMMA_REF}/gemma/diffusion/hackable_diffusion_adapter/data/pubmedqa/pubmedqa_test.jsonl"
 )
 
+COMMON_ARGS+=(--lora_backend "${LORA_BACKEND}")
+if [[ -n "${LORA_ALPHA}" ]]; then
+  COMMON_ARGS+=(--lora_alpha "${LORA_ALPHA}")
+fi
+if [[ -n "${QWIX_LORA_MODULE_PATH}" ]]; then
+  COMMON_ARGS+=(--qwix_lora_module_path "${QWIX_LORA_MODULE_PATH}")
+fi
+if [[ -n "${QLORA_WEIGHT_QTYPE}" ]]; then
+  COMMON_ARGS+=(--qlora_weight_qtype "${QLORA_WEIGHT_QTYPE}")
+fi
+if [[ -n "${QLORA_ACT_QTYPE}" ]]; then
+  COMMON_ARGS+=(--qlora_act_qtype "${QLORA_ACT_QTYPE}")
+fi
+if [[ -n "${QLORA_TILE_SIZE}" ]]; then
+  COMMON_ARGS+=(--qlora_tile_size "${QLORA_TILE_SIZE}")
+fi
+
 if [[ -n "${RUN_STEPS}" ]]; then
   COMMON_ARGS+=(--run_steps "${RUN_STEPS}")
 fi
@@ -357,6 +413,9 @@ payload = {
     "gemma_revision": "$(git -C "${GEMMA_REF}" rev-parse HEAD)",
     "hackable_diffusion_revision": "$(git -C "${HACKABLE_DIFFUSION_REF}" rev-parse HEAD)",
     "train_loop": "${TRAIN_LOOP}",
+    "lora_backend": "${LORA_BACKEND}",
+    "lora_alpha": "${LORA_ALPHA}",
+    "qlora_weight_qtype": "${QLORA_WEIGHT_QTYPE}",
     "log_losses": "${LOG_LOSSES}",
     "sync_after_step": "${SYNC_AFTER_STEP}",
     "jax_package_spec": "${JAX_PACKAGE_SPEC}",

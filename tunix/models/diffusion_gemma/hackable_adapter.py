@@ -71,6 +71,18 @@ class OfficialSFTConfig:
     lora_rank: Optional LoRA rank override. This is applied before the official
       config factory is called so the official LoRA wrapper is constructed with
       the requested rank.
+    lora_backend: LoRA implementation used by the official recipe. `official`
+      preserves the DeepMind Hackable Diffusion wrapper. `qwix_lora` and
+      `qwix_qlora` patch only the recipe's LoRA constructor so the Linen model
+      is wrapped by Tunix/Qwix while the rest of the official backend remains
+      intact.
+    lora_alpha: Optional Qwix LoRA alpha. When unset, Qwix Linen LoRA uses
+      `rank` so the adapter scale is 1.0, matching the official unscaled LoRA
+      adapter more closely than the common `alpha=2*rank` recipe.
+    qwix_lora_module_path: Optional Qwix `module_path` regex override.
+    qlora_weight_qtype: Qwix QLoRA weight quantization type.
+    qlora_act_qtype: Optional Qwix activation quantization type.
+    qlora_tile_size: Optional Qwix QLoRA tile size.
     dataset_batch_size: Optional batch-size override for official dataset
       builder calls. The official recipes keep their default batch size when
       this is unset.
@@ -112,6 +124,12 @@ class OfficialSFTConfig:
   run_steps: int | None = None
   checkpoint_every_n_steps: int | None = None
   lora_rank: int | None = None
+  lora_backend: str = "official"
+  lora_alpha: float | None = None
+  qwix_lora_module_path: str | None = None
+  qlora_weight_qtype: str | None = "int4"
+  qlora_act_qtype: str | None = None
+  qlora_tile_size: int | float | None = None
   dataset_batch_size: int | None = None
   skip_step_metrics: bool = False
   log_losses: bool = True
@@ -159,6 +177,7 @@ def check_dependencies(
 
 def build_official_sft_config(config: OfficialSFTConfig):
   """Builds an official Kauldron config with Tunix-side overrides applied."""
+  _validate_lora_backend(config)
   initialize_jax_before_tensorflow(_extra_paths(config))
   module = _import_recipe_module(config)
   module_overrides = dict(config.module_overrides)
@@ -169,7 +188,9 @@ def build_official_sft_config(config: OfficialSFTConfig):
 
   with _patched_module_attrs(
       module, module_overrides
-  ), _patched_dataset_batch_size(module, config.dataset_batch_size):
+  ), _patched_dataset_batch_size(
+      module, config.dataset_batch_size
+  ), _patched_lora_backend(module, config):
     cfg = _call_get_config(module, config)
 
   _apply_common_config_overrides(cfg, config)
@@ -414,6 +435,115 @@ def _import_recipe_module(config: OfficialSFTConfig):
       ) from exc
 
 
+def _validate_lora_backend(config: OfficialSFTConfig) -> None:
+  valid = {"official", "qwix_lora", "qwix_qlora"}
+  if config.lora_backend not in valid:
+    raise ValueError(
+        "Official DiffusionGemma lora_backend must be one of "
+        f"{sorted(valid)}, got {config.lora_backend!r}."
+    )
+
+
+@contextlib.contextmanager
+def _patched_lora_backend(module: Any, config: OfficialSFTConfig):
+  """Temporarily patches an official recipe to construct Qwix Linen LoRA."""
+  if config.lora_backend == "official":
+    yield
+    return
+
+  recipe_lora_module = getattr(module, "lora", None)
+  if recipe_lora_module is None or not hasattr(recipe_lora_module, "LoRA"):
+    raise OfficialBackendDependencyError(
+        f"Official recipe module {module.__name__!r} does not expose "
+        "a patchable lora.LoRA constructor."
+    )
+
+  original_lora = recipe_lora_module.LoRA
+  try:
+    recipe_lora_module.LoRA = _make_qwix_linen_lora_constructor(config)
+    yield
+  finally:
+    recipe_lora_module.LoRA = original_lora
+
+
+def _make_qwix_linen_lora_constructor(config: OfficialSFTConfig):
+  """Builds a constructor compatible with official hd.lora.LoRA call sites."""
+
+  def qwix_linen_lora(
+      *,
+      rank: int,
+      model: Any,
+      dtype: Any = None,
+      verbose: bool = False,
+      target_modules: Any = None,
+  ) -> Any:
+    del dtype, verbose
+    bridge = _load_linen_qwix_lora_module()
+    alpha = config.lora_alpha if config.lora_alpha is not None else float(rank)
+    module_path = _qwix_module_path_from_official_targets(
+        bridge,
+        target_modules,
+        override=config.qwix_lora_module_path,
+    )
+    if config.lora_backend == "qwix_qlora":
+      return bridge.apply_qlora_to_linen_model(
+          model,
+          rank=rank,
+          alpha=alpha,
+          module_path=module_path,
+          weight_qtype=config.qlora_weight_qtype or "int4",
+          act_qtype=config.qlora_act_qtype,
+          tile_size=config.qlora_tile_size,
+      )
+    return bridge.apply_lora_to_linen_model(
+        model,
+        rank=rank,
+        alpha=alpha,
+        module_path=module_path,
+    )
+
+  qwix_linen_lora.__name__ = f"{config.lora_backend}_LoRA"
+  return qwix_linen_lora
+
+
+def _qwix_module_path_from_official_targets(
+    bridge: Any,
+    target_modules: Any,
+    *,
+    override: str | None,
+) -> str:
+  if override is not None:
+    return override
+  if target_modules is None or target_modules == "all-linear":
+    return bridge.official_compatible_module_path()
+  if isinstance(target_modules, str):
+    return target_modules
+  try:
+    patterns = tuple(str(pattern) for pattern in target_modules)
+  except TypeError as exc:
+    raise ValueError(
+        f"Unsupported official target_modules value: {target_modules!r}"
+    ) from exc
+  return bridge.official_compatible_module_path(
+      tuple(f".*{pattern}.*" for pattern in patterns)
+  )
+
+
+def _load_linen_qwix_lora_module():
+  module_path = pathlib.Path(__file__).with_name("linen_qwix_lora.py")
+  spec = importlib.util.spec_from_file_location(
+      "_tunix_diffusion_gemma_linen_qwix_lora", module_path
+  )
+  if spec is None or spec.loader is None:
+    raise OfficialBackendDependencyError(
+        f"Could not load Qwix Linen LoRA bridge from {module_path}."
+    )
+  module = importlib.util.module_from_spec(spec)
+  sys.modules[spec.name] = module
+  spec.loader.exec_module(module)
+  return module
+
+
 def _call_get_config(module: Any, config: OfficialSFTConfig):
   if not hasattr(module, "get_config"):
     raise OfficialBackendDependencyError(
@@ -430,6 +560,14 @@ def _call_get_config(module: Any, config: OfficialSFTConfig):
 def _apply_common_config_overrides(cfg: Any, config: OfficialSFTConfig) -> None:
   if config.workdir is not None:
     cfg.workdir = str(config.workdir)
+  aux = getattr(cfg, "aux", None)
+  if aux is not None:
+    aux.lora_backend = config.lora_backend
+    aux.lora_alpha = config.lora_alpha
+    aux.qwix_lora_module_path = config.qwix_lora_module_path
+    aux.qlora_weight_qtype = config.qlora_weight_qtype
+    aux.qlora_act_qtype = config.qlora_act_qtype
+    aux.qlora_tile_size = config.qlora_tile_size
   if config.num_train_steps is not None:
     cfg.num_train_steps = config.num_train_steps
   if config.checkpoint_every_n_steps is not None:

@@ -23,12 +23,28 @@ surface intact.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import dataclasses
 from typing import Any
 
 import flax.traverse_util
-import jax
+import jax.numpy as jnp
 
-from tunix.models.diffusion_gemma import lora_inventory
+try:
+  from . import lora_inventory
+except ImportError:  # Allows direct importlib loading without importing tunix.
+  import importlib.util
+  import pathlib
+  import sys
+
+  _LORA_INVENTORY_PATH = pathlib.Path(__file__).with_name("lora_inventory.py")
+  _SPEC = importlib.util.spec_from_file_location(
+      "_tunix_diffusion_gemma_lora_inventory", _LORA_INVENTORY_PATH
+  )
+  if _SPEC is None or _SPEC.loader is None:
+    raise
+  lora_inventory = importlib.util.module_from_spec(_SPEC)
+  sys.modules[_SPEC.name] = lora_inventory
+  _SPEC.loader.exec_module(lora_inventory)
 
 
 DIFFUSION_GEMMA_LINEN_LORA_METHODS: tuple[str, ...] = (
@@ -43,6 +59,25 @@ OFFICIAL_COMPATIBLE_LINEN_TARGET_PATTERNS: tuple[str, ...] = (
     r"(.*/)?(mlp|mlp2)/(gating_einsum|linear|router_logits)$",
     r"(.*/)?self_conditioner/ffw/(gating_einsum|linear)$",
 )
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LinenQwixLoRAConfig:
+  """Qwix LoRA/QLoRA configuration for Linen DiffusionGemma models."""
+
+  rank: int
+  alpha: float
+  module_path: str | None = None
+  dropout: float = 0.0
+  weight_qtype: str | type[Any] | jnp.dtype | None = None
+  act_qtype: str | type[Any] | jnp.dtype | None = None
+  tile_size: int | float | None = None
+  weight_calibration_method: str = "absmax"
+  act_calibration_method: str | None = None
+
+  @property
+  def is_qlora(self) -> bool:
+    return self.weight_qtype is not None or self.act_qtype is not None
 
 
 def official_compatible_module_path(
@@ -60,15 +95,60 @@ def create_linen_lora_provider(
     alpha: float,
     module_path: str | None = None,
     dropout: float = 0.0,
+    weight_qtype: str | type[Any] | jnp.dtype | None = None,
+    act_qtype: str | type[Any] | jnp.dtype | None = None,
+    tile_size: int | float | None = None,
+    weight_calibration_method: str = "absmax",
+    act_calibration_method: str | None = None,
 ):
-  """Creates a Qwix LoRA provider for Linen DiffusionGemma modules."""
+  """Creates a Qwix LoRA/QLoRA provider for Linen DiffusionGemma modules."""
   import qwix  # pylint: disable=g-import-not-at-top
 
-  return qwix.LoraProvider(
-      module_path=module_path or official_compatible_module_path(),
-      rank=rank,
-      alpha=alpha,
-      dropout=dropout,
+  kwargs = {
+      "module_path": module_path or official_compatible_module_path(),
+      "rank": rank,
+      "alpha": alpha,
+      "dropout": dropout,
+  }
+  if weight_qtype is not None:
+    kwargs["weight_qtype"] = weight_qtype
+  if act_qtype is not None:
+    kwargs["act_qtype"] = act_qtype
+  if tile_size is not None:
+    kwargs["tile_size"] = tile_size
+  if weight_calibration_method is not None:
+    kwargs["weight_calibration_method"] = weight_calibration_method
+  if act_calibration_method is not None:
+    kwargs["act_calibration_method"] = act_calibration_method
+  return qwix.LoraProvider(**kwargs)
+
+
+def create_linen_lora_provider_from_config(config: LinenQwixLoRAConfig):
+  """Creates a Qwix provider from a structured Linen bridge config."""
+  return create_linen_lora_provider(
+      rank=config.rank,
+      alpha=config.alpha,
+      module_path=config.module_path,
+      dropout=config.dropout,
+      weight_qtype=config.weight_qtype,
+      act_qtype=config.act_qtype,
+      tile_size=config.tile_size,
+      weight_calibration_method=config.weight_calibration_method,
+      act_calibration_method=config.act_calibration_method,
+  )
+
+
+def apply_lora_to_linen_model_from_config(
+    model: Any,
+    config: LinenQwixLoRAConfig,
+    *,
+    methods: Sequence[str] = DIFFUSION_GEMMA_LINEN_LORA_METHODS,
+) -> Any:
+  """Applies Qwix LoRA/QLoRA to a Linen model from a structured config."""
+  return _apply_provider_to_linen_model(
+      model,
+      create_linen_lora_provider_from_config(config),
+      methods=methods,
   )
 
 
@@ -81,21 +161,75 @@ def apply_lora_to_linen_model(
     methods: Sequence[str] = DIFFUSION_GEMMA_LINEN_LORA_METHODS,
     dropout: float = 0.0,
 ) -> Any:
-  """Applies Qwix LoRA to a Linen model with DiffusionGemma call coverage.
+  """Applies Qwix LoRA to a Linen model with DiffusionGemma call coverage."""
+  return apply_lora_to_linen_model_from_config(
+      model,
+      LinenQwixLoRAConfig(
+          rank=rank,
+          alpha=alpha,
+          module_path=module_path,
+          dropout=dropout,
+      ),
+      methods=methods,
+  )
 
-  DiffusionGemma uses more than ``__call__`` during SFT and generation. The
-  official wrapper keeps LoRA active for ``encoder_call`` and ``init_cache`` as
-  well; this bridge mirrors that method set for Qwix.
-  """
+
+def apply_qlora_to_linen_model(
+    model: Any,
+    *,
+    rank: int,
+    alpha: float,
+    weight_qtype: str | type[Any] | jnp.dtype = "int4",
+    module_path: str | None = None,
+    methods: Sequence[str] = DIFFUSION_GEMMA_LINEN_LORA_METHODS,
+    dropout: float = 0.0,
+    act_qtype: str | type[Any] | jnp.dtype | None = None,
+    tile_size: int | float | None = None,
+    weight_calibration_method: str = "absmax",
+    act_calibration_method: str | None = None,
+) -> Any:
+  """Applies Qwix QLoRA to a Linen model with DiffusionGemma call coverage."""
+  return apply_lora_to_linen_model_from_config(
+      model,
+      LinenQwixLoRAConfig(
+          rank=rank,
+          alpha=alpha,
+          module_path=module_path,
+          dropout=dropout,
+          weight_qtype=weight_qtype,
+          act_qtype=act_qtype,
+          tile_size=tile_size,
+          weight_calibration_method=weight_calibration_method,
+          act_calibration_method=act_calibration_method,
+      ),
+      methods=methods,
+  )
+
+
+def _apply_provider_to_linen_model(
+    model: Any,
+    provider: Any,
+    *,
+    methods: Sequence[str],
+) -> Any:
+  """Applies a Qwix provider to a Linen model with DiffusionGemma methods."""
   import qwix  # pylint: disable=g-import-not-at-top
 
-  provider = create_linen_lora_provider(
-      rank=rank,
-      alpha=alpha,
-      module_path=module_path,
-      dropout=dropout,
-  )
   return qwix.apply_lora_to_model(model, provider, methods=tuple(methods))
+
+
+def quantized_base_leaf_paths(params: Mapping[str, Any]) -> tuple[str, ...]:
+  """Returns Linen param paths whose base weights carry Qwix quantization aux."""
+  flat = flax.traverse_util.flatten_dict(params)
+  return tuple(
+      "/".join(str(part) for part in path)
+      for path, value in flat.items()
+      if hasattr(value, "how") and hasattr(value, "array")
+  )
+
+
+def has_quantized_base_leaves(params: Mapping[str, Any]) -> bool:
+  return bool(quantized_base_leaf_paths(params))
 
 
 def inventory_from_linen_params(

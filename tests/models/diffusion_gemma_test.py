@@ -715,6 +715,32 @@ class DiffusionGemmaTest(absltest.TestCase):
 
     self.assertTrue(bool(jnp.any(before != after)))
 
+  def test_linen_qwix_qlora_bridge_quantizes_base_and_affects_outputs(self):
+    model = linen_qwix_lora.apply_qlora_to_linen_model(
+        _ToyLinenDiffusionGemmaMethods(),
+        rank=2,
+        alpha=4.0,
+        weight_qtype="int4",
+    )
+    x = jnp.ones((1, 4), dtype=jnp.float32)
+    variables = model.init(jax.random.PRNGKey(0), x)
+    inventory = linen_qwix_lora.inventory_from_linen_params(
+        variables["params"]
+    )
+
+    self.assertTrue(linen_qwix_lora.has_quantized_base_leaves(
+        variables["params"]
+    ))
+    self.assertTrue(lora_inventory.LoRATargetComparison(
+        inventory
+    ).matches_official)
+
+    changed_variables = _set_lora_b_leaves_to_constant(variables, 0.01)
+    before = model.apply(variables, x)
+    after = model.apply(changed_variables, x)
+
+    self.assertTrue(bool(jnp.any(before != after)))
+
   def test_sft_loss_is_finite(self):
     vocab_size = 32
     model = diffusion_model.DiffusionGemma_A26B_A4B(

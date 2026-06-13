@@ -90,6 +90,21 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--checkpoint_every_n_steps", type=int, default=None)
   parser.add_argument("--lora_rank", type=int, default=None)
   parser.add_argument(
+      "--lora_backend",
+      choices=["official", "qwix_lora", "qwix_qlora"],
+      default="official",
+      help=(
+          "LoRA implementation inside the official recipe. 'official' keeps "
+          "DeepMind Hackable Diffusion LoRA; Qwix modes patch only the Linen "
+          "LoRA constructor while retaining the official model/loss/trainstep."
+      ),
+  )
+  parser.add_argument("--lora_alpha", type=float, default=None)
+  parser.add_argument("--qwix_lora_module_path", default=None)
+  parser.add_argument("--qlora_weight_qtype", default="int4")
+  parser.add_argument("--qlora_act_qtype", default=None)
+  parser.add_argument("--qlora_tile_size", type=float, default=None)
+  parser.add_argument(
       "--dataset_batch_size",
       type=int,
       default=None,
@@ -200,6 +215,12 @@ def main() -> None:
       run_steps=args.run_steps,
       checkpoint_every_n_steps=args.checkpoint_every_n_steps,
       lora_rank=args.lora_rank,
+      lora_backend=args.lora_backend,
+      lora_alpha=args.lora_alpha,
+      qwix_lora_module_path=args.qwix_lora_module_path,
+      qlora_weight_qtype=args.qlora_weight_qtype,
+      qlora_act_qtype=args.qlora_act_qtype,
+      qlora_tile_size=args.qlora_tile_size,
       dataset_batch_size=args.dataset_batch_size,
       skip_step_metrics=args.skip_step_metrics,
       log_losses=args.log_losses,
@@ -245,6 +266,15 @@ def main() -> None:
                 "lora_rank": getattr(
                     getattr(cfg, "aux", None), "lora_rank", None
                 ),
+                "lora_backend": getattr(
+                    getattr(cfg, "aux", None), "lora_backend", None
+                ),
+                "lora_alpha": getattr(
+                    getattr(cfg, "aux", None), "lora_alpha", None
+                ),
+                "qlora_weight_qtype": getattr(
+                    getattr(cfg, "aux", None), "qlora_weight_qtype", None
+                ),
                 "dataset_batch_size": args.dataset_batch_size,
                 "prompt_len": getattr(
                     getattr(cfg, "aux", None), "prompt_len", None
@@ -270,6 +300,9 @@ def main() -> None:
           "workdir": args.workdir,
           "num_train_steps": args.num_train_steps,
           "run_steps": args.run_steps,
+          "lora_backend": args.lora_backend,
+          "lora_alpha": args.lora_alpha,
+          "qlora_weight_qtype": args.qlora_weight_qtype,
           "skip_step_metrics": args.skip_step_metrics,
           "log_losses": args.log_losses,
           "sync_after_step": args.sync_after_step,
