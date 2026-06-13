@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import importlib.util
 import json
 import pathlib
 import sys
@@ -36,7 +37,17 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(REPO_ROOT))
 
-from tunix.models.diffusion_gemma import hackable_adapter
+_HACKABLE_ADAPTER_PATH = (
+    REPO_ROOT / "tunix" / "models" / "diffusion_gemma" / "hackable_adapter.py"
+)
+_HACKABLE_ADAPTER_SPEC = importlib.util.spec_from_file_location(
+    "_tunix_diffusion_gemma_hackable_adapter", _HACKABLE_ADAPTER_PATH
+)
+if _HACKABLE_ADAPTER_SPEC is None or _HACKABLE_ADAPTER_SPEC.loader is None:
+  raise ImportError(f"Could not load {_HACKABLE_ADAPTER_PATH}")
+hackable_adapter = importlib.util.module_from_spec(_HACKABLE_ADAPTER_SPEC)
+sys.modules[_HACKABLE_ADAPTER_SPEC.name] = hackable_adapter
+_HACKABLE_ADAPTER_SPEC.loader.exec_module(hackable_adapter)
 
 
 DEFAULT_TOKENIZER = "gs://gemma-data/tokenizers/tokenizer_gemma4.model"
