@@ -19,5 +19,19 @@ from tunix.models.diffusion_gemma import model
 from tunix.models.diffusion_gemma import params
 from tunix.models.diffusion_gemma import params_safetensors
 from tunix.models.diffusion_gemma import sft
+from tunix.models.diffusion_gemma.hackable_adapter import (
+    OfficialBackendDependencyError,
+    OfficialDiffusionGemmaTrainer,
+    OfficialSFTConfig,
+)
 
-__all__ = ["hackable_adapter", "model", "params", "params_safetensors", "sft"]
+__all__ = [
+    "OfficialBackendDependencyError",
+    "OfficialDiffusionGemmaTrainer",
+    "OfficialSFTConfig",
+    "hackable_adapter",
+    "model",
+    "params",
+    "params_safetensors",
+    "sft",
+]

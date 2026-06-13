@@ -1,8 +1,8 @@
 # DiffusionGemma Hackable Diffusion Wrapper Report
 
-Date: 2026-06-12
+Date: 2026-06-13
 
-Branch: `codex/diffusion-gemma-integration`
+Branch: `codex/diffusion-gemma-native-port`
 
 ## Scope
 
@@ -12,7 +12,8 @@ Diffusion, and Kauldron SFT implementation as the source of truth, and exposes
 it through Tunix-side entrypoints for controlled configuration and validation.
 
 It does not claim that the native Tunix NNX/Qwix DiffusionGemma path is a
-drop-in replacement for the official recipe.
+drop-in replacement for the official recipe. The current H100 x2 practical path
+is the official Hackable Diffusion backend wrapped by Tunix.
 
 ## Relevant Files
 
@@ -32,6 +33,37 @@ and sharding.
 The Tunix wrapper is responsible for importing that backend inside this fork,
 applying run-environment overrides, launching comparable official-vs-wrapper
 runs, and collecting concise logs plus GPU memory telemetry.
+
+In `train_loop=hybrid` mode the wrapper still uses the official model, dataset,
+optimizer, loss, train step, checkpoint restore, and sharding. Tunix only drives
+the outer step loop and reads addressable loss shards so that GPU validation can
+avoid Kauldron post-step metric/final-sync paths that are fragile on some
+multi-GPU Jarvis runtimes.
+
+Minimal Tunix-facing usage:
+
+```python
+from tunix.models.diffusion_gemma import (
+    OfficialDiffusionGemmaTrainer,
+    OfficialSFTConfig,
+)
+
+trainer = OfficialDiffusionGemmaTrainer(
+    OfficialSFTConfig(
+        recipe="pubmedqa",
+        gemma_ref="/home/ubuntu/gemma_official_reference",
+        hackable_diffusion_ref="/home/ubuntu/hackable_diffusion_reference",
+        checkpoint_path="/home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it",
+        workdir="/home/ubuntu/diffusion_gemma_pubmedqa_wrapper",
+        num_train_steps=2000,
+        lora_rank=4,
+        train_loop="hybrid",
+        sync_after_step="losses",
+        disable_evals=True,
+    )
+)
+trainer.train()
+```
 
 ## Local Parity Evidence
 
@@ -102,8 +134,9 @@ is applied. It matches official helper/logit parity checks locally and completes
 a real 26B PubMedQA LoRA train step through the Tunix wrapper path.
 
 Treat this integration as a practical official-backend wrapper plus parity
-scaffold. It is not yet a claim that the native Tunix NNX/Qwix training graph
-has matched the official 2-GPU memory profile.
+scaffold. For H100 x2 use, prefer the wrapper path. The native NNX/Qwix path is
+useful for model-family work and parity development, but it is still
+experimental for multi-step public 26B training on H100 80GB x2.
 
 ## Next Work
 

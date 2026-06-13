@@ -15,7 +15,8 @@ This directory is the runbook for the Tunix DiffusionGemma MVP integration.
 - Includes a PubMedQA real-data LoRA SFT validation script that mirrors the official DeepMind PubMedQA split and prompt/answer formatting without importing Kauldron or Grain.
 - Includes an optional official Hackable Diffusion compatibility backend that keeps the official Flax/Linen + Kauldron SFT path intact and wraps it with a Tunix entrypoint for 2-GPU parity/resource checks.
 - Includes a no-tuning generation demo with official-style confidence selection, annealed temperature, token-stability plus entropy early stopping, JSON trace export, and a self-contained HTML animation of every denoising frame.
-- The native NNX/Qwix path now completes a public 26B PubMedQA LoRA train step on H100 80GB x2 using the official prompt/canvas geometry (`prompt_len=1024`, `canvas_size=128`, `num_canvases=2`), TP=2, selected-canvas slice decoding, cuDNN local attention, full rematerialization, split encoder/decoder gradients, and the official-compatible ragged-MoE router LoRA target set.
+- The recommended H100 80GB x2 path is the official Hackable Diffusion backend wrapper: Tunix owns the entrypoint/config overrides/run telemetry, while the official backend owns the GPU-heavy model, dataset, loss, LoRA, checkpoint restore, train step, and sharding.
+- The native NNX/Qwix path completes a public 26B PubMedQA LoRA train step on H100 80GB x2 using the official prompt/canvas geometry (`prompt_len=1024`, `canvas_size=128`, `num_canvases=2`), TP=2, selected-canvas slice decoding, cuDNN local attention, full rematerialization, split encoder/decoder gradients, and the official-compatible ragged-MoE router LoRA target set. It is still experimental for multi-step H100x2 training.
 
 ## Current Limitations
 
@@ -23,7 +24,7 @@ This directory is the runbook for the Tunix DiffusionGemma MVP integration.
 - The full-model logits parity script covers the direct transformer forward path without cache. Cached SFT logits parity against the full official Flax/Linen stack is still a next gate.
 - Upstream Orbax checkpoint loading maps the Gemma4-compatible backbone and known `self_conditioner` leaves. The public `diffusiongemma-26B-A4B-it` checkpoint has been loaded successfully on 4xH100 and 8x96GB JAX meshes.
 - The no-tuning generation demo uses the full-sequence no-cache path covered by logits parity, not the official cached production sampler. Treat it as a load/denoise visibility validation test, not a quality benchmark.
-- Public 26B PubMedQA LoRA tuning now passes 1-step official-length validation on H100 80GB x2 with `mesh_fsdp=1, mesh_tp=2`, `prompt_len=1024`, `num_canvases=2`, `canvas_size=128`, batch size 1, gradient accumulation 2, long answers, `cached_selected_canvas_slice`, cuDNN attention, full remat, self-conditioning, encoder AR loss, LoRA-only update, base-parameter non-update, VRAM telemetry, and minimal state save.
+- Public 26B PubMedQA LoRA tuning through the native NNX/Qwix script passes 1-step official-length validation on H100 80GB x2 with `mesh_fsdp=1, mesh_tp=2`, `prompt_len=1024`, `num_canvases=2`, `canvas_size=128`, batch size 1, gradient accumulation 2, long answers, `cached_selected_canvas_slice`, cuDNN attention, full remat, self-conditioning, encoder AR loss, LoRA-only update, base-parameter non-update, VRAM telemetry, and minimal state save. A 2-step run with the same geometry currently fails at the next-step self-conditioning prefill all-reduce signal-buffer allocation unless more memory headroom is created; keep using the official wrapper for practical H100x2 runs.
 - The official PubMedQA SFT recipe uses the same prompt/canvas geometry, batch size 2, long answers, encoder AR loss, LoRA rank 4, and 2000 train steps. A direct official Kauldron-compatible H100x2 run and the Tunix Hackable wrapper both complete one synchronized train step. The native NNX/Qwix path now also completes the same geometry on H100x2, but with TP=2 plus gradient accumulation rather than the official backend's FSDP-first Kauldron setup.
 - For multi-GPU public-checkpoint runs, `scripts/run_diffusion_gemma_pubmedqa_tunix.py` supports explicit `mesh_fsdp` and `mesh_tp`. The H100x2 native validation uses TP=2 because the 26B cached diffusion loss graph is memory-bound under the NNX/Qwix implementation.
 - Decoder rematerialization is compatible with Qwix LoRA materialization in this MVP. The SFT adapter temporarily disables decoder remat while Qwix discovers LoRA targets, then restores remat for the actual forward/train path; GPU logs verify the same 366 LoRA leaves with `--remat_decoder`.
@@ -77,6 +78,31 @@ python scripts/run_diffusion_gemma_official_backend.py \
 Use this path when the goal is to match the official 2xA100/H100 memory profile.
 Use `scripts/run_diffusion_gemma_pubmedqa_tunix.py` when the goal is to test
 the native Tunix NNX/Qwix trainer path.
+
+Tunix-facing Python wrapper usage:
+
+```python
+from tunix.models.diffusion_gemma import (
+    OfficialDiffusionGemmaTrainer,
+    OfficialSFTConfig,
+)
+
+trainer = OfficialDiffusionGemmaTrainer(
+    OfficialSFTConfig(
+        recipe="pubmedqa",
+        gemma_ref="/home/ubuntu/gemma_official_reference",
+        hackable_diffusion_ref="/home/ubuntu/hackable_diffusion_reference",
+        checkpoint_path="/home/ubuntu/checkpoints/diffusiongemma-26B-A4B-it",
+        workdir="/home/ubuntu/diffusion_gemma_pubmedqa_wrapper",
+        num_train_steps=2000,
+        lora_rank=4,
+        train_loop="hybrid",
+        sync_after_step="losses",
+        disable_evals=True,
+    )
+)
+trainer.train()
+```
 
 Latest A100-80GB x2 official-backend check:
 
