@@ -15,6 +15,8 @@
 """DiffusionGemma API."""
 
 from tunix.models.diffusion_gemma import hackable_adapter
+from tunix.models.diffusion_gemma import linen_qwix_lora
+from tunix.models.diffusion_gemma import lora_inventory
 from tunix.models.diffusion_gemma import model
 from tunix.models.diffusion_gemma import params
 from tunix.models.diffusion_gemma import params_safetensors
@@ -30,6 +32,8 @@ __all__ = [
     "OfficialDiffusionGemmaTrainer",
     "OfficialSFTConfig",
     "hackable_adapter",
+    "linen_qwix_lora",
+    "lora_inventory",
     "model",
     "params",
     "params_safetensors",

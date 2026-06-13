@@ -20,6 +20,10 @@ import types
 from unittest import mock
 
 from absl.testing import absltest
+import flax.traverse_util
+from flax import linen as linen_nn
+from flax.core import freeze
+from flax.core import unfreeze
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -29,6 +33,8 @@ from tunix.models import automodel
 from tunix.models import low_peak_params
 from tunix.models import naming
 from tunix.models.diffusion_gemma import hackable_adapter
+from tunix.models.diffusion_gemma import linen_qwix_lora
+from tunix.models.diffusion_gemma import lora_inventory
 from tunix.models.diffusion_gemma import model as diffusion_model
 from tunix.models.diffusion_gemma import params as diffusion_params
 from tunix.models.diffusion_gemma import sft as diffusion_sft
@@ -123,6 +129,83 @@ def _official_reference_masked_ce(logits, targets, mask):
   per_example_loss = jnp.sum(loss * mask, axis=reduce_axes)
   per_example_denom = jnp.maximum(jnp.sum(mask, axis=reduce_axes), 1.0)
   return jnp.mean(per_example_loss / per_example_denom)
+
+
+class _ToyLinenAttention(linen_nn.Module):
+
+  @linen_nn.compact
+  def __call__(self, x):
+    q = linen_nn.Dense(4, use_bias=False, name="q_einsum")(x)
+    kv = linen_nn.Dense(4, use_bias=False, name="kv_einsum")(x)
+    out = linen_nn.Dense(4, use_bias=False, name="attn_vec_einsum")(x)
+    return q + kv + out
+
+
+class _ToyLinenMLP(linen_nn.Module):
+
+  @linen_nn.compact
+  def __call__(self, x):
+    gate = linen_nn.Dense(4, use_bias=False, name="gating_einsum")(x)
+    down = linen_nn.Dense(4, use_bias=False, name="linear")(x)
+    router = linen_nn.Dense(4, use_bias=False, name="router_logits")(x)
+    return gate + down + router
+
+
+class _ToyLinenSelfConditioner(linen_nn.Module):
+
+  @linen_nn.compact
+  def __call__(self, x):
+    ffw = _ToyLinenFFW(name="ffw")
+    return ffw(x)
+
+
+class _ToyLinenFFW(linen_nn.Module):
+
+  @linen_nn.compact
+  def __call__(self, x):
+    gate = linen_nn.Dense(4, use_bias=False, name="gating_einsum")(x)
+    down = linen_nn.Dense(4, use_bias=False, name="linear")(x)
+    return gate + down
+
+
+class _ToyLinenLayer(linen_nn.Module):
+
+  @linen_nn.compact
+  def __call__(self, x):
+    attn = _ToyLinenAttention(name="attn")
+    mlp = _ToyLinenMLP(name="mlp")
+    return attn(x) + mlp(x)
+
+
+class _ToyLinenDiffusionGemmaMethods(linen_nn.Module):
+  """Tiny Linen surface with DiffusionGemma method names and target scopes."""
+
+  @linen_nn.compact
+  def __call__(self, x):
+    embed = linen_nn.Dense(4, use_bias=False, name="embedder")(x)
+    layer = _ToyLinenLayer(name="layer_0")
+    conditioner = _ToyLinenSelfConditioner(name="self_conditioner")
+    return embed + layer(x) + conditioner(x)
+
+  @linen_nn.compact
+  def encoder_call(self, x):
+    layer = _ToyLinenLayer(name="layer_1")
+    return layer(x)
+
+  @linen_nn.compact
+  def init_cache(self, x):
+    attn = _ToyLinenAttention(name="attn")
+    return attn(x)
+
+
+def _set_lora_b_leaves_to_constant(variables, value: float):
+  mutable = unfreeze(variables)
+  flat_params = flax.traverse_util.flatten_dict(mutable["params"])
+  for path, leaf in flat_params.items():
+    if str(path[-1]).endswith("_lora_b"):
+      flat_params[path] = jnp.ones_like(leaf) * value
+  mutable["params"] = flax.traverse_util.unflatten_dict(flat_params)
+  return freeze(mutable)
 
 
 class DiffusionGemmaTest(absltest.TestCase):
@@ -472,6 +555,37 @@ class DiffusionGemmaTest(absltest.TestCase):
     after = moe(x)
     self.assertTrue(bool(jnp.any(before != after)))
 
+  def test_lora_inventory_matches_official_all_linear_default(self):
+    base_cfg = diffusion_model.ModelConfig.tiny(
+        vocab_size=32,
+        num_layers=1,
+        embed_dim=16,
+        hidden_dim=32,
+        num_heads=2,
+        head_dim=8,
+        num_kv_heads=1,
+    )
+    cfg = dataclasses.replace(
+        base_cfg,
+        enable_moe=True,
+        num_experts=4,
+        num_experts_per_tok=2,
+        expert_dim=8,
+        moe_dense_hidden_dim=16,
+    )
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        cfg,
+        rngs=nnx.Rngs(0),
+    )
+    model = diffusion_sft.apply_lora(model, rank=2, alpha=4.0)
+
+    comparison = lora_inventory.compare_model_to_official_all_linear(model)
+
+    self.assertEmpty(comparison.missing_from_inventory)
+    self.assertEmpty(comparison.extra_in_inventory)
+    self.assertEmpty(comparison.inventory.unknown_leaf_paths)
+    self.assertTrue(comparison.matches_official)
+
   def test_lora_raw_expert_targets_are_opt_in(self):
     base_cfg = diffusion_model.ModelConfig.tiny(
         vocab_size=32,
@@ -525,6 +639,80 @@ class DiffusionGemmaTest(absltest.TestCase):
     )
     moe.linear_lora_b.value = jnp.ones_like(moe.linear_lora_b.value) * 0.01
     after = moe(x)
+    self.assertTrue(bool(jnp.any(before != after)))
+
+    comparison = lora_inventory.compare_model_to_official_all_linear(model)
+    self.assertEqual(
+        comparison.extra_in_inventory,
+        frozenset({"moe.gating_einsum", "moe.linear"}),
+    )
+    self.assertEmpty(comparison.missing_from_inventory)
+
+  def test_linen_qwix_lora_bridge_targets_diffusion_methods(self):
+    model = linen_qwix_lora.apply_lora_to_linen_model(
+        _ToyLinenDiffusionGemmaMethods(),
+        rank=2,
+        alpha=4.0,
+    )
+    x = jnp.ones((1, 4), dtype=jnp.float32)
+
+    call_variables = model.init(jax.random.PRNGKey(0), x)
+    call_inventory = linen_qwix_lora.inventory_from_linen_params(
+        call_variables["params"]
+    )
+    call_comparison = lora_inventory.LoRATargetComparison(call_inventory)
+
+    self.assertTrue(call_comparison.matches_official)
+    self.assertFalse(
+        any("embedder" in path for path in call_inventory.leaf_paths)
+    )
+
+    encoder_variables = model.init(
+        jax.random.PRNGKey(1), x, method=model.encoder_call
+    )
+    encoder_inventory = linen_qwix_lora.inventory_from_linen_params(
+        encoder_variables["params"]
+    )
+    self.assertEqual(
+        encoder_inventory.families,
+        frozenset({
+            "attention.attn_vec_einsum",
+            "attention.kv_einsum",
+            "attention.q_einsum",
+            "ffw.gating_einsum",
+            "ffw.linear",
+            "moe.router_logits",
+        }),
+    )
+
+    cache_variables = model.init(
+        jax.random.PRNGKey(2), x, method=model.init_cache
+    )
+    cache_inventory = linen_qwix_lora.inventory_from_linen_params(
+        cache_variables["params"]
+    )
+    self.assertEqual(
+        cache_inventory.families,
+        frozenset({
+            "attention.attn_vec_einsum",
+            "attention.kv_einsum",
+            "attention.q_einsum",
+        }),
+    )
+
+  def test_linen_qwix_lora_bridge_affects_outputs(self):
+    model = linen_qwix_lora.apply_lora_to_linen_model(
+        _ToyLinenDiffusionGemmaMethods(),
+        rank=2,
+        alpha=4.0,
+    )
+    x = jnp.ones((1, 4), dtype=jnp.float32)
+    variables = model.init(jax.random.PRNGKey(0), x)
+    changed_variables = _set_lora_b_leaves_to_constant(variables, 0.01)
+
+    before = model.apply(variables, x)
+    after = model.apply(changed_variables, x)
+
     self.assertTrue(bool(jnp.any(before != after)))
 
   def test_sft_loss_is_finite(self):
