@@ -32,10 +32,13 @@ import optax
 from tunix.models import automodel
 from tunix.models import low_peak_params
 from tunix.models import naming
+from tunix.models.diffusion_gemma import data as diffusion_data
+from tunix.models.diffusion_gemma import generation as diffusion_generation
 from tunix.models.diffusion_gemma import hackable_adapter
 from tunix.models.diffusion_gemma import linen_qwix_lora
 from tunix.models.diffusion_gemma import lora_inventory
 from tunix.models.diffusion_gemma import model as diffusion_model
+from tunix.models.diffusion_gemma import official_qlora
 from tunix.models.diffusion_gemma import params as diffusion_params
 from tunix.models.diffusion_gemma import sft as diffusion_sft
 from tunix.models.gemma4 import model as gemma4_model
@@ -137,6 +140,41 @@ def _official_reference_masked_ce_from_token_loss(loss, mask):
   per_example_loss = jnp.sum(loss * mask, axis=reduce_axes)
   per_example_denom = jnp.maximum(jnp.sum(mask, axis=reduce_axes), 1.0)
   return jnp.mean(per_example_loss / per_example_denom)
+
+
+class _FakeTextTokenizer:
+
+  def __init__(self):
+    self._vocab = {
+        "hello": 10,
+        "world": 11,
+        "answer": 12,
+        "yes": 13,
+        "no": 14,
+        "maybe": 15,
+        "short": 16,
+        "response": 17,
+    }
+
+  def encode(self, text):
+    return [self._vocab[token] for token in text.split()]
+
+  def pad_id(self):
+    return 0
+
+  def eos_id(self):
+    return 1
+
+  def bos_id(self):
+    return 2
+
+  def decode(self, token_ids, skip_special_tokens=True):
+    del skip_special_tokens
+    reverse_vocab = {value: key for key, value in self._vocab.items()}
+    reverse_vocab.update({0: "<pad>", 1: "<eos>", 2: "<bos>"})
+    return " ".join(
+        reverse_vocab.get(token_id, f"<{token_id}>") for token_id in token_ids
+    )
 
 
 class _ToyLinenAttention(linen_nn.Module):
@@ -294,7 +332,12 @@ def _set_lora_b_leaves_to_constant(variables, value: float):
   mutable = unfreeze(variables)
   flat_params = flax.traverse_util.flatten_dict(mutable["params"])
   for path, leaf in flat_params.items():
-    if str(path[-1]).endswith("_lora_b"):
+    if str(path[-1]).endswith("_lora_b") or tuple(
+        str(p) for p in path[-2:]
+    ) == (
+        "lora",
+        "b",
+    ):
       flat_params[path] = jnp.ones_like(leaf) * value
   mutable["params"] = flax.traverse_util.unflatten_dict(flat_params)
   return freeze(mutable)
@@ -474,6 +517,490 @@ class DiffusionGemmaTest(absltest.TestCase):
         rtol=1e-6,
         atol=1e-6,
     )
+
+  def test_official_streaming_vocab_encoder_ce_matches_full_decode(self):
+
+    class FakeEmbedder:
+
+      def __init__(self, table):
+        self.input_embedding_table = table
+
+      def decode(self, hidden):
+        return jnp.dot(hidden, self.input_embedding_table.T)
+
+    class FakeGemmaNetwork:
+
+      def __init__(self, table, softcap):
+        self.gemma_model = types.SimpleNamespace(
+            embedder=FakeEmbedder(table),
+            config=types.SimpleNamespace(final_logit_softcap=softcap),
+        )
+
+      def decode_hidden(self, hidden):
+        logits = self.gemma_model.embedder.decode(hidden).astype(jnp.float32)
+        softcap = self.gemma_model.config.final_logit_softcap
+        if softcap is not None:
+          logits = jnp.tanh(logits / softcap) * softcap
+        return logits
+
+    key_hidden, key_table = jax.random.split(jax.random.PRNGKey(42))
+    hidden = jax.random.normal(key_hidden, (2, 7, 5), dtype=jnp.float32)
+    table = jax.random.normal(key_table, (23, 5), dtype=jnp.float32)
+    targets = jnp.array(
+        [[0, 5, 7, 11, 13, 19, 22], [3, 4, 9, 10, 12, 18, 20]],
+        dtype=jnp.int32,
+    )
+    mask = jnp.array(
+        [[1, 1, 1, 0, 1, 1, 0], [1, 0, 1, 1, 1, 0, 1]],
+        dtype=jnp.float32,
+    )
+    network = FakeGemmaNetwork(table, softcap=4.0)
+    logits = network.decode_hidden(hidden)
+    full_token_loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits, targets
+    )
+    expected = jnp.sum(full_token_loss * mask, axis=1) / jnp.maximum(
+        jnp.sum(mask, axis=1), 1.0
+    )
+
+    actual = hackable_adapter._encoder_loss_from_hidden(  # pylint: disable=protected-access
+        network,
+        hidden,
+        targets,
+        mask,
+        chunk_size=3,
+        vocab_chunk_size=5,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+
+  def test_official_streaming_vocab_encoder_ce_grad_matches_full_decode(self):
+
+    class FakeEmbedder:
+
+      def __init__(self, table):
+        self.input_embedding_table = table
+
+      def decode(self, hidden):
+        return jnp.dot(hidden, self.input_embedding_table.T)
+
+    class FakeGemmaNetwork:
+
+      def __init__(self, table, softcap):
+        self.gemma_model = types.SimpleNamespace(
+            embedder=FakeEmbedder(table),
+            config=types.SimpleNamespace(final_logit_softcap=softcap),
+        )
+
+      def decode_hidden(self, hidden):
+        logits = self.gemma_model.embedder.decode(hidden).astype(jnp.float32)
+        softcap = self.gemma_model.config.final_logit_softcap
+        if softcap is not None:
+          logits = jnp.tanh(logits / softcap) * softcap
+        return logits
+
+    key_hidden, key_table = jax.random.split(jax.random.PRNGKey(123))
+    hidden = jax.random.normal(key_hidden, (2, 5, 4), dtype=jnp.float32)
+    table = jax.random.normal(key_table, (17, 4), dtype=jnp.float32)
+    targets = jnp.array(
+        [[0, 5, 7, 11, 13], [3, 4, 9, 10, 12]], dtype=jnp.int32
+    )
+    mask = jnp.array(
+        [[1, 1, 1, 0, 1], [1, 0, 1, 1, 1]], dtype=jnp.float32
+    )
+    network = FakeGemmaNetwork(table, softcap=3.0)
+
+    def full_loss_fn(hidden_value):
+      logits = network.decode_hidden(hidden_value)
+      token_loss = optax.softmax_cross_entropy_with_integer_labels(
+          logits, targets
+      )
+      per_example = jnp.sum(token_loss * mask, axis=1) / jnp.maximum(
+          jnp.sum(mask, axis=1), 1.0
+      )
+      return jnp.sum(per_example)
+
+    def streaming_loss_fn(hidden_value):
+      per_example = hackable_adapter._encoder_loss_from_hidden(  # pylint: disable=protected-access
+          network,
+          hidden_value,
+          targets,
+          mask,
+          chunk_size=2,
+          vocab_chunk_size=4,
+      )
+      return jnp.sum(per_example)
+
+    np.testing.assert_allclose(
+        jax.grad(streaming_loss_fn)(hidden),
+        jax.grad(full_loss_fn)(hidden),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+
+  def test_diffusion_gemma_sft_loss_is_tunix_loss_callable(self):
+    cfg = diffusion_sft.DiffusionGemmaSFTConfig(
+        prompt_len=4,
+        canvas_size=4,
+        num_canvases=2,
+        vocab_size=32,
+    )
+
+    loss_fn = diffusion_sft.make_loss_fn(cfg)
+
+    self.assertIsInstance(loss_fn, diffusion_sft.DiffusionGemmaSFTLoss)
+    self.assertEqual(loss_fn.config, cfg)
+
+  def test_configure_peft_trainer_for_diffusion_gemma_sft_installs_hooks(self):
+    cfg = diffusion_sft.DiffusionGemmaSFTConfig(
+        prompt_len=4,
+        canvas_size=4,
+        num_canvases=2,
+        vocab_size=32,
+    )
+
+    class FakeTrainer:
+
+      def with_gen_model_input_fn(self, gen_model_input_fn):
+        self.gen_model_input_fn = gen_model_input_fn
+        return self
+
+      def with_loss_fn(self, loss_fn, *, has_aux=False):
+        self.loss_fn = loss_fn
+        self.has_aux = has_aux
+        return self
+
+    trainer = FakeTrainer()
+    returned = diffusion_sft.configure_peft_trainer_for_diffusion_gemma_sft(
+        trainer, cfg
+    )
+
+    self.assertIs(returned, trainer)
+    self.assertIs(trainer.gen_model_input_fn, diffusion_sft.gen_model_input_fn)
+    self.assertIsInstance(trainer.loss_fn, diffusion_sft.DiffusionGemmaSFTLoss)
+    self.assertTrue(trainer.has_aux)
+
+  def test_official_tunix_config_maps_loss_and_qwix_peft_configs(self):
+    config = hackable_adapter.make_official_tunix_sft_config(
+        recipe="pubmedqa",
+        workdir="/tmp/dg",
+        num_train_steps=2000,
+        peft_config=hackable_adapter.DiffusionGemmaQwixLoRAConfig(
+            rank=4,
+            alpha=4.0,
+        ),
+        loss_config=hackable_adapter.DiffusionGemmaOfficialLossConfig(
+            encoder_loss_token_chunk_size=128
+        ),
+    )
+
+    self.assertEqual(config.recipe, "pubmedqa")
+    self.assertEqual(config.workdir, "/tmp/dg")
+    self.assertEqual(config.num_train_steps, 2000)
+    self.assertEqual(config.lora_backend, "qwix_lora")
+    self.assertEqual(config.lora_rank, 4)
+    self.assertEqual(config.lora_alpha, 4.0)
+    self.assertIsNone(config.qwix_lora_module_path)
+    self.assertEqual(config.train_loop, "hybrid")
+    self.assertEqual(config.sync_after_step, "losses")
+    self.assertTrue(config.log_losses)
+    self.assertEqual(config.encoder_loss_token_chunk_size, 128)
+    self.assertEqual(config.encoder_loss_vocab_chunk_size, 8192)
+    self.assertFalse(config.official_remat_blocks)
+
+  def test_official_trainer_from_backend_accepts_tunix_configs(self):
+    trainer = (
+        hackable_adapter.OfficialDiffusionGemmaTrainer.from_official_backend(
+            recipe="sudoku",
+            peft_config=hackable_adapter.DiffusionGemmaQwixLoRAConfig(
+                rank=2,
+                target_modules=r".*q_einsum$",
+            ),
+            loss_config=hackable_adapter.DiffusionGemmaOfficialLossConfig(
+                sync_after_step="none",
+                encoder_loss_token_chunk_size=None,
+            ),
+        )
+    )
+
+    self.assertEqual(trainer.config.recipe, "sudoku")
+    self.assertEqual(trainer.config.lora_backend, "qwix_lora")
+    self.assertEqual(trainer.config.lora_rank, 2)
+    self.assertEqual(trainer.config.qwix_lora_module_path, r".*q_einsum$")
+    self.assertEqual(trainer.config.train_loop, "hybrid")
+    self.assertEqual(trainer.config.sync_after_step, "none")
+    self.assertIsNone(trainer.config.encoder_loss_token_chunk_size)
+    self.assertEqual(trainer.config.encoder_loss_vocab_chunk_size, 8192)
+
+  def test_official_config_accepts_remat_blocks_knob(self):
+    config = hackable_adapter.OfficialSFTConfig(
+        lora_backend="official_qlora",
+        official_remat_blocks=True,
+    )
+
+    self.assertTrue(config.official_remat_blocks)
+    hackable_adapter._validate_lora_backend(config)  # pylint: disable=protected-access
+
+  def test_tunix_config_helpers_validate_loss_and_peft_knobs(self):
+    with self.assertRaisesRegex(ValueError, "rank must be positive"):
+      hackable_adapter.DiffusionGemmaQwixLoRAConfig(rank=0)
+    with self.assertRaisesRegex(ValueError, "alpha must be positive"):
+      hackable_adapter.DiffusionGemmaQwixLoRAConfig(rank=4, alpha=0)
+
+    config = hackable_adapter.OfficialSFTConfig()
+    with self.assertRaisesRegex(ValueError, "train_loop"):
+      hackable_adapter.DiffusionGemmaOfficialLossConfig(
+          train_loop="bad"
+      ).apply_to_official_config(config)
+    with self.assertRaisesRegex(ValueError, "sync_after_step"):
+      hackable_adapter.DiffusionGemmaOfficialLossConfig(
+          sync_after_step="bad"
+      ).apply_to_official_config(config)
+    with self.assertRaisesRegex(ValueError, "encoder_loss_token_chunk_size"):
+      hackable_adapter.DiffusionGemmaOfficialLossConfig(
+          encoder_loss_token_chunk_size=0
+      ).apply_to_official_config(config)
+    with self.assertRaisesRegex(ValueError, "encoder_loss_vocab_chunk_size"):
+      hackable_adapter.DiffusionGemmaOfficialLossConfig(
+          encoder_loss_vocab_chunk_size=0
+      ).apply_to_official_config(config)
+
+  def test_text_data_adapter_builds_diffusion_gemma_sft_batch(self):
+    tokenizer = _FakeTextTokenizer()
+    config = diffusion_data.config_from_tokenizer(
+        tokenizer,
+        prompt_len=3,
+        canvas_size=3,
+        num_canvases=2,
+    )
+    examples = [
+        diffusion_data.DiffusionGemmaTextExample(
+            prompt="hello world",
+            response="answer yes",
+        )
+    ]
+
+    batch = diffusion_data.make_sft_batch_from_text_examples(
+        examples,
+        tokenizer=tokenizer,
+        config=config,
+        rng_seed=123,
+    )
+
+    np.testing.assert_array_equal(batch.prompt, [[2, 10, 11]])
+    np.testing.assert_array_equal(batch.canvas[0, :, 0], [12, 13, 1, 0, 0, 0])
+    np.testing.assert_array_equal(batch.canvas_id, [[0, 0, 0, 1, 1, 1]])
+    np.testing.assert_array_equal(
+        batch.canvas_mask, [[True, True, True, False, False, False]]
+    )
+    np.testing.assert_array_equal(
+        batch.encoder_target, [[10, 11, 12, 13, 1, 0, 0, 0, 0]]
+    )
+    np.testing.assert_array_equal(
+        batch.encoder_target_mask,
+        [[1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]],
+    )
+    np.testing.assert_array_equal(batch.rng, jax.random.PRNGKey(123))
+
+  def test_text_data_adapter_yields_trainer_input_dicts(self):
+    tokenizer = _FakeTextTokenizer()
+    config = diffusion_data.config_from_tokenizer(
+        tokenizer,
+        prompt_len=4,
+        canvas_size=2,
+        num_canvases=2,
+        add_canvas_feature_axis=False,
+    )
+    examples = [
+        {"prompts": "hello", "targets": "yes"},
+        {"prompts": "world", "targets": "no"},
+    ]
+
+    batches = list(
+        diffusion_data.make_sft_batches_from_text_examples(
+            examples,
+            tokenizer=tokenizer,
+            config=config,
+            batch_size=2,
+            rng_seed=7,
+            as_model_inputs=True,
+        )
+    )
+
+    self.assertLen(batches, 1)
+    self.assertSameElements(
+        batches[0],
+        (
+            "prompt",
+            "canvas",
+            "canvas_id",
+            "canvas_mask",
+            "encoder_target",
+            "encoder_target_mask",
+            "rng",
+        ),
+    )
+    self.assertEqual(batches[0]["prompt"].shape, (2, 4))
+    self.assertEqual(batches[0]["canvas"].shape, (2, 4))
+    np.testing.assert_array_equal(batches[0]["rng"], jax.random.PRNGKey(7))
+
+  def test_text_data_adapter_rejects_empty_responses(self):
+    tokenizer = _FakeTextTokenizer()
+    config = diffusion_data.config_from_tokenizer(
+        tokenizer,
+        prompt_len=3,
+        canvas_size=2,
+        num_canvases=2,
+    )
+
+    with self.assertRaisesRegex(ValueError, "valid canvas token"):
+      diffusion_data.make_sft_batch_from_text_examples(
+          [{"prompt": "hello", "response": ""}],
+          tokenizer=tokenizer,
+          config=config,
+          rng_seed=0,
+      )
+
+  def test_text_data_adapter_batch_runs_diffusion_sft_loss(self):
+    tokenizer = _FakeTextTokenizer()
+    data_config = diffusion_data.config_from_tokenizer(
+        tokenizer,
+        prompt_len=4,
+        canvas_size=2,
+        num_canvases=2,
+    )
+    examples = [
+        {"prompt": "hello world", "response": "answer yes"},
+        {"prompt": "short", "response": "response no"},
+    ]
+    batch = diffusion_data.make_sft_batch_from_text_examples(
+        examples,
+        tokenizer=tokenizer,
+        config=data_config,
+        rng_seed=9,
+    )
+    vocab_size = 32
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        diffusion_model.ModelConfig.tiny(vocab_size=vocab_size),
+        rngs=nnx.Rngs(0),
+    )
+    sft_config = diffusion_sft.DiffusionGemmaSFTConfig(
+        prompt_len=data_config.prompt_len,
+        canvas_size=data_config.canvas_size,
+        num_canvases=data_config.num_canvases,
+        vocab_size=vocab_size,
+        pad_token=data_config.pad_id,
+        self_cond_prob=0.0,
+    )
+
+    loss, aux = diffusion_sft.diffusion_gemma_sft_loss(
+        model,
+        **diffusion_sft.gen_model_input_fn(batch),
+        config=sft_config,
+    )
+
+    self.assertTrue(bool(jnp.isfinite(loss)))
+    self.assertTrue(bool(jnp.isfinite(aux["decoder_loss"])))
+    self.assertTrue(bool(jnp.isfinite(aux["encoder_loss"])))
+
+  def test_evaluate_sft_loss_aggregates_diffusion_metrics(self):
+    tokenizer = _FakeTextTokenizer()
+    data_config = diffusion_data.config_from_tokenizer(
+        tokenizer,
+        prompt_len=4,
+        canvas_size=2,
+        num_canvases=2,
+    )
+    eval_ds = list(
+        diffusion_data.make_sft_batches_from_text_examples(
+            [
+                {"prompt": "hello world", "response": "answer yes"},
+                {"prompt": "short", "response": "response no"},
+            ],
+            tokenizer=tokenizer,
+            config=data_config,
+            batch_size=1,
+            rng_seed=11,
+        )
+    )
+    vocab_size = 32
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        diffusion_model.ModelConfig.tiny(vocab_size=vocab_size),
+        rngs=nnx.Rngs(0),
+    )
+    sft_config = diffusion_sft.DiffusionGemmaSFTConfig(
+        prompt_len=data_config.prompt_len,
+        canvas_size=data_config.canvas_size,
+        num_canvases=data_config.num_canvases,
+        vocab_size=vocab_size,
+        pad_token=data_config.pad_id,
+        self_cond_prob=0.0,
+    )
+
+    result = diffusion_sft.evaluate_sft_loss(model, eval_ds, sft_config)
+
+    self.assertEqual(result.num_batches, 2)
+    for metric in ("total_loss", "decoder_loss", "encoder_loss"):
+      self.assertIn(metric, result.metrics)
+      self.assertTrue(np.isfinite(result.metrics[metric]))
+    self.assertIn("corrupted_fraction", result.metrics)
+
+  def test_generate_tokens_returns_denoising_trace(self):
+    vocab_size = 32
+    model = diffusion_model.DiffusionGemma_A26B_A4B(
+        diffusion_model.ModelConfig.tiny(vocab_size=vocab_size),
+        rngs=nnx.Rngs(0),
+    )
+    config = diffusion_generation.DiffusionGemmaGenerationConfig(
+        prompt_len=4,
+        canvas_size=2,
+        num_canvases=2,
+        vocab_size=vocab_size,
+        num_steps=3,
+        start_token=3,
+        use_self_conditioning=True,
+        entropy_budget=1.0,
+    )
+    prompt = jnp.array([[2, 10, 11, 1]], dtype=jnp.int32)
+    canvas_mask = jnp.array([[True, True, True, False]])
+
+    trace = diffusion_generation.generate_tokens(
+        model,
+        prompt,
+        config,
+        canvas_mask=canvas_mask,
+        rng=jax.random.PRNGKey(4),
+    )
+
+    self.assertEqual(trace.final_tokens.shape, (1, 4))
+    self.assertLen(trace.frames, config.num_steps + 1)
+    self.assertEqual(trace.selected_canvas_idx.shape, (config.num_steps, 1))
+    self.assertEqual(trace.changed_fraction.shape, (config.num_steps, 1))
+    self.assertEqual(trace.accepted_fraction.shape, (config.num_steps, 1))
+    np.testing.assert_array_equal(trace.frames[0], [[3, 3, 3, 0]])
+    self.assertEqual(int(trace.final_tokens[0, -1]), config.pad_token)
+    self.assertTrue(bool(jnp.all(trace.final_tokens >= 0)))
+    self.assertTrue(bool(jnp.all(trace.final_tokens < vocab_size)))
+    self.assertGreaterEqual(float(jnp.max(trace.changed_fraction)), 0.0)
+    self.assertGreater(float(jnp.max(trace.accepted_fraction)), 0.0)
+
+  def test_decode_generation_trace_uses_tokenizer_decode(self):
+    trace = diffusion_generation.DiffusionGemmaGenerationTrace(
+        prompt=jnp.array([[2, 10, 1]], dtype=jnp.int32),
+        final_tokens=jnp.array([[12, 13, 1]], dtype=jnp.int32),
+        frames=(
+            jnp.array([[3, 3, 0]], dtype=jnp.int32),
+            jnp.array([[12, 13, 1]], dtype=jnp.int32),
+        ),
+        selected_canvas_idx=jnp.array([[0]], dtype=jnp.int32),
+        changed_fraction=jnp.array([[1.0]], dtype=jnp.float32),
+        accepted_fraction=jnp.array([[1.0]], dtype=jnp.float32),
+    )
+
+    frames = diffusion_generation.decode_trace(_FakeTextTokenizer(), trace)
+
+    self.assertEqual(frames[0], "<3> <3> <pad>")
+    self.assertEqual(frames[1], "answer yes <eos>")
 
   def test_official_backend_builds_fake_recipe_with_overrides(self):
     module_name = hackable_adapter.recipe_module_name("pubmedqa")
@@ -845,24 +1372,24 @@ class DiffusionGemmaTest(absltest.TestCase):
         ("lora", r".*_lora_a", r".*_lora_b", "head"),
     )
 
-  def test_qwix_lora_paths_are_checkpoint_lora_paths(self):
+  def test_lora_adapter_paths_are_checkpoint_lora_paths(self):
     self.assertTrue(
-        hackable_adapter._is_qwix_or_official_lora_path(  # pylint: disable=protected-access
+        hackable_adapter._is_lora_adapter_path(  # pylint: disable=protected-access
             "layer_0/attn/q_einsum/w_lora_a"
         )
     )
     self.assertTrue(
-        hackable_adapter._is_qwix_or_official_lora_path(  # pylint: disable=protected-access
+        hackable_adapter._is_lora_adapter_path(  # pylint: disable=protected-access
             "layer_0/attn/q_einsum/w_lora_b"
         )
     )
     self.assertTrue(
-        hackable_adapter._is_qwix_or_official_lora_path(  # pylint: disable=protected-access
+        hackable_adapter._is_lora_adapter_path(  # pylint: disable=protected-access
             "layer_0/attn/q_einsum/lora/a"
         )
     )
     self.assertFalse(
-        hackable_adapter._is_qwix_or_official_lora_path(  # pylint: disable=protected-access
+        hackable_adapter._is_lora_adapter_path(  # pylint: disable=protected-access
             "layer_0/attn/q_einsum/w"
         )
     )
@@ -873,26 +1400,735 @@ class DiffusionGemmaTest(absltest.TestCase):
     with self.assertRaisesRegex(ValueError, "lora_backend"):
       hackable_adapter._validate_lora_backend(config)  # pylint: disable=protected-access
 
-  def test_qwix_apply_updates_keeps_base_frozen(self):
+  def test_official_qlora_backend_is_valid(self):
+    hackable_adapter._validate_lora_backend(  # pylint: disable=protected-access
+        hackable_adapter.OfficialSFTConfig(lora_backend="official_qlora")
+    )
+
+  def test_official_qlora_patch_restore_preserves_official_lora(self):
+    original_lora_cls = object()
+    fake_official_lora = types.SimpleNamespace(
+        LoRA=original_lora_cls,
+        peft=types.SimpleNamespace(
+            ModuleInterceptor=object,
+            LoRAEinsumAdapter=object,
+        ),
+        _SUPPORTED_MODULES=(linen_nn.Dense,),
+        _matches_target_modules=lambda module, target_modules: True,
+        kontext=types.SimpleNamespace(get_keypaths=lambda model: {}),
+    )
+
+    official_qlora.patch_official_lora_module(fake_official_lora)
+    self.assertIsNot(fake_official_lora.LoRA, original_lora_cls)
+
+    official_qlora.restore_official_lora_module(fake_official_lora)
+
+    self.assertIs(fake_official_lora.LoRA, original_lora_cls)
+
+  def test_official_qlora_int4_round_trip_is_bounded(self):
+    weight = jnp.array([[-2.0, -0.25, 0.0], [0.5, 1.0, 2.0]], dtype=jnp.float32)
+
+    quantized = official_qlora.quantize_symmetric_int4(
+        weight,
+        scale_shape=(1, 3),
+        scale_dtype=jnp.float32,
+    )
+    restored = official_qlora.dequantize_symmetric_int4(
+        quantized.qvalue,
+        quantized.scale,
+        quantized.shape,
+        dtype=jnp.float32,
+    )
+
+    self.assertEqual(quantized.qvalue.dtype, jnp.uint8)
+    self.assertEqual(quantized.qvalue.shape, (2, 2))
+    self.assertEqual(quantized.scale.shape, (1, 3))
+    self.assertLessEqual(float(jnp.max(jnp.abs(restored - weight))), 0.15)
+
+  def test_official_qlora_dequantized_base_is_frozen_for_autodiff(self):
+    qvalue = official_qlora.pack_int4(
+        jnp.array([[1, -2, 3], [4, -5, 6]], dtype=jnp.int8)
+    )
+
+    def loss(scale):
+      return jnp.sum(
+          official_qlora.dequantize_symmetric_int4(
+              qvalue,
+              scale,
+              (2, 3),
+              dtype=jnp.float32,
+          )
+      )
+
+    grad = jax.grad(loss)(jnp.ones((1, 3), dtype=jnp.float32))
+
+    self.assertTrue(bool(jnp.all(grad == 0)))
+
+  def test_official_qlora_einsum_uses_official_lora_layout(self):
+    model = official_qlora.QuantizedLoRAEinsum(
+        rank=2,
+        shape=(4, 3),
+        weight_name="w",
+        dtype=jnp.float32,
+        scale_dtype=jnp.float32,
+    )
+    x = jnp.ones((2, 4), dtype=jnp.float32)
+    variables = model.init(jax.random.PRNGKey(0), "bd,df->bf", x)
+    flat_params = flax.traverse_util.flatten_dict(unfreeze(variables)["params"])
+    leaf_paths = {"/".join(str(part) for part in path) for path in flat_params}
+
+    self.assertIn("w_qvalue", leaf_paths)
+    self.assertIn("w_scale", leaf_paths)
+    self.assertIn("lora/a", leaf_paths)
+    self.assertIn("lora/b", leaf_paths)
+    self.assertNotIn("w", leaf_paths)
+
+    changed_variables = _set_lora_b_leaves_to_constant(variables, 0.01)
+    before = model.apply(variables, "bd,df->bf", x)
+    after = model.apply(changed_variables, "bd,df->bf", x)
+
+    self.assertTrue(bool(jnp.any(before != after)))
+
+  def test_official_qlora_einsum_forces_wrapper_compute_dtype(self):
+    model = official_qlora.QuantizedLoRAEinsum(
+        rank=2,
+        shape=(4, 3),
+        weight_name="w",
+        dtype=jnp.bfloat16,
+        scale_dtype=jnp.bfloat16,
+    )
+    x = jnp.ones((2, 4), dtype=jnp.float32)
+    variables = model.init(jax.random.PRNGKey(0), "bd,df->bf", x)
+
+    y = model.apply(variables, "bd,df->bf", x)
+
+    self.assertEqual(y.dtype, jnp.bfloat16)
+
+  def test_official_qlora_einsum_chunked_path_matches_dequantized_reference(
+      self,
+  ):
+    model = official_qlora.QuantizedLoRAEinsum(
+        rank=1,
+        shape=(3, 5),
+        weight_name="w",
+        dtype=jnp.float32,
+        scale_dtype=jnp.float32,
+        output_chunk_size=2,
+    )
+    x = jnp.arange(6, dtype=jnp.float32).reshape(2, 3) / 10.0
+    variables = model.init(jax.random.PRNGKey(0), "bd,df->bf", x)
+    dense_weight = jnp.arange(15, dtype=jnp.float32).reshape(3, 5) / 7.0
+    quantized = official_qlora.quantize_symmetric_int4(
+        dense_weight,
+        scale_shape=(1, 5),
+        scale_dtype=jnp.float32,
+    )
+    mutable = unfreeze(variables)
+    mutable["params"]["w_qvalue"] = quantized.qvalue
+    mutable["params"]["w_scale"] = quantized.scale
+    variables = freeze(mutable)
+
+    actual = model.apply(variables, "bd,df->bf", x)
+    reference_weight = official_qlora.dequantize_symmetric_int4(
+        quantized.qvalue,
+        quantized.scale,
+        quantized.shape,
+        dtype=jnp.float32,
+    )
+    expected = jnp.einsum("bd,df->bf", x, reference_weight)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+  def test_official_qlora_einsum_ellipsis_chunked_path_matches_reference(
+      self,
+  ):
+    model = official_qlora.QuantizedLoRAEinsum(
+        rank=1,
+        shape=(3, 5),
+        weight_name="w",
+        dtype=jnp.float32,
+        scale_dtype=jnp.float32,
+        output_chunk_size=2,
+    )
+    x = jnp.arange(12, dtype=jnp.float32).reshape(2, 2, 3) / 10.0
+    variables = model.init(jax.random.PRNGKey(0), "...d,df->...f", x)
+    dense_weight = jnp.arange(15, dtype=jnp.float32).reshape(3, 5) / 7.0
+    quantized = official_qlora.quantize_symmetric_int4(
+        dense_weight,
+        scale_shape=(1, 5),
+        scale_dtype=jnp.float32,
+    )
+    mutable = unfreeze(variables)
+    mutable["params"]["w_qvalue"] = quantized.qvalue
+    mutable["params"]["w_scale"] = quantized.scale
+    variables = freeze(mutable)
+
+    actual = model.apply(variables, "...d,df->...f", x)
+    reference_weight = official_qlora.dequantize_symmetric_int4(
+        quantized.qvalue,
+        quantized.scale,
+        quantized.shape,
+        dtype=jnp.float32,
+    )
+    expected = jnp.einsum("...d,df->...f", x, reference_weight)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+  def test_official_qlora_einsum_middle_output_axis_matches_reference(self):
+    model = official_qlora.QuantizedLoRAEinsum(
+        rank=1,
+        shape=(2, 5, 3),
+        weight_name="w",
+        dtype=jnp.float32,
+        scale_dtype=jnp.float32,
+        output_chunk_size=2,
+    )
+    x = jnp.arange(2 * 4 * 3, dtype=jnp.float32).reshape(2, 4, 3) / 10.0
+    variables = model.init(jax.random.PRNGKey(0), "...F,NHF->...NH", x)
+    dense_weight = jnp.arange(2 * 5 * 3, dtype=jnp.float32).reshape(2, 5, 3)
+    dense_weight = (dense_weight - 11.0) / 7.0
+    quantized = official_qlora.quantize_symmetric_int4(
+        dense_weight,
+        scale_shape=(2, 5, 1),
+        scale_dtype=jnp.float32,
+    )
+    mutable = unfreeze(variables)
+    mutable["params"]["w_qvalue"] = quantized.qvalue
+    mutable["params"]["w_scale"] = quantized.scale
+    variables = freeze(mutable)
+    official_qlora._LOGGED_DENSE_FALLBACKS.clear()  # pylint: disable=protected-access
+
+    actual = model.apply(variables, "...F,NHF->...NH", x)
+    reference_weight = official_qlora.dequantize_symmetric_int4(
+        quantized.qvalue,
+        quantized.scale,
+        quantized.shape,
+        dtype=jnp.float32,
+    )
+    expected = jnp.einsum("...F,NHF->...NH", x, reference_weight)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+    self.assertEmpty(official_qlora._LOGGED_DENSE_FALLBACKS)  # pylint: disable=protected-access
+
+  def test_official_qlora_einsum_middle_output_axis_jits_dynamic_path(self):
+    model = official_qlora.QuantizedLoRAEinsum(
+        rank=1,
+        shape=(2, 4, 3),
+        weight_name="w",
+        dtype=jnp.float32,
+        scale_dtype=jnp.float32,
+        output_chunk_size=2,
+    )
+    x = jnp.arange(2 * 4 * 3, dtype=jnp.float32).reshape(2, 4, 3) / 10.0
+    variables = model.init(jax.random.PRNGKey(0), "...F,NHF->...NH", x)
+    dense_weight = jnp.arange(2 * 4 * 3, dtype=jnp.float32).reshape(2, 4, 3)
+    dense_weight = (dense_weight - 11.0) / 7.0
+    quantized = official_qlora.quantize_symmetric_int4(
+        dense_weight,
+        scale_shape=(2, 4, 1),
+        scale_dtype=jnp.float32,
+    )
+    mutable = unfreeze(variables)
+    mutable["params"]["w_qvalue"] = quantized.qvalue
+    mutable["params"]["w_scale"] = quantized.scale
+    variables = freeze(mutable)
+    official_qlora._LOGGED_DENSE_FALLBACKS.clear()  # pylint: disable=protected-access
+
+    @jax.jit
+    def apply_model(params, inputs):
+      return model.apply(params, "...F,NHF->...NH", inputs)
+
+    actual = apply_model(variables, x)
+    reference_weight = official_qlora.dequantize_symmetric_int4(
+        quantized.qvalue,
+        quantized.scale,
+        quantized.shape,
+        dtype=jnp.float32,
+    )
+    expected = jnp.einsum("...F,NHF->...NH", x, reference_weight)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+    self.assertEmpty(official_qlora._LOGGED_DENSE_FALLBACKS)  # pylint: disable=protected-access
+
+  def test_official_qlora_einsum_input_grad_matches_reference(self):
+    dense_weight = jnp.arange(2 * 4 * 3, dtype=jnp.float32).reshape(2, 4, 3)
+    dense_weight = (dense_weight - 11.0) / 7.0
+    packed = official_qlora.quantize_symmetric_int4(
+        dense_weight,
+        scale_shape=(2, 4, 1),
+        scale_dtype=jnp.float32,
+    ).astype(jnp.float32)
+    reference_weight = official_qlora.dequantize_symmetric_int4(
+        packed.qvalue,
+        packed.scale,
+        packed.shape,
+        dtype=jnp.float32,
+    )
+    x = jnp.arange(2 * 4 * 3, dtype=jnp.float32).reshape(2, 4, 3) / 10.0
+    cotangent = jnp.arange(2 * 4 * 2 * 4, dtype=jnp.float32).reshape(
+        2, 4, 2, 4
+    )
+    cotangent = (cotangent - 9.0) / 13.0
+
+    def packed_loss(inputs):
+      y = official_qlora._packed_int4_einsum(  # pylint: disable=protected-access
+          "...F,NHF->...NH",
+          inputs,
+          packed,
+          output_chunk_size=2,
+      )
+      return jnp.sum(y * cotangent)
+
+    def reference_loss(inputs):
+      return jnp.sum(jnp.einsum("...F,NHF->...NH", inputs, reference_weight) * cotangent)
+
+    actual = jax.jit(jax.grad(packed_loss))(x)
+    expected = jax.jit(jax.grad(reference_loss))(x)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+  def test_official_qlora_matmul_input_grad_matches_reference(self):
+    dense_weight = jnp.arange(3 * 5, dtype=jnp.float32).reshape(3, 5) / 7.0
+    packed = official_qlora.quantize_symmetric_int4(
+        dense_weight,
+        scale_shape=(1, 5),
+        scale_dtype=jnp.float32,
+    ).astype(jnp.float32)
+    reference_weight = official_qlora.dequantize_symmetric_int4(
+        packed.qvalue,
+        packed.scale,
+        packed.shape,
+        dtype=jnp.float32,
+    )
+    x = jnp.arange(2 * 3, dtype=jnp.float32).reshape(2, 3) / 10.0
+    cotangent = jnp.arange(2 * 5, dtype=jnp.float32).reshape(2, 5) / 11.0
+
+    def packed_loss(inputs):
+      y = official_qlora._packed_int4_matmul(  # pylint: disable=protected-access
+          inputs,
+          packed,
+          output_chunk_size=2,
+      )
+      return jnp.sum(y * cotangent)
+
+    def reference_loss(inputs):
+      return jnp.sum(jnp.matmul(inputs, reference_weight) * cotangent)
+
+    actual = jax.jit(jax.grad(packed_loss))(x)
+    expected = jax.jit(jax.grad(reference_loss))(x)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+  def test_official_qlora_dot_general_input_grad_matches_reference(self):
+    dense_weight = jnp.arange(3 * 5 * 6, dtype=jnp.float32).reshape(3, 5, 6)
+    dense_weight = (dense_weight - 19.0) / 17.0
+    packed = official_qlora.quantize_symmetric_int4(
+        dense_weight,
+        scale_shape=(1, 5, 6),
+        scale_dtype=jnp.float32,
+    ).astype(jnp.float32)
+    reference_weight = official_qlora.dequantize_symmetric_int4(
+        packed.qvalue,
+        packed.scale,
+        packed.shape,
+        dtype=jnp.float32,
+    )
+    x = jnp.arange(2 * 3 * 4, dtype=jnp.float32).reshape(2, 3, 4) / 10.0
+    cotangent = jnp.arange(2 * 4 * 5 * 6, dtype=jnp.float32).reshape(
+        2, 4, 5, 6
+    )
+    cotangent = (cotangent - 7.0) / 23.0
+    dimension_numbers = (((1,), (0,)), ((), ()))
+
+    def packed_loss(inputs):
+      y = official_qlora._packed_int4_dot_general(  # pylint: disable=protected-access
+          inputs,
+          packed,
+          dimension_numbers=dimension_numbers,
+          output_chunk_size=2,
+      )
+      return jnp.sum(y * cotangent)
+
+    def reference_loss(inputs):
+      y = jax.lax.dot_general(inputs, reference_weight, dimension_numbers)
+      return jnp.sum(y * cotangent)
+
+    actual = jax.jit(jax.grad(packed_loss))(x)
+    expected = jax.jit(jax.grad(reference_loss))(x)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+  def test_official_qlora_packed_ragged_dot_matches_dequantized_reference(
+      self,
+  ):
+    dense_weight = jnp.arange(2 * 3 * 5, dtype=jnp.float32).reshape(2, 3, 5)
+    dense_weight = (dense_weight - 10.0) / 9.0
+    packed = official_qlora.quantize_symmetric_int4(
+        dense_weight,
+        scale_shape=(2, 1, 5),
+        scale_dtype=jnp.float32,
+    ).astype(jnp.float32)
+    x = jnp.arange(4 * 3, dtype=jnp.float32).reshape(4, 3) / 8.0
+    group_sizes = jnp.array([3, 1], dtype=jnp.int32)
+
+    with official_qlora._packed_int4_runtime_context(  # pylint: disable=protected-access
+        ragged_output_chunk_size=2
+    ):
+      actual = jax.lax.ragged_dot(x, packed, group_sizes=group_sizes)
+
+    reference_weight = official_qlora.dequantize_symmetric_int4(
+        packed.qvalue,
+        packed.scale,
+        packed.shape,
+        dtype=jnp.float32,
+    )
+    expected = jax.lax.ragged_dot(
+        x,
+        reference_weight,
+        group_sizes=group_sizes,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+  def test_official_qlora_packed_gating_ragged_dot_matches_reference(self):
+    dense_weight = jnp.arange(2 * 2 * 3 * 4, dtype=jnp.float32).reshape(
+        2, 2, 3, 4
+    )
+    dense_weight = (dense_weight - 17.0) / 11.0
+    packed = official_qlora.quantize_symmetric_int4(
+        dense_weight,
+        scale_shape=(2, 2, 3, 1),
+        scale_dtype=jnp.float32,
+    ).astype(jnp.float32)
+    x = jnp.arange(5 * 4, dtype=jnp.float32).reshape(5, 4) / 13.0
+    group_sizes = jnp.array([2, 3], dtype=jnp.int32)
+
+    with official_qlora._packed_int4_runtime_context(  # pylint: disable=protected-access
+        ragged_output_chunk_size=2
+    ):
+      rhs = jnp.transpose(packed, (0, 3, 1, 2)).reshape(2, 4, 6)
+      actual = jax.lax.ragged_dot(x, rhs, group_sizes=group_sizes)
+
+    reference_weight = official_qlora.dequantize_symmetric_int4(
+        packed.qvalue,
+        packed.scale,
+        packed.shape,
+        dtype=jnp.float32,
+    )
+    reference_rhs = jnp.transpose(reference_weight, (0, 3, 1, 2)).reshape(
+        2, 4, 6
+    )
+    expected = jax.lax.ragged_dot(
+        x,
+        reference_rhs,
+        group_sizes=group_sizes,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+  def test_official_qlora_packed_ragged_dot_input_grad_matches_reference(self):
+    dense_weight = jnp.arange(2 * 3 * 4, dtype=jnp.float32).reshape(2, 3, 4)
+    dense_weight = (dense_weight - 8.0) / 7.0
+    packed = official_qlora.quantize_symmetric_int4(
+        dense_weight,
+        scale_shape=(2, 1, 4),
+        scale_dtype=jnp.float32,
+    ).astype(jnp.float32)
+    reference_rhs = official_qlora.dequantize_symmetric_int4(
+        packed.qvalue,
+        packed.scale,
+        packed.shape,
+        dtype=jnp.float32,
+    )
+    x = jnp.arange(5 * 3, dtype=jnp.float32).reshape(5, 3) / 17.0
+    group_sizes = jnp.array([2, 3], dtype=jnp.int32)
+    cotangent = jnp.arange(5 * 4, dtype=jnp.float32).reshape(5, 4) / 19.0
+
+    def packed_loss(inputs):
+      with official_qlora._packed_int4_runtime_context(  # pylint: disable=protected-access
+          ragged_output_chunk_size=2
+      ):
+        y = jax.lax.ragged_dot(inputs, packed, group_sizes=group_sizes)
+      return jnp.sum(y * cotangent)
+
+    def reference_loss(inputs):
+      y = jax.lax.ragged_dot(inputs, reference_rhs, group_sizes=group_sizes)
+      return jnp.sum(y * cotangent)
+
+    actual = jax.jit(jax.grad(packed_loss))(x)
+    expected = jax.jit(jax.grad(reference_loss))(x)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+  def test_official_qlora_packed_ragged_dot_general_matches_reference(self):
+    dense_weight = jnp.arange(2 * 3 * 4, dtype=jnp.float32).reshape(2, 3, 4)
+    dense_weight = (dense_weight - 8.0) / 7.0
+    packed = official_qlora.quantize_symmetric_int4(
+        dense_weight,
+        scale_shape=(2, 1, 4),
+        scale_dtype=jnp.float32,
+    ).astype(jnp.float32)
+    x = jnp.arange(5 * 3, dtype=jnp.float32).reshape(5, 3) / 17.0
+    group_sizes = jnp.array([2, 3], dtype=jnp.int32)
+    dnums = jax.lax.RaggedDotDimensionNumbers(
+        (((1,), (1,)), ((), ())),
+        (0,),
+        (0,),
+    )
+
+    with official_qlora._packed_int4_runtime_context(  # pylint: disable=protected-access
+        ragged_output_chunk_size=2
+    ):
+      actual = jax.lax.ragged_dot_general(
+          x,
+          packed,
+          group_sizes=group_sizes,
+          ragged_dot_dimension_numbers=dnums,
+      )
+
+    reference_rhs = official_qlora.dequantize_symmetric_int4(
+        packed.qvalue,
+        packed.scale,
+        packed.shape,
+        dtype=jnp.float32,
+    )
+    expected = jax.lax.ragged_dot_general(
+        x,
+        reference_rhs,
+        group_sizes=group_sizes,
+        ragged_dot_dimension_numbers=dnums,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+  def test_official_qlora_packed_gating_ragged_dot_general_jits(self):
+    dense_weight = jnp.arange(2 * 2 * 3 * 4, dtype=jnp.float32).reshape(
+        2, 2, 3, 4
+    )
+    dense_weight = (dense_weight - 17.0) / 11.0
+    packed = official_qlora.quantize_symmetric_int4(
+        dense_weight,
+        scale_shape=(2, 2, 3, 1),
+        scale_dtype=jnp.float32,
+    ).astype(jnp.float32)
+    x = jnp.arange(5 * 4, dtype=jnp.float32).reshape(5, 4) / 13.0
+    group_sizes = jnp.array([2, 3], dtype=jnp.int32)
+    dnums = jax.lax.RaggedDotDimensionNumbers(
+        (((1,), (1,)), ((), ())),
+        (0,),
+        (0,),
+    )
+
+    def run(x, packed, group_sizes):
+      with official_qlora._packed_int4_runtime_context(  # pylint: disable=protected-access
+          ragged_output_chunk_size=2
+      ):
+        rhs = jnp.transpose(packed, (0, 3, 1, 2)).reshape(2, 4, 6)
+        return jax.lax.ragged_dot_general(
+            x,
+            rhs,
+            group_sizes=group_sizes,
+            ragged_dot_dimension_numbers=dnums,
+        )
+
+    actual = jax.jit(run)(x, packed, group_sizes)
+
+    reference_weight = official_qlora.dequantize_symmetric_int4(
+        packed.qvalue,
+        packed.scale,
+        packed.shape,
+        dtype=jnp.float32,
+    )
+    reference_rhs = jnp.transpose(reference_weight, (0, 3, 1, 2)).reshape(
+        2, 4, 6
+    )
+    expected = jax.lax.ragged_dot_general(
+        x,
+        reference_rhs,
+        group_sizes=group_sizes,
+        ragged_dot_dimension_numbers=dnums,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+  def test_official_qlora_checkpoint_candidates_match_gemma_paths(self):
+    self.assertIn(
+        "layer_0/mlp/gating_einsum",
+        official_qlora.checkpoint_candidates_for_quantized_path(
+            "layer_0/mlp/_QLoRAEinsum_gating_einsum/gating_einsum_qvalue"
+        ),
+    )
+    self.assertIn(
+        "layer_0/attn/q_einsum/w",
+        official_qlora.checkpoint_candidates_for_quantized_path(
+            "layer_0/attn/q_einsum/_QLoRAEinsum_0/w_scale"
+        ),
+    )
+    self.assertIn(
+        "layer_0/mlp/gating_einsum/w",
+        official_qlora.checkpoint_candidates_for_quantized_path(
+            "layer_0/mlp/gating_einsum/_QLoRAWeight_0/w_qvalue"
+        ),
+    )
+
+  def test_official_qlora_moe_weight_scale_shapes(self):
+    self.assertEqual(
+        official_qlora.deduce_moe_weight_scale_shape(
+            "layer_0/mlp/gating_einsum", (8, 2, 16, 32)
+        ),
+        (8, 2, 16, 1),
+    )
+    self.assertEqual(
+        official_qlora.deduce_moe_weight_scale_shape(
+            "layer_0/mlp/linear", (8, 16, 32)
+        ),
+        (8, 1, 32),
+    )
+
+  def test_official_qlora_moe_weight_provider_uses_quantized_storage(self):
+    model = official_qlora.QuantizedWeightProvider(
+        shape=(2, 3, 4),
+        dtype=jnp.float32,
+        scale_dtype=jnp.float32,
+        module_path="layer_0/mlp/linear",
+    )
+    variables = model.init(jax.random.PRNGKey(0))
+    flat_params = flax.traverse_util.flatten_dict(unfreeze(variables)["params"])
+    leaf_paths = {"/".join(str(part) for part in path) for path in flat_params}
+
+    self.assertIn("w_qvalue", leaf_paths)
+    self.assertIn("w_scale", leaf_paths)
+    self.assertNotIn("w", leaf_paths)
+    self.assertEqual(flat_params[("w_qvalue",)].shape, (2, 3, 2))
+    self.assertEqual(flat_params[("w_scale",)].shape, (2, 1, 4))
+
+  def test_official_qlora_can_skip_moe_weight_quantization(self):
+    class _Weight(linen_nn.Module):
+      shape: tuple[int, ...]
+      weight_name: str = "w"
+      dtype: jnp.dtype = jnp.float32
+
+    module = _Weight(shape=(2, 3, 4), name="linear")
+
+    replaced = official_qlora._replace_by_official_qlora(  # pylint: disable=protected-access
+        module,
+        rank=2,
+        dtype=jnp.float32,
+        target_modules=official_qlora.ALL_LINEAR,
+        supported_modules=(),
+        matches_target_modules=lambda module, target_modules: True,
+        lora_einsum_adapter_cls=None,
+        lora_dense_adapter_cls=None,
+        lora_dense_general_adapter_cls=None,
+        scale_dtype=jnp.float32,
+        quantize_moe_weights=False,
+        einsum_output_chunk_size=2,
+        ragged_output_chunk_size=2,
+    )
+
+    self.assertIs(replaced, module)
+
+  def test_official_qlora_quantizes_moe_weight_by_default(self):
+    class _Weight(linen_nn.Module):
+      shape: tuple[int, ...]
+      weight_name: str = "w"
+      dtype: jnp.dtype = jnp.float32
+
+    module = _Weight(shape=(2, 3, 4), name="linear")
+
+    replaced = official_qlora._replace_by_official_qlora(  # pylint: disable=protected-access
+        module,
+        rank=2,
+        dtype=jnp.float32,
+        target_modules=official_qlora.ALL_LINEAR,
+        supported_modules=(),
+        matches_target_modules=lambda module, target_modules: True,
+        lora_einsum_adapter_cls=None,
+        lora_dense_adapter_cls=None,
+        lora_dense_general_adapter_cls=None,
+        scale_dtype=jnp.float32,
+        quantize_moe_weights=True,
+        einsum_output_chunk_size=2,
+        ragged_output_chunk_size=2,
+    )
+
+    self.assertIsInstance(replaced, official_qlora.QuantizedWeightProvider)
+
+  def test_official_qlora_checkpoint_leaf_quantizes_dense_weight(self):
+    model_flat = {
+        "layer_0/attn/q_einsum/_QLoRAEinsum_0/w_qvalue": jax.ShapeDtypeStruct(
+            (4, 2), jnp.uint8
+        ),
+        "layer_0/attn/q_einsum/_QLoRAEinsum_0/w_scale": jax.ShapeDtypeStruct(
+            (1, 3), jnp.float32
+        ),
+    }
+    dense = jnp.arange(12, dtype=jnp.float32).reshape(4, 3) - 6.0
+
+    qvalue = official_qlora.quantize_checkpoint_leaf(
+        quantized_path="layer_0/attn/q_einsum/_QLoRAEinsum_0/w_qvalue",
+        checkpoint_value=dense,
+        model_flat=model_flat,
+    )
+    scale = official_qlora.quantize_checkpoint_leaf(
+        quantized_path="layer_0/attn/q_einsum/_QLoRAEinsum_0/w_scale",
+        checkpoint_value=dense,
+        model_flat=model_flat,
+    )
+
+    self.assertEqual(qvalue.shape, (4, 2))
+    self.assertEqual(qvalue.dtype, jnp.uint8)
+    self.assertEqual(scale.shape, (1, 3))
+    self.assertEqual(scale.dtype, jnp.float32)
+
+  def test_official_qlora_param_summary_counts_qvalue_scale_pair(self):
+    summary = hackable_adapter._param_tree_memory_summary({  # pylint: disable=protected-access
+        "layer_0": {
+            "attn": {
+                "q_einsum": {
+                    "_QLoRAEinsum_0": {
+                        "w_qvalue": jnp.zeros((6,), dtype=jnp.uint8),
+                        "w_scale": jnp.ones((1, 3), dtype=jnp.bfloat16),
+                        "lora": {
+                            "a": jnp.ones((4, 2), dtype=jnp.bfloat16),
+                            "b": jnp.ones((2, 3), dtype=jnp.bfloat16),
+                        },
+                    },
+                    "router_scale": jnp.ones((1,), dtype=jnp.bfloat16),
+                }
+            }
+        }
+    })
+
+    self.assertEqual(summary["quantized_base_leaves"], 1)
+    self.assertEqual(summary["quantized_base_qvalue_bytes"], 6)
+    self.assertEqual(summary["quantized_base_scale_bytes"], 6)
+    self.assertEqual(summary["quantized_base_storage_bytes"], 12)
+    self.assertEqual(summary["quantized_base_dense_equivalent_bf16_bytes"], 24)
+    self.assertEqual(summary["lora_path_leaves"], 2)
+    self.assertEqual(summary["dense_non_lora_leaves"], 1)
+    self.assertIn("int4", summary["qtypes"])
+
+  def test_lora_adapter_apply_updates_keeps_base_frozen(self):
     original_apply_updates = optax.apply_updates
-    original_patch_flag = hackable_adapter._QWIX_OPTAX_PATCHED  # pylint: disable=protected-access
+    original_patch_flag = hackable_adapter._ADAPTER_ONLY_OPTAX_PATCHED  # pylint: disable=protected-access
     original_optax_marker = getattr(
         optax,
-        "_tunix_qwix_apply_updates_patched",
+        "_tunix_lora_adapter_apply_updates_patched",
         None,
     )
     original_optax_apply_updates = getattr(
         optax,
-        "_tunix_original_apply_updates",
+        "_tunix_lora_adapter_original_apply_updates",
         None,
     )
-    if hasattr(optax, "_tunix_qwix_apply_updates_patched"):
-      delattr(optax, "_tunix_qwix_apply_updates_patched")
-    if hasattr(optax, "_tunix_original_apply_updates"):
-      delattr(optax, "_tunix_original_apply_updates")
-    hackable_adapter._QWIX_OPTAX_PATCHED = False  # pylint: disable=protected-access
+    if hasattr(optax, "_tunix_lora_adapter_apply_updates_patched"):
+      delattr(optax, "_tunix_lora_adapter_apply_updates_patched")
+    if hasattr(optax, "_tunix_lora_adapter_original_apply_updates"):
+      delattr(optax, "_tunix_lora_adapter_original_apply_updates")
+    hackable_adapter._ADAPTER_ONLY_OPTAX_PATCHED = False  # pylint: disable=protected-access
     try:
-      hackable_adapter._patch_qwix_optax_apply_updates()  # pylint: disable=protected-access
+      hackable_adapter._patch_lora_adapter_only_optax_apply_updates()  # pylint: disable=protected-access
       int_param = jnp.array([1, 2], dtype=jnp.int32)
 
       def _constant_loss(value):
@@ -936,17 +2172,19 @@ class DiffusionGemmaTest(absltest.TestCase):
       )
     finally:
       optax.apply_updates = original_apply_updates
-      hackable_adapter._QWIX_OPTAX_PATCHED = original_patch_flag  # pylint: disable=protected-access
+      hackable_adapter._ADAPTER_ONLY_OPTAX_PATCHED = original_patch_flag  # pylint: disable=protected-access
       if original_optax_marker is None:
-        if hasattr(optax, "_tunix_qwix_apply_updates_patched"):
-          delattr(optax, "_tunix_qwix_apply_updates_patched")
+        if hasattr(optax, "_tunix_lora_adapter_apply_updates_patched"):
+          delattr(optax, "_tunix_lora_adapter_apply_updates_patched")
       else:
-        optax._tunix_qwix_apply_updates_patched = original_optax_marker
+        optax._tunix_lora_adapter_apply_updates_patched = original_optax_marker
       if original_optax_apply_updates is None:
-        if hasattr(optax, "_tunix_original_apply_updates"):
-          delattr(optax, "_tunix_original_apply_updates")
+        if hasattr(optax, "_tunix_lora_adapter_original_apply_updates"):
+          delattr(optax, "_tunix_lora_adapter_original_apply_updates")
       else:
-        optax._tunix_original_apply_updates = original_optax_apply_updates
+        optax._tunix_lora_adapter_original_apply_updates = (
+            original_optax_apply_updates
+        )
 
   def test_sft_loss_is_finite(self):
     vocab_size = 32

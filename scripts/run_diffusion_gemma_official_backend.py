@@ -66,6 +66,72 @@ def _parse_key_value(items: list[str]) -> dict[str, Any]:
   return values
 
 
+def _base_config_from_args(args: argparse.Namespace):
+  return hackable_adapter.OfficialSFTConfig(
+      recipe=args.recipe,
+      gemma_ref=args.gemma_ref,
+      hackable_diffusion_ref=args.hackable_diffusion_ref,
+      workdir=args.workdir,
+      checkpoint_path=args.checkpoint_path,
+      num_train_steps=args.num_train_steps,
+      run_steps=args.run_steps,
+      checkpoint_every_n_steps=args.checkpoint_every_n_steps,
+      lora_rank=args.lora_rank,
+      lora_backend=args.lora_backend,
+      official_qlora_quantize_moe_weights=(
+          args.official_qlora_quantize_moe_weights
+      ),
+      official_qlora_einsum_output_chunk_size=(
+          args.official_qlora_einsum_output_chunk_size
+      ),
+      official_qlora_ragged_output_chunk_size=(
+          args.official_qlora_ragged_output_chunk_size
+      ),
+      official_remat_blocks=args.official_remat_blocks,
+      stop_gradient_from_denoiser_to_encoder=(
+          args.stop_gradient_from_denoiser_to_encoder
+      ),
+      lora_alpha=args.lora_alpha,
+      qwix_lora_module_path=args.qwix_lora_module_path,
+      dataset_batch_size=args.dataset_batch_size,
+      skip_step_metrics=args.skip_step_metrics,
+      log_losses=args.log_losses,
+      sync_after_step=args.sync_after_step,
+      save_final_checkpoint=args.save_final_checkpoint,
+      train_loop=args.train_loop,
+      log_param_summary=args.log_param_summary,
+      encoder_loss_token_chunk_size=args.encoder_loss_token_chunk_size,
+      encoder_loss_vocab_chunk_size=args.encoder_loss_vocab_chunk_size,
+      use_early_stopping=args.use_early_stopping,
+      disable_evals=args.disable_evals,
+      module_overrides=_parse_key_value(args.module_override),
+      config_overrides=_parse_key_value(args.config_override),
+  )
+
+
+def _trainer_from_args(args: argparse.Namespace):
+  base_config = _base_config_from_args(args)
+  if args.lora_backend != "qwix_lora":
+    return hackable_adapter.OfficialDiffusionGemmaTrainer(base_config)
+
+  peft_config = hackable_adapter.DiffusionGemmaQwixLoRAConfig(
+      rank=args.lora_rank or 4,
+      alpha=args.lora_alpha,
+      module_path=args.qwix_lora_module_path,
+  )
+  loss_config = hackable_adapter.DiffusionGemmaOfficialLossConfig(
+      train_loop=args.train_loop,
+      sync_after_step=args.sync_after_step,
+      log_losses=args.log_losses,
+      encoder_loss_token_chunk_size=args.encoder_loss_token_chunk_size,
+  )
+  return hackable_adapter.OfficialDiffusionGemmaTrainer.from_official_backend(
+      base_config=base_config,
+      peft_config=peft_config,
+      loss_config=loss_config,
+  )
+
+
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser()
   parser.add_argument(
@@ -91,13 +157,60 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--lora_rank", type=int, default=None)
   parser.add_argument(
       "--lora_backend",
-      choices=["official", "qwix_lora"],
+      choices=["official", "official_qlora", "qwix_lora"],
       default="official",
       help=(
           "LoRA implementation inside the official recipe. 'official' keeps"
-          " DeepMind Hackable Diffusion LoRA; 'qwix_lora' patches only the"
-          " Linen LoRA constructor while retaining the official"
-          " model/loss/trainstep."
+          " DeepMind Hackable Diffusion LoRA; 'official_qlora' keeps that"
+          " official LoRA surface but stores frozen base weights as packed"
+          " int4 qvalue/scale leaves; 'qwix_lora' patches only the Linen LoRA"
+          " constructor while retaining the official model/loss/trainstep."
+      ),
+  )
+  parser.add_argument(
+      "--official_qlora_quantize_moe_weights",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help=(
+          "For lora_backend=official_qlora, also quantize Gemma4 MoERagged "
+          "private _Weight leaves. Disable to isolate the MoE weight path."
+      ),
+  )
+  parser.add_argument(
+      "--official_qlora_einsum_output_chunk_size",
+      type=int,
+      default=256,
+      help=(
+          "For lora_backend=official_qlora, chunk packed int4 Dense/Einsum "
+          "base-weight execution along the output feature axis."
+      ),
+  )
+  parser.add_argument(
+      "--official_qlora_ragged_output_chunk_size",
+      type=int,
+      default=256,
+      help=(
+          "For lora_backend=official_qlora, chunk packed int4 MoE ragged_dot "
+          "base-weight execution along the output feature axis."
+      ),
+  )
+  parser.add_argument(
+      "--official_remat_blocks",
+      action=argparse.BooleanOptionalAction,
+      default=False,
+      help=(
+          "Apply the official Sudoku-full Gemma4 Block.__call__ nn.remat "
+          "patch. This is useful for high-memory PubMedQA QLoRA runs and is "
+          "off by default so existing official/LoRA runs are unchanged."
+      ),
+  )
+  parser.add_argument(
+      "--stop_gradient_from_denoiser_to_encoder",
+      action=argparse.BooleanOptionalAction,
+      default=None,
+      help=(
+          "Override the official SFTDiffusion setting. True reduces denoiser "
+          "backprop through the encoder KV cache; unset preserves the recipe."
       ),
   )
   parser.add_argument("--lora_alpha", type=float, default=None)
@@ -201,6 +314,16 @@ def parse_args() -> argparse.Namespace:
       ),
   )
   parser.add_argument(
+      "--encoder_loss_vocab_chunk_size",
+      type=int,
+      default=8192,
+      help=(
+          "When the memory-safe encoder AR loss is enabled, stream the tied "
+          "vocab projection this many vocabulary entries at a time instead "
+          "of materializing full-vocab logits."
+      ),
+  )
+  parser.add_argument(
       "--config_override",
       action="append",
       default=[],
@@ -223,32 +346,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
   args = parse_args()
-  config = hackable_adapter.OfficialSFTConfig(
-      recipe=args.recipe,
-      gemma_ref=args.gemma_ref,
-      hackable_diffusion_ref=args.hackable_diffusion_ref,
-      workdir=args.workdir,
-      checkpoint_path=args.checkpoint_path,
-      num_train_steps=args.num_train_steps,
-      run_steps=args.run_steps,
-      checkpoint_every_n_steps=args.checkpoint_every_n_steps,
-      lora_rank=args.lora_rank,
-      lora_backend=args.lora_backend,
-      lora_alpha=args.lora_alpha,
-      qwix_lora_module_path=args.qwix_lora_module_path,
-      dataset_batch_size=args.dataset_batch_size,
-      skip_step_metrics=args.skip_step_metrics,
-      log_losses=args.log_losses,
-      sync_after_step=args.sync_after_step,
-      save_final_checkpoint=args.save_final_checkpoint,
-      train_loop=args.train_loop,
-      log_param_summary=args.log_param_summary,
-      encoder_loss_token_chunk_size=args.encoder_loss_token_chunk_size,
-      use_early_stopping=args.use_early_stopping,
-      disable_evals=args.disable_evals,
-      module_overrides=_parse_key_value(args.module_override),
-      config_overrides=_parse_key_value(args.config_override),
-  )
   dependency_report = hackable_adapter.check_dependencies(
       [path for path in (args.hackable_diffusion_ref, args.gemma_ref) if path]
   )
@@ -264,7 +361,7 @@ def main() -> None:
   )
   if not dependency_report["available"]:
     raise SystemExit("Official DiffusionGemma backend dependencies missing.")
-  trainer = hackable_adapter.OfficialDiffusionGemmaTrainer(config)
+  trainer = _trainer_from_args(args)
   if args.build_config_only:
     cfg = trainer.build_config()
     print(
@@ -286,12 +383,30 @@ def main() -> None:
                 "lora_backend": getattr(
                     getattr(cfg, "aux", None), "lora_backend", None
                 ),
+                "official_qlora_quantize_moe_weights": (
+                    args.official_qlora_quantize_moe_weights
+                ),
+                "official_qlora_einsum_output_chunk_size": (
+                    args.official_qlora_einsum_output_chunk_size
+                ),
+                "official_qlora_ragged_output_chunk_size": (
+                    args.official_qlora_ragged_output_chunk_size
+                ),
+                "official_remat_blocks": args.official_remat_blocks,
+                "stop_gradient_from_denoiser_to_encoder": (
+                    args.stop_gradient_from_denoiser_to_encoder
+                ),
                 "lora_alpha": getattr(
                     getattr(cfg, "aux", None), "lora_alpha", None
                 ),
                 "encoder_loss_token_chunk_size": getattr(
                     getattr(cfg, "aux", None),
                     "encoder_loss_token_chunk_size",
+                    None,
+                ),
+                "encoder_loss_vocab_chunk_size": getattr(
+                    getattr(cfg, "aux", None),
+                    "encoder_loss_vocab_chunk_size",
                     None,
                 ),
                 "dataset_batch_size": args.dataset_batch_size,
@@ -320,6 +435,19 @@ def main() -> None:
           "num_train_steps": args.num_train_steps,
           "run_steps": args.run_steps,
           "lora_backend": args.lora_backend,
+          "official_qlora_quantize_moe_weights": (
+              args.official_qlora_quantize_moe_weights
+          ),
+          "official_qlora_einsum_output_chunk_size": (
+              args.official_qlora_einsum_output_chunk_size
+          ),
+          "official_qlora_ragged_output_chunk_size": (
+              args.official_qlora_ragged_output_chunk_size
+          ),
+          "official_remat_blocks": args.official_remat_blocks,
+          "stop_gradient_from_denoiser_to_encoder": (
+              args.stop_gradient_from_denoiser_to_encoder
+          ),
           "lora_alpha": args.lora_alpha,
           "skip_step_metrics": args.skip_step_metrics,
           "log_losses": args.log_losses,
@@ -327,6 +455,7 @@ def main() -> None:
           "train_loop": args.train_loop,
           "log_param_summary": args.log_param_summary,
           "encoder_loss_token_chunk_size": args.encoder_loss_token_chunk_size,
+          "encoder_loss_vocab_chunk_size": args.encoder_loss_vocab_chunk_size,
       }),
       flush=True,
   )

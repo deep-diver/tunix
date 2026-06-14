@@ -19,16 +19,24 @@ MODE=""
 CLI_MAX_RUNTIME_SECONDS=""
 CLI_NUM_TRAIN_STEPS=""
 CLI_RUN_STEPS=""
+CLI_DATASET_BATCH_SIZE=""
 CLI_LOG_LOSSES=""
 CLI_JAX_PACKAGE_SPEC=""
 CLI_SYNC_AFTER_STEP=""
 CLI_RUN_NAME=""
 CLI_LORA_BACKEND=""
+CLI_OFFICIAL_QLORA_QUANTIZE_MOE_WEIGHTS=""
+CLI_OFFICIAL_QLORA_EINSUM_OUTPUT_CHUNK_SIZE=""
+CLI_OFFICIAL_QLORA_RAGGED_OUTPUT_CHUNK_SIZE=""
 CLI_LORA_ALPHA=""
 CLI_QWIX_LORA_MODULE_PATH=""
 CLI_LOG_PARAM_SUMMARY=""
 CLI_ENCODER_LOSS_TOKEN_CHUNK_SIZE=""
+CLI_ENCODER_LOSS_VOCAB_CHUNK_SIZE=""
 CLI_GPU_POLL_SECONDS=""
+CLI_XLA_PYTHON_CLIENT_MEM_FRACTION=""
+CLI_XLA_PYTHON_CLIENT_PREALLOCATE=""
+CLI_TF_GPU_ALLOCATOR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode)
@@ -45,6 +53,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --run_steps)
       CLI_RUN_STEPS="$2"
+      shift 2
+      ;;
+    --dataset_batch_size)
+      CLI_DATASET_BATCH_SIZE="$2"
       shift 2
       ;;
     --log_losses)
@@ -67,6 +79,26 @@ while [[ $# -gt 0 ]]; do
       CLI_LORA_BACKEND="$2"
       shift 2
       ;;
+    --official_qlora_quantize_moe_weights)
+      CLI_OFFICIAL_QLORA_QUANTIZE_MOE_WEIGHTS="$2"
+      shift 2
+      ;;
+    --official_qlora_einsum_output_chunk_size)
+      CLI_OFFICIAL_QLORA_EINSUM_OUTPUT_CHUNK_SIZE="$2"
+      shift 2
+      ;;
+    --official_qlora_ragged_output_chunk_size)
+      CLI_OFFICIAL_QLORA_RAGGED_OUTPUT_CHUNK_SIZE="$2"
+      shift 2
+      ;;
+    --official_remat_blocks)
+      CLI_OFFICIAL_REMAT_BLOCKS="$2"
+      shift 2
+      ;;
+    --stop_gradient_from_denoiser_to_encoder)
+      CLI_STOP_GRADIENT_FROM_DENOISER_TO_ENCODER="$2"
+      shift 2
+      ;;
     --lora_alpha)
       CLI_LORA_ALPHA="$2"
       shift 2
@@ -83,8 +115,24 @@ while [[ $# -gt 0 ]]; do
       CLI_ENCODER_LOSS_TOKEN_CHUNK_SIZE="$2"
       shift 2
       ;;
+    --encoder_loss_vocab_chunk_size)
+      CLI_ENCODER_LOSS_VOCAB_CHUNK_SIZE="$2"
+      shift 2
+      ;;
     --gpu_poll_seconds)
       CLI_GPU_POLL_SECONDS="$2"
+      shift 2
+      ;;
+    --xla_python_client_mem_fraction)
+      CLI_XLA_PYTHON_CLIENT_MEM_FRACTION="$2"
+      shift 2
+      ;;
+    --xla_python_client_preallocate)
+      CLI_XLA_PYTHON_CLIENT_PREALLOCATE="$2"
+      shift 2
+      ;;
+    --tf_gpu_allocator)
+      CLI_TF_GPU_ALLOCATOR="$2"
       shift 2
       ;;
     *)
@@ -116,9 +164,14 @@ MAX_RUNTIME_SECONDS="${CLI_MAX_RUNTIME_SECONDS:-${MAX_RUNTIME_SECONDS:-10800}}"
 NUM_TRAIN_STEPS="${CLI_NUM_TRAIN_STEPS:-${NUM_TRAIN_STEPS:-2000}}"
 RUN_STEPS="${CLI_RUN_STEPS:-${RUN_STEPS:-}}"
 CHECKPOINT_EVERY_N_STEPS="${CHECKPOINT_EVERY_N_STEPS:-1000}"
-DATASET_BATCH_SIZE="${DATASET_BATCH_SIZE:-2}"
+DATASET_BATCH_SIZE="${CLI_DATASET_BATCH_SIZE:-${DATASET_BATCH_SIZE:-2}}"
 LORA_RANK="${LORA_RANK:-4}"
 LORA_BACKEND="${CLI_LORA_BACKEND:-${LORA_BACKEND:-official}}"
+OFFICIAL_QLORA_QUANTIZE_MOE_WEIGHTS="${CLI_OFFICIAL_QLORA_QUANTIZE_MOE_WEIGHTS:-${OFFICIAL_QLORA_QUANTIZE_MOE_WEIGHTS:-true}}"
+OFFICIAL_QLORA_EINSUM_OUTPUT_CHUNK_SIZE="${CLI_OFFICIAL_QLORA_EINSUM_OUTPUT_CHUNK_SIZE:-${OFFICIAL_QLORA_EINSUM_OUTPUT_CHUNK_SIZE:-256}}"
+OFFICIAL_QLORA_RAGGED_OUTPUT_CHUNK_SIZE="${CLI_OFFICIAL_QLORA_RAGGED_OUTPUT_CHUNK_SIZE:-${OFFICIAL_QLORA_RAGGED_OUTPUT_CHUNK_SIZE:-256}}"
+OFFICIAL_REMAT_BLOCKS="${CLI_OFFICIAL_REMAT_BLOCKS:-${OFFICIAL_REMAT_BLOCKS:-false}}"
+STOP_GRADIENT_FROM_DENOISER_TO_ENCODER="${CLI_STOP_GRADIENT_FROM_DENOISER_TO_ENCODER:-${STOP_GRADIENT_FROM_DENOISER_TO_ENCODER:-}}"
 LORA_ALPHA="${CLI_LORA_ALPHA:-${LORA_ALPHA:-}}"
 QWIX_LORA_MODULE_PATH="${CLI_QWIX_LORA_MODULE_PATH:-${QWIX_LORA_MODULE_PATH:-}}"
 GPU_POLL_SECONDS="${CLI_GPU_POLL_SECONDS:-${GPU_POLL_SECONDS:-60}}"
@@ -131,6 +184,16 @@ SYNC_AFTER_STEP="${CLI_SYNC_AFTER_STEP:-${SYNC_AFTER_STEP:-state}}"
 SAVE_FINAL_CHECKPOINT="${SAVE_FINAL_CHECKPOINT:-false}"
 LOG_PARAM_SUMMARY="${CLI_LOG_PARAM_SUMMARY:-${LOG_PARAM_SUMMARY:-false}}"
 ENCODER_LOSS_TOKEN_CHUNK_SIZE="${CLI_ENCODER_LOSS_TOKEN_CHUNK_SIZE:-${ENCODER_LOSS_TOKEN_CHUNK_SIZE:-}}"
+ENCODER_LOSS_VOCAB_CHUNK_SIZE="${CLI_ENCODER_LOSS_VOCAB_CHUNK_SIZE:-${ENCODER_LOSS_VOCAB_CHUNK_SIZE:-8192}}"
+if [[ "${LORA_BACKEND}" == "official_qlora" ]]; then
+  XLA_PYTHON_CLIENT_MEM_FRACTION="${CLI_XLA_PYTHON_CLIENT_MEM_FRACTION:-${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.95}}"
+  XLA_PYTHON_CLIENT_PREALLOCATE="${CLI_XLA_PYTHON_CLIENT_PREALLOCATE:-${XLA_PYTHON_CLIENT_PREALLOCATE:-true}}"
+  TF_GPU_ALLOCATOR="${CLI_TF_GPU_ALLOCATOR:-${TF_GPU_ALLOCATOR:-cuda_malloc_async}}"
+else
+  XLA_PYTHON_CLIENT_MEM_FRACTION="${CLI_XLA_PYTHON_CLIENT_MEM_FRACTION:-${XLA_PYTHON_CLIENT_MEM_FRACTION:-}}"
+  XLA_PYTHON_CLIENT_PREALLOCATE="${CLI_XLA_PYTHON_CLIENT_PREALLOCATE:-${XLA_PYTHON_CLIENT_PREALLOCATE:-}}"
+  TF_GPU_ALLOCATOR="${CLI_TF_GPU_ALLOCATOR:-${TF_GPU_ALLOCATOR:-}}"
+fi
 
 python_version_ok() {
   "$1" - <<'PY' >/dev/null 2>&1
@@ -148,8 +211,24 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
     PYTHON_BIN="$(command -v python3.12)"
   elif command -v python3.13 >/dev/null 2>&1 && python_version_ok "$(command -v python3.13)"; then
     PYTHON_BIN="$(command -v python3.13)"
+  elif command -v uv >/dev/null 2>&1 && uv python find 3.12 >/dev/null 2>&1; then
+    PYTHON_BIN="$(uv python find 3.12)"
   elif [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -x "${VIRTUAL_ENV}/bin/python" ]] && python_version_ok "${VIRTUAL_ENV}/bin/python"; then
-    PYTHON_BIN="${VIRTUAL_ENV}/bin/python"
+    VENV_PY_VERSION="$("${VIRTUAL_ENV}/bin/python" - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+    if [[ "${VENV_PY_VERSION}" == "3.12" || "${VENV_PY_VERSION}" == "3.13" ]]; then
+      PYTHON_BIN="${VIRTUAL_ENV}/bin/python"
+    fi
+  fi
+fi
+
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if command -v uv >/dev/null 2>&1; then
+    uv python install 3.12
+    PYTHON_BIN="$(uv python find 3.12)"
   else
     if ! command -v uv >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
       if ! python3 -m pip --version >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
@@ -198,15 +277,22 @@ json_event comparison_job_start \
   dataset_batch_size="${DATASET_BATCH_SIZE}" \
   lora_rank="${LORA_RANK}" \
   lora_backend="${LORA_BACKEND}" \
+  official_qlora_quantize_moe_weights="${OFFICIAL_QLORA_QUANTIZE_MOE_WEIGHTS}" \
+  official_qlora_einsum_output_chunk_size="${OFFICIAL_QLORA_EINSUM_OUTPUT_CHUNK_SIZE}" \
+  official_qlora_ragged_output_chunk_size="${OFFICIAL_QLORA_RAGGED_OUTPUT_CHUNK_SIZE}" \
   lora_alpha="${LORA_ALPHA:-}" \
   train_loop="${TRAIN_LOOP}" \
   log_losses="${LOG_LOSSES}" \
   sync_after_step="${SYNC_AFTER_STEP}" \
   log_param_summary="${LOG_PARAM_SUMMARY}" \
   encoder_loss_token_chunk_size="${ENCODER_LOSS_TOKEN_CHUNK_SIZE:-}" \
+  encoder_loss_vocab_chunk_size="${ENCODER_LOSS_VOCAB_CHUNK_SIZE:-}" \
   gpu_poll_seconds="${GPU_POLL_SECONDS}" \
   jax_package_spec="${JAX_PACKAGE_SPEC}" \
-  xla_flags="${XLA_FLAGS}"
+  xla_flags="${XLA_FLAGS}" \
+  xla_python_client_mem_fraction="${XLA_PYTHON_CLIENT_MEM_FRACTION:-}" \
+  xla_python_client_preallocate="${XLA_PYTHON_CLIENT_PREALLOCATE:-}" \
+  tf_gpu_allocator="${TF_GPU_ALLOCATOR:-}"
 
 if [[ ! -x "${VENV}/bin/python" ]] || ! python_version_ok "${VENV}/bin/python"; then
   rm -rf "${VENV}"
@@ -263,6 +349,15 @@ export NCCL_PROTO="${NCCL_PROTO:-LL128}"
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
 export XLA_FLAGS
+if [[ -n "${XLA_PYTHON_CLIENT_MEM_FRACTION}" ]]; then
+  export XLA_PYTHON_CLIENT_MEM_FRACTION
+fi
+if [[ -n "${XLA_PYTHON_CLIENT_PREALLOCATE}" ]]; then
+  export XLA_PYTHON_CLIENT_PREALLOCATE
+fi
+if [[ -n "${TF_GPU_ALLOCATOR}" ]]; then
+  export TF_GPU_ALLOCATOR
+fi
 
 rm -rf /tmp/pubmedqa_repo
 (
@@ -332,6 +427,27 @@ COMMON_ARGS=(
 )
 
 COMMON_ARGS+=(--lora_backend "${LORA_BACKEND}")
+if [[ "${OFFICIAL_QLORA_QUANTIZE_MOE_WEIGHTS}" == "false" || "${OFFICIAL_QLORA_QUANTIZE_MOE_WEIGHTS}" == "0" ]]; then
+  COMMON_ARGS+=(--no-official_qlora_quantize_moe_weights)
+else
+  COMMON_ARGS+=(--official_qlora_quantize_moe_weights)
+fi
+COMMON_ARGS+=(
+  --official_qlora_einsum_output_chunk_size "${OFFICIAL_QLORA_EINSUM_OUTPUT_CHUNK_SIZE}"
+  --official_qlora_ragged_output_chunk_size "${OFFICIAL_QLORA_RAGGED_OUTPUT_CHUNK_SIZE}"
+)
+if [[ "${OFFICIAL_REMAT_BLOCKS}" == "true" || "${OFFICIAL_REMAT_BLOCKS}" == "1" ]]; then
+  COMMON_ARGS+=(--official_remat_blocks)
+else
+  COMMON_ARGS+=(--no-official_remat_blocks)
+fi
+if [[ -n "${STOP_GRADIENT_FROM_DENOISER_TO_ENCODER}" ]]; then
+  if [[ "${STOP_GRADIENT_FROM_DENOISER_TO_ENCODER}" == "true" || "${STOP_GRADIENT_FROM_DENOISER_TO_ENCODER}" == "1" ]]; then
+    COMMON_ARGS+=(--stop_gradient_from_denoiser_to_encoder)
+  else
+    COMMON_ARGS+=(--no-stop_gradient_from_denoiser_to_encoder)
+  fi
+fi
 if [[ -n "${LORA_ALPHA}" ]]; then
   COMMON_ARGS+=(--lora_alpha "${LORA_ALPHA}")
 fi
@@ -357,6 +473,9 @@ fi
 
 if [[ "${MODE}" == "tunix" ]] && [[ -n "${ENCODER_LOSS_TOKEN_CHUNK_SIZE}" ]]; then
   COMMON_ARGS+=(--encoder_loss_token_chunk_size "${ENCODER_LOSS_TOKEN_CHUNK_SIZE}")
+fi
+if [[ "${MODE}" == "tunix" ]] && [[ -n "${ENCODER_LOSS_VOCAB_CHUNK_SIZE}" ]]; then
+  COMMON_ARGS+=(--encoder_loss_vocab_chunk_size "${ENCODER_LOSS_VOCAB_CHUNK_SIZE}")
 fi
 
 if [[ "${MODE}" == "tunix" ]] && [[ "${SAVE_FINAL_CHECKPOINT}" == "true" || "${SAVE_FINAL_CHECKPOINT}" == "1" ]]; then
@@ -415,12 +534,21 @@ payload = {
     "hackable_diffusion_revision": "$(git -C "${HACKABLE_DIFFUSION_REF}" rev-parse HEAD)",
     "train_loop": "${TRAIN_LOOP}",
     "lora_backend": "${LORA_BACKEND}",
+    "official_qlora_quantize_moe_weights": "${OFFICIAL_QLORA_QUANTIZE_MOE_WEIGHTS}",
+    "official_qlora_einsum_output_chunk_size": "${OFFICIAL_QLORA_EINSUM_OUTPUT_CHUNK_SIZE}",
+    "official_qlora_ragged_output_chunk_size": "${OFFICIAL_QLORA_RAGGED_OUTPUT_CHUNK_SIZE}",
+    "official_remat_blocks": "${OFFICIAL_REMAT_BLOCKS}",
+    "stop_gradient_from_denoiser_to_encoder": "${STOP_GRADIENT_FROM_DENOISER_TO_ENCODER}",
     "lora_alpha": "${LORA_ALPHA}",
     "log_losses": "${LOG_LOSSES}",
     "sync_after_step": "${SYNC_AFTER_STEP}",
     "log_param_summary": "${LOG_PARAM_SUMMARY}",
+    "encoder_loss_vocab_chunk_size": "${ENCODER_LOSS_VOCAB_CHUNK_SIZE}",
     "jax_package_spec": "${JAX_PACKAGE_SPEC}",
     "xla_flags": "${XLA_FLAGS}",
+    "xla_python_client_mem_fraction": "${XLA_PYTHON_CLIENT_MEM_FRACTION}",
+    "xla_python_client_preallocate": "${XLA_PYTHON_CLIENT_PREALLOCATE}",
+    "tf_gpu_allocator": "${TF_GPU_ALLOCATOR}",
 }
 path = pathlib.Path("${RESULT_JSON}")
 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\\n")

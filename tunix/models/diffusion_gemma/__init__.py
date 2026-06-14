@@ -14,27 +14,59 @@
 
 """DiffusionGemma API."""
 
+from tunix.models.diffusion_gemma import data
+from tunix.models.diffusion_gemma import generation
 from tunix.models.diffusion_gemma import hackable_adapter
 from tunix.models.diffusion_gemma import linen_qwix_lora
 from tunix.models.diffusion_gemma import lora_inventory
 from tunix.models.diffusion_gemma import model
+from tunix.models.diffusion_gemma import official_qlora
 from tunix.models.diffusion_gemma import params
 from tunix.models.diffusion_gemma import params_safetensors
 from tunix.models.diffusion_gemma import sft
+from tunix.models.diffusion_gemma.generation import (
+    DiffusionGemmaGenerationConfig,
+    DiffusionGemmaGenerationTrace,
+    decode_trace,
+    generate_tokens,
+)
 from tunix.models.diffusion_gemma.hackable_adapter import (
+    DiffusionGemmaOfficialLossConfig,
+    DiffusionGemmaQwixLoRAConfig,
     OfficialBackendDependencyError,
     OfficialDiffusionGemmaTrainer,
     OfficialSFTConfig,
+    make_official_tunix_sft_config,
+)
+from tunix.models.diffusion_gemma.sft import (
+    DiffusionGemmaEvalResult,
+    DiffusionGemmaSFTLoss,
+    configure_peft_trainer_for_diffusion_gemma_sft,
+    evaluate_sft_loss,
 )
 
 __all__ = [
+    "DiffusionGemmaGenerationConfig",
+    "DiffusionGemmaGenerationTrace",
+    "DiffusionGemmaOfficialLossConfig",
+    "DiffusionGemmaQwixLoRAConfig",
+    "DiffusionGemmaEvalResult",
+    "DiffusionGemmaSFTLoss",
     "OfficialBackendDependencyError",
     "OfficialDiffusionGemmaTrainer",
     "OfficialSFTConfig",
+    "configure_peft_trainer_for_diffusion_gemma_sft",
+    "data",
+    "decode_trace",
+    "evaluate_sft_loss",
+    "generation",
+    "generate_tokens",
     "hackable_adapter",
     "linen_qwix_lora",
     "lora_inventory",
+    "make_official_tunix_sft_config",
     "model",
+    "official_qlora",
     "params",
     "params_safetensors",
     "sft",

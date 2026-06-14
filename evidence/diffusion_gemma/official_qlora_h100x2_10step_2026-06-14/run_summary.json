@@ -1,0 +1,381 @@
+{
+  "event_scalars": {
+    "event_dirs": [],
+    "metrics": {}
+  },
+  "gpu_memory": {
+    "path": "/home/ubuntu/diffusion_gemma_compare/qlora_remat_moe_chunk16_10step_retry_20260614/workdir/gpu_memory.csv",
+    "per_gpu": {
+      " 0": {
+        "median_used_mib": 68979.0,
+        "min_free_mib": 12101.0,
+        "peak_used_mib": 68979.0
+      },
+      " 1": {
+        "median_used_mib": 68941.0,
+        "min_free_mib": 12139.0,
+        "peak_used_mib": 68941.0
+      }
+    },
+    "samples": 538
+  },
+  "log_events": {
+    "events": {
+      "official_backend_dependencies": {
+        "count": 1,
+        "first": {
+          "available": true,
+          "event": "official_backend_dependencies",
+          "line": 7,
+          "missing": [],
+          "versions": {
+            "gemma": "4.1.0",
+            "hackable_diffusion": "1.0.1",
+            "kauldron": "1.4.4"
+          }
+        },
+        "last": {
+          "available": true,
+          "event": "official_backend_dependencies",
+          "line": 7,
+          "missing": [],
+          "versions": {
+            "gemma": "4.1.0",
+            "hackable_diffusion": "1.0.1",
+            "kauldron": "1.4.4"
+          }
+        },
+        "last_state_step": null
+      },
+      "official_backend_gemma4_block_remat_patched": {
+        "count": 1,
+        "first": {
+          "event": "official_backend_gemma4_block_remat_patched",
+          "line": 8,
+          "policy": "nothing_saveable",
+          "source": "official_sft_sudoku_full"
+        },
+        "last": {
+          "event": "official_backend_gemma4_block_remat_patched",
+          "line": 8,
+          "policy": "nothing_saveable",
+          "source": "official_sft_sudoku_full"
+        },
+        "last_state_step": null
+      },
+      "official_backend_hybrid_batch_device_put": {
+        "count": 10,
+        "first": {
+          "event": "official_backend_hybrid_batch_device_put",
+          "line": 22,
+          "loop_step": 0,
+          "state_step": 1
+        },
+        "last": {
+          "event": "official_backend_hybrid_batch_device_put",
+          "line": 1148,
+          "loop_step": 9,
+          "state_step": 10
+        },
+        "last_state_step": 10
+      },
+      "official_backend_hybrid_batch_host_ready": {
+        "count": 10,
+        "first": {
+          "event": "official_backend_hybrid_batch_host_ready",
+          "line": 21,
+          "loop_step": 0,
+          "state_step": 1
+        },
+        "last": {
+          "event": "official_backend_hybrid_batch_host_ready",
+          "line": 1147,
+          "loop_step": 9,
+          "state_step": 10
+        },
+        "last_state_step": 10
+      },
+      "official_backend_hybrid_step_complete": {
+        "count": 10,
+        "first": {
+          "event": "official_backend_hybrid_step_complete",
+          "line": 1097,
+          "logged_losses": [],
+          "loop_step": 0,
+          "state_step": 1,
+          "sync_after_step": "state"
+        },
+        "last": {
+          "event": "official_backend_hybrid_step_complete",
+          "line": 1151,
+          "logged_losses": [],
+          "loop_step": 9,
+          "state_step": 10,
+          "sync_after_step": "state"
+        },
+        "last_state_step": 10
+      },
+      "official_backend_hybrid_step_start": {
+        "count": 10,
+        "first": {
+          "event": "official_backend_hybrid_step_start",
+          "line": 20,
+          "loop_step": 0,
+          "state_step": 1
+        },
+        "last": {
+          "event": "official_backend_hybrid_step_start",
+          "line": 1146,
+          "loop_step": 9,
+          "state_step": 10
+        },
+        "last_state_step": 10
+      },
+      "official_backend_hybrid_train_complete": {
+        "count": 1,
+        "first": {
+          "event": "official_backend_hybrid_train_complete",
+          "line": 1152,
+          "num_steps": 10,
+          "state_step": 10,
+          "workdir": "/home/ubuntu/diffusion_gemma_compare/qlora_remat_moe_chunk16_10step_retry_20260614/workdir"
+        },
+        "last": {
+          "event": "official_backend_hybrid_train_complete",
+          "line": 1152,
+          "num_steps": 10,
+          "state_step": 10,
+          "workdir": "/home/ubuntu/diffusion_gemma_compare/qlora_remat_moe_chunk16_10step_retry_20260614/workdir"
+        },
+        "last_state_step": 10
+      },
+      "official_backend_hybrid_trainstep_call_returned": {
+        "count": 10,
+        "first": {
+          "event": "official_backend_hybrid_trainstep_call_returned",
+          "line": 1096,
+          "loop_step": 0,
+          "state_step": 1
+        },
+        "last": {
+          "event": "official_backend_hybrid_trainstep_call_returned",
+          "line": 1150,
+          "loop_step": 9,
+          "state_step": 10
+        },
+        "last_state_step": 10
+      },
+      "official_backend_hybrid_trainstep_call_start": {
+        "count": 10,
+        "first": {
+          "event": "official_backend_hybrid_trainstep_call_start",
+          "line": 23,
+          "log_losses": false,
+          "loop_step": 0,
+          "state_step": 1,
+          "sync_after_step": "state"
+        },
+        "last": {
+          "event": "official_backend_hybrid_trainstep_call_start",
+          "line": 1149,
+          "log_losses": false,
+          "loop_step": 9,
+          "state_step": 10,
+          "sync_after_step": "state"
+        },
+        "last_state_step": 10
+      },
+      "official_backend_jax_preinit": {
+        "count": 1,
+        "first": {
+          "device_count": 2,
+          "devices": [
+            "cuda:0",
+            "cuda:1"
+          ],
+          "event": "official_backend_jax_preinit",
+          "line": 6,
+          "tensorflow_gpu_hidden": true
+        },
+        "last": {
+          "device_count": 2,
+          "devices": [
+            "cuda:0",
+            "cuda:1"
+          ],
+          "event": "official_backend_jax_preinit",
+          "line": 6,
+          "tensorflow_gpu_hidden": true
+        },
+        "last_state_step": null
+      },
+      "official_backend_lora_adapter_only_apply_updates_patched": {
+        "count": 1,
+        "first": {
+          "event": "official_backend_lora_adapter_only_apply_updates_patched",
+          "line": 14,
+          "update_predicate": "lora_adapter_paths_only"
+        },
+        "last": {
+          "event": "official_backend_lora_adapter_only_apply_updates_patched",
+          "line": 14,
+          "update_predicate": "lora_adapter_paths_only"
+        },
+        "last_state_step": null
+      },
+      "official_backend_memory_safe_encoder_loss_replaced": {
+        "count": 1,
+        "first": {
+          "event": "official_backend_memory_safe_encoder_loss_replaced",
+          "line": 17,
+          "model_output": "preds.encoder_loss",
+          "original_loss": "EncoderARLoss",
+          "replacement_loss": "EncoderLossValue",
+          "token_chunk_size": 128,
+          "vocab_chunk_size": 8192
+        },
+        "last": {
+          "event": "official_backend_memory_safe_encoder_loss_replaced",
+          "line": 17,
+          "model_output": "preds.encoder_loss",
+          "original_loss": "EncoderARLoss",
+          "replacement_loss": "EncoderLossValue",
+          "token_chunk_size": 128,
+          "vocab_chunk_size": 8192
+        },
+        "last_state_step": null
+      },
+      "official_backend_memory_safe_sft_model_replaced": {
+        "count": 1,
+        "first": {
+          "event": "official_backend_memory_safe_sft_model_replaced",
+          "line": 16,
+          "original_model": "SFTDiffusion",
+          "replacement_model": "MemorySafeSFTDiffusion",
+          "token_chunk_size": 128,
+          "vocab_chunk_size": 8192
+        },
+        "last": {
+          "event": "official_backend_memory_safe_sft_model_replaced",
+          "line": 16,
+          "original_model": "SFTDiffusion",
+          "replacement_model": "MemorySafeSFTDiffusion",
+          "token_chunk_size": 128,
+          "vocab_chunk_size": 8192
+        },
+        "last_state_step": null
+      },
+      "official_backend_official_lora_patched_for_qlora": {
+        "count": 1,
+        "first": {
+          "einsum_output_chunk_size": 16,
+          "event": "official_backend_official_lora_patched_for_qlora",
+          "line": 12,
+          "lora_backend": "official_qlora",
+          "qtype": "int4",
+          "quantize_moe_weights": true,
+          "ragged_output_chunk_size": 16
+        },
+        "last": {
+          "einsum_output_chunk_size": 16,
+          "event": "official_backend_official_lora_patched_for_qlora",
+          "line": 12,
+          "lora_backend": "official_qlora",
+          "qtype": "int4",
+          "quantize_moe_weights": true,
+          "ragged_output_chunk_size": 16
+        },
+        "last_state_step": null
+      },
+      "official_backend_official_qlora_checkpoint_loader_patched": {
+        "count": 1,
+        "first": {
+          "base_weight_storage": "packed_int4_qvalue_scale",
+          "event": "official_backend_official_qlora_checkpoint_loader_patched",
+          "line": 13
+        },
+        "last": {
+          "base_weight_storage": "packed_int4_qvalue_scale",
+          "event": "official_backend_official_qlora_checkpoint_loader_patched",
+          "line": 13
+        },
+        "last_state_step": null
+      },
+      "official_backend_official_qlora_ready": {
+        "count": 1,
+        "first": {
+          "base_weight_storage": "packed_qvalue_scale",
+          "event": "official_backend_official_qlora_ready",
+          "line": 15,
+          "lora_backend": "official_qlora",
+          "qtype": "int4",
+          "quantize_moe_weights": true
+        },
+        "last": {
+          "base_weight_storage": "packed_qvalue_scale",
+          "event": "official_backend_official_qlora_ready",
+          "line": 15,
+          "lora_backend": "official_qlora",
+          "qtype": "int4",
+          "quantize_moe_weights": true
+        },
+        "last_state_step": null
+      },
+      "official_backend_train_complete": {
+        "count": 1,
+        "first": {
+          "encoder_loss_token_chunk_size": 128,
+          "encoder_loss_vocab_chunk_size": 8192,
+          "event": "official_backend_train_complete",
+          "line": 1153,
+          "log_losses": false,
+          "log_param_summary": false,
+          "lora_alpha": null,
+          "lora_backend": "official_qlora",
+          "num_train_steps": 2000,
+          "official_qlora_einsum_output_chunk_size": 16,
+          "official_qlora_quantize_moe_weights": true,
+          "official_qlora_ragged_output_chunk_size": 16,
+          "official_remat_blocks": true,
+          "recipe": "pubmedqa",
+          "run_steps": 10,
+          "skip_step_metrics": false,
+          "stop_gradient_from_denoiser_to_encoder": true,
+          "sync_after_step": "state",
+          "train_loop": "hybrid",
+          "workdir": "/home/ubuntu/diffusion_gemma_compare/qlora_remat_moe_chunk16_10step_retry_20260614/workdir"
+        },
+        "last": {
+          "encoder_loss_token_chunk_size": 128,
+          "encoder_loss_vocab_chunk_size": 8192,
+          "event": "official_backend_train_complete",
+          "line": 1153,
+          "log_losses": false,
+          "log_param_summary": false,
+          "lora_alpha": null,
+          "lora_backend": "official_qlora",
+          "num_train_steps": 2000,
+          "official_qlora_einsum_output_chunk_size": 16,
+          "official_qlora_quantize_moe_weights": true,
+          "official_qlora_ragged_output_chunk_size": 16,
+          "official_remat_blocks": true,
+          "recipe": "pubmedqa",
+          "run_steps": 10,
+          "skip_step_metrics": false,
+          "stop_gradient_from_denoiser_to_encoder": true,
+          "sync_after_step": "state",
+          "train_loop": "hybrid",
+          "workdir": "/home/ubuntu/diffusion_gemma_compare/qlora_remat_moe_chunk16_10step_retry_20260614/workdir"
+        },
+        "last_state_step": null
+      }
+    },
+    "path": "/home/ubuntu/diffusion_gemma_compare/qlora_remat_moe_chunk16_10step_retry_20260614/workdir/train.log"
+  },
+  "log_scalars": {
+    "metrics": {},
+    "path": "/home/ubuntu/diffusion_gemma_compare/qlora_remat_moe_chunk16_10step_retry_20260614/workdir/train.log"
+  },
+  "selected": {},
+  "workdir": "/home/ubuntu/diffusion_gemma_compare/qlora_remat_moe_chunk16_10step_retry_20260614/workdir"
+}
