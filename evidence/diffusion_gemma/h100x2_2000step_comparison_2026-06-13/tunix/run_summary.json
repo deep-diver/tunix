@@ -1,0 +1,269 @@
+{
+  "event_scalars": {
+    "event_dirs": [],
+    "metrics": {}
+  },
+  "gpu_memory": {
+    "path": "/home/ubuntu/diffusion_gemma_compare_official_backend/tunix_wrapper_3h_6a374bb/workdir/gpu_memory.csv",
+    "per_gpu": {
+      " 0": {
+        "median_used_mib": 65659.0,
+        "min_free_mib": 15421.0,
+        "peak_used_mib": 65659.0
+      },
+      " 1": {
+        "median_used_mib": 65629.0,
+        "min_free_mib": 15451.0,
+        "peak_used_mib": 65629.0
+      }
+    },
+    "samples": 170
+  },
+  "log_events": {
+    "events": {
+      "diffusion_gemma_hybrid_loss": {
+        "count": 6000,
+        "first": {
+          "event": "diffusion_gemma_hybrid_loss",
+          "line": 2661,
+          "loop_step": 0,
+          "metric": "losses/diffusion_loss",
+          "step": 1,
+          "value": 6.671875
+        },
+        "last": {
+          "event": "diffusion_gemma_hybrid_loss",
+          "line": 10659,
+          "loop_step": 1999,
+          "metric": "losses/total",
+          "step": 2000,
+          "value": 2.099609375
+        },
+        "last_state_step": 2000
+      },
+      "official_backend_dependencies": {
+        "count": 1,
+        "first": {
+          "available": true,
+          "event": "official_backend_dependencies",
+          "line": 7,
+          "missing": [],
+          "versions": {
+            "gemma": "4.1.0",
+            "hackable_diffusion": "1.0.1",
+            "kauldron": "1.4.4"
+          }
+        },
+        "last": {
+          "available": true,
+          "event": "official_backend_dependencies",
+          "line": 7,
+          "missing": [],
+          "versions": {
+            "gemma": "4.1.0",
+            "hackable_diffusion": "1.0.1",
+            "kauldron": "1.4.4"
+          }
+        },
+        "last_state_step": null
+      },
+      "official_backend_hybrid_step_complete": {
+        "count": 2000,
+        "first": {
+          "event": "official_backend_hybrid_step_complete",
+          "line": 2664,
+          "logged_losses": [
+            "losses/diffusion_loss",
+            "losses/encoder_loss",
+            "losses/total"
+          ],
+          "loop_step": 0,
+          "state_step": 1,
+          "sync_after_step": "losses"
+        },
+        "last": {
+          "event": "official_backend_hybrid_step_complete",
+          "line": 10660,
+          "logged_losses": [
+            "losses/diffusion_loss",
+            "losses/encoder_loss",
+            "losses/total"
+          ],
+          "loop_step": 1999,
+          "state_step": 2000,
+          "sync_after_step": "losses"
+        },
+        "last_state_step": 2000
+      },
+      "official_backend_hybrid_train_complete": {
+        "count": 1,
+        "first": {
+          "event": "official_backend_hybrid_train_complete",
+          "line": 10661,
+          "num_steps": 2000,
+          "state_step": 2000,
+          "workdir": "/home/ubuntu/diffusion_gemma_compare_official_backend/tunix_wrapper_3h_6a374bb/workdir"
+        },
+        "last": {
+          "event": "official_backend_hybrid_train_complete",
+          "line": 10661,
+          "num_steps": 2000,
+          "state_step": 2000,
+          "workdir": "/home/ubuntu/diffusion_gemma_compare_official_backend/tunix_wrapper_3h_6a374bb/workdir"
+        },
+        "last_state_step": 2000
+      },
+      "official_backend_jax_preinit": {
+        "count": 1,
+        "first": {
+          "device_count": 2,
+          "devices": [
+            "cuda:0",
+            "cuda:1"
+          ],
+          "event": "official_backend_jax_preinit",
+          "line": 6,
+          "tensorflow_gpu_hidden": true
+        },
+        "last": {
+          "device_count": 2,
+          "devices": [
+            "cuda:0",
+            "cuda:1"
+          ],
+          "event": "official_backend_jax_preinit",
+          "line": 6,
+          "tensorflow_gpu_hidden": true
+        },
+        "last_state_step": null
+      },
+      "official_backend_train_complete": {
+        "count": 1,
+        "first": {
+          "event": "official_backend_train_complete",
+          "line": 10662,
+          "log_losses": true,
+          "num_train_steps": 2000,
+          "recipe": "pubmedqa",
+          "run_steps": null,
+          "skip_step_metrics": false,
+          "sync_after_step": "losses",
+          "train_loop": "hybrid",
+          "workdir": "/home/ubuntu/diffusion_gemma_compare_official_backend/tunix_wrapper_3h_6a374bb/workdir"
+        },
+        "last": {
+          "event": "official_backend_train_complete",
+          "line": 10662,
+          "log_losses": true,
+          "num_train_steps": 2000,
+          "recipe": "pubmedqa",
+          "run_steps": null,
+          "skip_step_metrics": false,
+          "sync_after_step": "losses",
+          "train_loop": "hybrid",
+          "workdir": "/home/ubuntu/diffusion_gemma_compare_official_backend/tunix_wrapper_3h_6a374bb/workdir"
+        },
+        "last_state_step": null
+      }
+    },
+    "path": "/home/ubuntu/diffusion_gemma_compare_official_backend/tunix_wrapper_3h_6a374bb/workdir/train.log"
+  },
+  "log_scalars": {
+    "metrics": {
+      "losses/diffusion_loss": {
+        "count": 2000,
+        "first": {
+          "line": 2661,
+          "step": 1,
+          "value": 6.671875
+        },
+        "last": {
+          "line": 10657,
+          "step": 2000,
+          "value": 1.052734375
+        },
+        "max": 8.578125,
+        "min": 0.00341796875
+      },
+      "losses/encoder_loss": {
+        "count": 2000,
+        "first": {
+          "line": 2662,
+          "step": 1,
+          "value": 7.25
+        },
+        "last": {
+          "line": 10658,
+          "step": 2000,
+          "value": 1.046875
+        },
+        "max": 8.875,
+        "min": 0.775390625
+      },
+      "losses/total": {
+        "count": 2000,
+        "first": {
+          "line": 2663,
+          "step": 1,
+          "value": 13.921875
+        },
+        "last": {
+          "line": 10659,
+          "step": 2000,
+          "value": 2.099609375
+        },
+        "max": 16.765625,
+        "min": 0.8837890625
+      }
+    },
+    "path": "/home/ubuntu/diffusion_gemma_compare_official_backend/tunix_wrapper_3h_6a374bb/workdir/train.log"
+  },
+  "selected": {
+    "losses/diffusion_loss": {
+      "count": 2000,
+      "first": {
+        "line": 2661,
+        "step": 1,
+        "value": 6.671875
+      },
+      "last": {
+        "line": 10657,
+        "step": 2000,
+        "value": 1.052734375
+      },
+      "max": 8.578125,
+      "min": 0.00341796875
+    },
+    "losses/encoder_loss": {
+      "count": 2000,
+      "first": {
+        "line": 2662,
+        "step": 1,
+        "value": 7.25
+      },
+      "last": {
+        "line": 10658,
+        "step": 2000,
+        "value": 1.046875
+      },
+      "max": 8.875,
+      "min": 0.775390625
+    },
+    "losses/total": {
+      "count": 2000,
+      "first": {
+        "line": 2663,
+        "step": 1,
+        "value": 13.921875
+      },
+      "last": {
+        "line": 10659,
+        "step": 2000,
+        "value": 2.099609375
+      },
+      "max": 16.765625,
+      "min": 0.8837890625
+    }
+  },
+  "workdir": "/home/ubuntu/diffusion_gemma_compare_official_backend/tunix_wrapper_3h_6a374bb/workdir"
+}

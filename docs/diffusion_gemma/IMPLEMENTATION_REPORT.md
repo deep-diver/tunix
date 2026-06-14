@@ -37,8 +37,7 @@ applying run-environment overrides, launching comparable official-vs-wrapper
 runs, and collecting concise logs plus GPU memory telemetry.
 
 The wrapper can preserve the official LoRA layer or replace just that layer with
-Tunix/Qwix LoRA via `lora_backend="qwix_lora"`. Qwix QLoRA is not exposed for
-DiffusionGemma; `lora_backend="qwix_qlora"` is rejected.
+Tunix/Qwix LoRA via `lora_backend="qwix_lora"`.
 
 In `train_loop=hybrid` mode the wrapper still uses the official model, dataset,
 optimizer, loss, train step, checkpoint restore, and sharding. Tunix only drives

@@ -16,13 +16,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 import dataclasses
 from typing import Any, Callable
 
 from flax import nnx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import qwix
 from tunix.models.gemma4 import moe as gemma4_moe
@@ -515,15 +516,19 @@ def _masked_ce_loss_from_hidden(
     mask = jnp.pad(mask, ((0, 0), (0, pad_len)), constant_values=False)
 
   num_chunks = hidden.shape[1] // chunk_size
-  hidden_chunks = hidden.reshape(
-      hidden.shape[0], num_chunks, chunk_size, hidden.shape[-1]
-  )
-  target_chunks = targets.reshape(targets.shape[0], num_chunks, chunk_size)
-  mask_chunks = mask.reshape(mask.shape[0], num_chunks, chunk_size)
 
-  def scan_body(carry, chunk_inputs):
+  def loop_body(chunk_idx, carry):
     total_loss, total_weight = carry
-    hidden_chunk, target_chunk, mask_chunk = chunk_inputs
+    start = chunk_idx * chunk_size
+    hidden_chunk = jax.lax.dynamic_slice_in_dim(
+        hidden, start, chunk_size, axis=1
+    )
+    target_chunk = jax.lax.dynamic_slice_in_dim(
+        targets, start, chunk_size, axis=1
+    )
+    mask_chunk = jax.lax.dynamic_slice_in_dim(
+        mask, start, chunk_size, axis=1
+    )
     logits = model.decode_hidden(hidden_chunk)
     logits = logits.astype(jnp.float32)
     target_logits = jnp.take_along_axis(
@@ -534,21 +539,13 @@ def _masked_ce_loss_from_hidden(
     return (
         total_loss + jnp.sum(loss * weight, axis=1),
         total_weight + jnp.sum(weight, axis=1),
-    ), None
+    )
 
   init = (
       jnp.zeros((hidden.shape[0],), dtype=jnp.float32),
       jnp.zeros((hidden.shape[0],), dtype=jnp.float32),
   )
-  (loss_sum, weight_sum), _ = jax.lax.scan(
-      scan_body,
-      init,
-      (
-          jnp.swapaxes(hidden_chunks, 0, 1),
-          jnp.swapaxes(target_chunks, 0, 1),
-          jnp.swapaxes(mask_chunks, 0, 1),
-      ),
-  )
+  loss_sum, weight_sum = jax.lax.fori_loop(0, num_chunks, loop_body, init)
   per_example_loss = loss_sum / jnp.maximum(weight_sum, 1.0)
   return jnp.mean(per_example_loss)
 
@@ -850,7 +847,22 @@ def make_loss_fn(
     config: DiffusionGemmaSFTConfig,
 ) -> Callable[..., tuple[jax.Array, dict[str, jax.Array]]]:
 
-  def loss_fn(
+  return DiffusionGemmaSFTLoss(config)
+
+
+@dataclasses.dataclass(frozen=True)
+class DiffusionGemmaSFTLoss:
+  """Tunix loss callable for DiffusionGemma supervised fine tuning.
+
+  This object is intentionally small: it packages the DiffusionGemma denoising
+  loss, optional self-conditioning pass, and encoder AR loss behind the same
+  callable shape expected by `PeftTrainer.with_loss_fn(has_aux=True)`.
+  """
+
+  config: DiffusionGemmaSFTConfig
+
+  def __call__(
+      self,
       model: nnx.Module,
       prompt: jax.Array,
       canvas: jax.Array,
@@ -869,10 +881,60 @@ def make_loss_fn(
         encoder_target=encoder_target,
         encoder_target_mask=encoder_target_mask,
         rng=rng,
-        config=config,
+        config=self.config,
     )
 
-  return loss_fn
+
+@dataclasses.dataclass(frozen=True)
+class DiffusionGemmaEvalResult:
+  """Aggregated DiffusionGemma SFT evaluation metrics."""
+
+  num_batches: int
+  metrics: dict[str, float]
+
+
+def _metric_to_float(value: Any) -> float:
+  array = np.asarray(jax.device_get(value), dtype=np.float32)
+  return float(np.mean(array))
+
+
+def evaluate_sft_loss(
+    model: nnx.Module,
+    eval_ds: Iterable[Any],
+    config: DiffusionGemmaSFTConfig,
+    *,
+    max_batches: int | None = None,
+    loss_fn: (
+        Callable[..., tuple[jax.Array, dict[str, jax.Array]]] | None
+    ) = None,
+    gen_input_fn: Callable[[Any], dict[str, jax.Array]] | None = None,
+) -> DiffusionGemmaEvalResult:
+  """Evaluates DiffusionGemma SFT loss and aux metrics over a dataset."""
+  if max_batches is not None and max_batches <= 0:
+    raise ValueError(f"max_batches must be positive, got {max_batches}.")
+  loss_fn = loss_fn or make_loss_fn(config)
+  gen_input_fn = gen_input_fn or gen_model_input_fn
+  metric_sums: dict[str, float] = {}
+  num_batches = 0
+  for batch in eval_ds:
+    if max_batches is not None and num_batches >= max_batches:
+      break
+    inputs = gen_input_fn(batch)
+    loss, aux = loss_fn(model, **inputs)
+    batch_metrics = {"total_loss": _metric_to_float(loss)}
+    batch_metrics.update(
+        {key: _metric_to_float(value) for key, value in aux.items()}
+    )
+    for key, value in batch_metrics.items():
+      metric_sums[key] = metric_sums.get(key, 0.0) + value
+    num_batches += 1
+
+  if num_batches == 0:
+    raise ValueError("eval_ds produced no batches.")
+  return DiffusionGemmaEvalResult(
+      num_batches=num_batches,
+      metrics={key: value / num_batches for key, value in metric_sums.items()},
+  )
 
 
 def gen_model_input_fn(batch: Any) -> dict[str, jax.Array]:
@@ -881,6 +943,16 @@ def gen_model_input_fn(batch: Any) -> dict[str, jax.Array]:
   if isinstance(batch, Mapping):
     return dict(batch)
   return vars(batch)
+
+
+def configure_peft_trainer_for_diffusion_gemma_sft(
+    trainer: peft_trainer.PeftTrainer,
+    config: DiffusionGemmaSFTConfig,
+) -> peft_trainer.PeftTrainer:
+  """Installs the DiffusionGemma SFT input and loss hooks on a PeftTrainer."""
+  return trainer.with_gen_model_input_fn(gen_model_input_fn).with_loss_fn(
+      make_loss_fn(config), has_aux=True
+  )
 
 
 def _init_lora_param(
@@ -1032,8 +1104,7 @@ class DiffusionGemmaTrainer(peft_trainer.PeftTrainer):
     self.last_train_aux = None
     self.last_eval_aux = None
     super().__init__(model, optimizer, training_config, **kwargs)
-    self.with_gen_model_input_fn(gen_model_input_fn)
-    self.with_loss_fn(make_loss_fn(diffusion_config), has_aux=True)
+    configure_peft_trainer_for_diffusion_gemma_sft(self, diffusion_config)
 
   def _train_step(
       self, model: nnx.Module, optimizer: nnx.Optimizer, inputs: Any

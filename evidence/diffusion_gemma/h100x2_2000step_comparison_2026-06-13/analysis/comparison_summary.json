@@ -1,0 +1,241 @@
+{
+  "animation": null,
+  "generated_at_utc": "2026-06-13T03:41:08.489504+00:00",
+  "plots": {
+    "gpu_memory": "analysis/gpu_memory.png",
+    "loss_curve": "analysis/loss_curve.png"
+  },
+  "revision_match": {
+    "gemma": true,
+    "hackable_diffusion": true
+  },
+  "rows": [
+    {
+      "diffusion_last_50_mean": 0.675595703125,
+      "encoder_last_50_mean": 1.1972265625,
+      "exit_code": null,
+      "gpu_min_free_mib": 15419.0,
+      "gpu_peak_used_mib": 65661.0,
+      "label": "official",
+      "mean_gpu_util_percent": 90.74404761904762,
+      "state": null,
+      "steps": 2000,
+      "steps_per_hour_by_gpu_window": 1444.7775905363856,
+      "timed_out": false,
+      "total_first": 13.921875,
+      "total_last": 2.07421875,
+      "total_last_50_mean": 1.872822265625
+    },
+    {
+      "diffusion_last_50_mean": 0.67685546875,
+      "encoder_last_50_mean": 1.1965234375,
+      "exit_code": null,
+      "gpu_min_free_mib": 15421.0,
+      "gpu_peak_used_mib": 65659.0,
+      "label": "tunix",
+      "mean_gpu_util_percent": 91.0,
+      "state": null,
+      "steps": 2000,
+      "steps_per_hour_by_gpu_window": 1427.550050499583,
+      "timed_out": false,
+      "total_first": 13.921875,
+      "total_last": 2.099609375,
+      "total_last_50_mean": 1.87337890625
+    }
+  ],
+  "runs": {
+    "official": {
+      "exit_code": null,
+      "gemma_revision": "a7e33454206ca24984565992f5c903191baecc22",
+      "gpu": {
+        "duration_seconds": 4983.466,
+        "max_peak_used_mib": 65661.0,
+        "mean_power_w": 632.6245238095238,
+        "mean_util_percent": 90.74404761904762,
+        "min_free_mib": 15419.0,
+        "per_gpu": {
+          "0": {
+            "mean_power_w": 635.0221428571429,
+            "mean_util_percent": 91.42857142857143,
+            "median_used_mib": 65661.0,
+            "min_free_mib": 15419.0,
+            "peak_used_mib": 65661.0,
+            "samples": 84
+          },
+          "1": {
+            "mean_power_w": 630.2269047619047,
+            "mean_util_percent": 90.05952380952381,
+            "median_used_mib": 65631.0,
+            "min_free_mib": 15449.0,
+            "peak_used_mib": 65631.0,
+            "samples": 84
+          }
+        },
+        "samples": 168
+      },
+      "hackable_diffusion_revision": "03ce88ed0acec3b17f4f284502a6053c5f2b3a15",
+      "jax_package_spec": "jax[cuda13]==0.10.1",
+      "losses/diffusion_loss": {
+        "count": 2000,
+        "finite": true,
+        "first": 6.671875,
+        "first_50_mean": 5.73109375,
+        "first_step": 1,
+        "inf_count": 0,
+        "last": 1.03515625,
+        "last_50_mean": 0.675595703125,
+        "last_step": 2000,
+        "max": 8.984375,
+        "mean": 1.147888671875,
+        "min": 0.00244140625,
+        "nan_count": 0
+      },
+      "losses/encoder_loss": {
+        "count": 2000,
+        "finite": true,
+        "first": 7.25,
+        "first_50_mean": 6.9825,
+        "first_step": 1,
+        "inf_count": 0,
+        "last": 1.0390625,
+        "last_50_mean": 1.1972265625,
+        "last_step": 2000,
+        "max": 8.90625,
+        "mean": 1.4978642578125,
+        "min": 0.76953125,
+        "nan_count": 0
+      },
+      "losses/total": {
+        "count": 2000,
+        "finite": true,
+        "first": 13.921875,
+        "first_50_mean": 12.71359375,
+        "first_step": 1,
+        "inf_count": 0,
+        "last": 2.07421875,
+        "last_50_mean": 1.872822265625,
+        "last_step": 2000,
+        "max": 17.109375,
+        "mean": 2.6457529296875,
+        "min": 0.87841796875,
+        "nan_count": 0
+      },
+      "state": null,
+      "steps_per_hour_by_gpu_window": 1444.7775905363856,
+      "sync_after_step": "losses",
+      "timed_out": false,
+      "train_loop": "hybrid",
+      "train_status": 0
+    },
+    "tunix": {
+      "exit_code": null,
+      "gemma_revision": "a7e33454206ca24984565992f5c903191baecc22",
+      "gpu": {
+        "duration_seconds": 5043.606,
+        "max_peak_used_mib": 65659.0,
+        "mean_power_w": 645.2682352941176,
+        "mean_util_percent": 91.0,
+        "min_free_mib": 15421.0,
+        "per_gpu": {
+          "0": {
+            "mean_power_w": 644.6704705882353,
+            "mean_util_percent": 91.62352941176471,
+            "median_used_mib": 65659.0,
+            "min_free_mib": 15421.0,
+            "peak_used_mib": 65659.0,
+            "samples": 85
+          },
+          "1": {
+            "mean_power_w": 645.866,
+            "mean_util_percent": 90.37647058823529,
+            "median_used_mib": 65629.0,
+            "min_free_mib": 15451.0,
+            "peak_used_mib": 65629.0,
+            "samples": 85
+          }
+        },
+        "samples": 170
+      },
+      "hackable_diffusion_revision": "03ce88ed0acec3b17f4f284502a6053c5f2b3a15",
+      "jax_package_spec": "jax[cuda13]==0.10.1",
+      "losses/diffusion_loss": {
+        "count": 2000,
+        "finite": true,
+        "first": 6.671875,
+        "first_50_mean": 5.68625,
+        "first_step": 1,
+        "inf_count": 0,
+        "last": 1.052734375,
+        "last_50_mean": 0.67685546875,
+        "last_step": 2000,
+        "max": 8.578125,
+        "mean": 1.1316484375,
+        "min": 0.00341796875,
+        "nan_count": 0
+      },
+      "losses/encoder_loss": {
+        "count": 2000,
+        "finite": true,
+        "first": 7.25,
+        "first_50_mean": 6.946875,
+        "first_step": 1,
+        "inf_count": 0,
+        "last": 1.046875,
+        "last_50_mean": 1.1965234375,
+        "last_step": 2000,
+        "max": 8.875,
+        "mean": 1.4962236328125,
+        "min": 0.775390625,
+        "nan_count": 0
+      },
+      "losses/total": {
+        "count": 2000,
+        "finite": true,
+        "first": 13.921875,
+        "first_50_mean": 12.633125,
+        "first_step": 1,
+        "inf_count": 0,
+        "last": 2.099609375,
+        "last_50_mean": 1.87337890625,
+        "last_step": 2000,
+        "max": 16.765625,
+        "mean": 2.6278720703125,
+        "min": 0.8837890625,
+        "nan_count": 0
+      },
+      "state": null,
+      "steps_per_hour_by_gpu_window": 1427.550050499583,
+      "sync_after_step": "losses",
+      "timed_out": false,
+      "train_loop": "hybrid",
+      "train_status": 0
+    }
+  },
+  "title": "DiffusionGemma H100x2 2000-step official vs Tunix-wrapper comparison",
+  "warnings": {
+    "official": {
+      "CUDA_ERROR_NOT_PERMITTED": 2648,
+      "Could not find cuda drivers": 0,
+      "NCCL": 0,
+      "OutOfMemory": 0,
+      "RESOURCE_EXHAUSTED": 0,
+      "RuntimeError": 0,
+      "TF-TRT Warning": 0,
+      "Traceback": 0,
+      "Unable to register": 0,
+      "nan": 0
+    },
+    "tunix": {
+      "CUDA_ERROR_NOT_PERMITTED": 2648,
+      "Could not find cuda drivers": 0,
+      "NCCL": 0,
+      "OutOfMemory": 0,
+      "RESOURCE_EXHAUSTED": 0,
+      "RuntimeError": 0,
+      "TF-TRT Warning": 0,
+      "Traceback": 0,
+      "Unable to register": 0,
+      "nan": 0
+    }
+  }
+}

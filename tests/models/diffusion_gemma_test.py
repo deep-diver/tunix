@@ -15,7 +15,9 @@
 """Tests for the DiffusionGemma Tunix integration."""
 
 import dataclasses
+import pathlib
 import sys
+import tempfile
 import types
 from unittest import mock
 
@@ -38,7 +40,6 @@ from tunix.models.diffusion_gemma import hackable_adapter
 from tunix.models.diffusion_gemma import linen_qwix_lora
 from tunix.models.diffusion_gemma import lora_inventory
 from tunix.models.diffusion_gemma import model as diffusion_model
-from tunix.models.diffusion_gemma import official_qlora
 from tunix.models.diffusion_gemma import params as diffusion_params
 from tunix.models.diffusion_gemma import sft as diffusion_sft
 from tunix.models.gemma4 import model as gemma4_model
@@ -602,12 +603,8 @@ class DiffusionGemmaTest(absltest.TestCase):
     key_hidden, key_table = jax.random.split(jax.random.PRNGKey(123))
     hidden = jax.random.normal(key_hidden, (2, 5, 4), dtype=jnp.float32)
     table = jax.random.normal(key_table, (17, 4), dtype=jnp.float32)
-    targets = jnp.array(
-        [[0, 5, 7, 11, 13], [3, 4, 9, 10, 12]], dtype=jnp.int32
-    )
-    mask = jnp.array(
-        [[1, 1, 1, 0, 1], [1, 0, 1, 1, 1]], dtype=jnp.float32
-    )
+    targets = jnp.array([[0, 5, 7, 11, 13], [3, 4, 9, 10, 12]], dtype=jnp.int32)
+    mask = jnp.array([[1, 1, 1, 0, 1], [1, 0, 1, 1, 1]], dtype=jnp.float32)
     network = FakeGemmaNetwork(table, softcap=3.0)
 
     def full_loss_fn(hidden_value):
@@ -732,9 +729,20 @@ class DiffusionGemmaTest(absltest.TestCase):
     self.assertIsNone(trainer.config.encoder_loss_token_chunk_size)
     self.assertEqual(trainer.config.encoder_loss_vocab_chunk_size, 8192)
 
+  def test_official_trainer_from_pubmedqa_sets_recipe(self):
+    trainer = hackable_adapter.OfficialDiffusionGemmaTrainer.from_pubmedqa(
+        workdir="/tmp/dg",
+        peft_config=hackable_adapter.DiffusionGemmaQwixLoRAConfig(rank=4),
+    )
+
+    self.assertEqual(trainer.config.recipe, "pubmedqa")
+    self.assertEqual(trainer.config.workdir, "/tmp/dg")
+    self.assertEqual(trainer.config.lora_backend, "qwix_lora")
+    self.assertEqual(trainer.config.lora_rank, 4)
+
   def test_official_config_accepts_remat_blocks_knob(self):
     config = hackable_adapter.OfficialSFTConfig(
-        lora_backend="official_qlora",
+        lora_backend="qwix_lora",
         official_remat_blocks=True,
     )
 
@@ -843,6 +851,49 @@ class DiffusionGemmaTest(absltest.TestCase):
     self.assertEqual(batches[0]["prompt"].shape, (2, 4))
     self.assertEqual(batches[0]["canvas"].shape, (2, 4))
     np.testing.assert_array_equal(batches[0]["rng"], jax.random.PRNGKey(7))
+
+  def test_text_data_adapter_loads_jsonl_and_describes_batch(self):
+    tokenizer = _FakeTextTokenizer()
+    path = pathlib.Path(tempfile.mkdtemp()) / "train.jsonl"
+    path.write_text(
+        "\n".join([
+            '{"question": "hello world", "answer": "answer yes"}',
+            '{"question": "short", "answer": "response no"}',
+        ])
+        + "\n",
+        encoding="utf-8",
+    )
+    config = diffusion_data.config_from_tokenizer(
+        tokenizer,
+        prompt_len=4,
+        canvas_size=2,
+        num_canvases=2,
+    )
+
+    examples = diffusion_data.load_text_examples_jsonl(path)
+    batches = list(
+        diffusion_data.make_sft_dataset_from_jsonl(
+            path,
+            tokenizer=tokenizer,
+            config=config,
+            batch_size=2,
+            rng_seed=21,
+            as_model_inputs=True,
+        )
+    )
+    summary = diffusion_data.describe_sft_batch(batches[0])
+
+    self.assertEqual(
+        examples[0],
+        diffusion_data.DiffusionGemmaTextExample(
+            prompt="hello world", response="answer yes"
+        ),
+    )
+    self.assertEqual(summary.batch_size, 2)
+    self.assertEqual(summary.prompt_shape, (2, 4))
+    self.assertEqual(summary.canvas_shape, (2, 4, 1))
+    self.assertEqual(summary.valid_canvas_tokens, 4)
+    self.assertEqual(summary.as_dict()["rng_shape"], (2,))
 
   def test_text_data_adapter_rejects_empty_responses(self):
     tokenizer = _FakeTextTokenizer()
@@ -1079,6 +1130,42 @@ class DiffusionGemmaTest(absltest.TestCase):
     self.assertEmpty(cfg.evals)
     self.assertEqual(fake_module.CHECKPOINT_PATH, "old_checkpoint")
     self.assertEqual(fake_module._LORA_RANK, 4)
+
+  def test_official_checkpoint_info_resolves_latest_generation_kwargs(self):
+    workdir = pathlib.Path(tempfile.mkdtemp())
+    (workdir / "checkpoints" / "ckpt_100").mkdir(parents=True)
+    (workdir / "checkpoints" / "ckpt_500").mkdir()
+    (workdir / "hybrid_loop_state.json").write_text(
+        '{"checkpoint_saved": true, "checkpoint_step": 500}\n',
+        encoding="utf-8",
+    )
+    trainer = hackable_adapter.OfficialDiffusionGemmaTrainer(
+        hackable_adapter.OfficialSFTConfig(
+            recipe="pubmedqa",
+            gemma_ref="/tmp/gemma",
+            hackable_diffusion_ref="/tmp/hd",
+            checkpoint_path="/tmp/base",
+            workdir=workdir,
+            num_train_steps=500,
+            checkpoint_every_n_steps=500,
+            lora_rank=4,
+            lora_backend="qwix_lora",
+            encoder_loss_token_chunk_size=128,
+        )
+    )
+
+    info = trainer.checkpoint_info("latest")
+    generation_kwargs = trainer.generation_kwargs("latest")
+
+    self.assertEqual(
+        hackable_adapter.list_official_checkpoint_steps(workdir), (100, 500)
+    )
+    self.assertEqual(info.selected_step, 500)
+    self.assertEqual(info.selected_path, workdir / "checkpoints" / "ckpt_500")
+    self.assertTrue(info.checkpoint_saved)
+    self.assertEqual(generation_kwargs["step"], 500)
+    self.assertEqual(generation_kwargs["lora_backend"], "qwix_lora")
+    self.assertEqual(generation_kwargs["encoder_loss_token_chunk_size"], 128)
 
   def test_official_backend_can_skip_step_metrics(self):
     calls = []
@@ -1394,720 +1481,11 @@ class DiffusionGemmaTest(absltest.TestCase):
         )
     )
 
-  def test_qwix_lora_backend_rejects_qlora(self):
-    config = hackable_adapter.OfficialSFTConfig(lora_backend="qwix_qlora")
+  def test_invalid_lora_backend_is_rejected(self):
+    config = hackable_adapter.OfficialSFTConfig(lora_backend="bad_backend")
 
     with self.assertRaisesRegex(ValueError, "lora_backend"):
       hackable_adapter._validate_lora_backend(config)  # pylint: disable=protected-access
-
-  def test_official_qlora_backend_is_valid(self):
-    hackable_adapter._validate_lora_backend(  # pylint: disable=protected-access
-        hackable_adapter.OfficialSFTConfig(lora_backend="official_qlora")
-    )
-
-  def test_official_qlora_patch_restore_preserves_official_lora(self):
-    original_lora_cls = object()
-    fake_official_lora = types.SimpleNamespace(
-        LoRA=original_lora_cls,
-        peft=types.SimpleNamespace(
-            ModuleInterceptor=object,
-            LoRAEinsumAdapter=object,
-        ),
-        _SUPPORTED_MODULES=(linen_nn.Dense,),
-        _matches_target_modules=lambda module, target_modules: True,
-        kontext=types.SimpleNamespace(get_keypaths=lambda model: {}),
-    )
-
-    official_qlora.patch_official_lora_module(fake_official_lora)
-    self.assertIsNot(fake_official_lora.LoRA, original_lora_cls)
-
-    official_qlora.restore_official_lora_module(fake_official_lora)
-
-    self.assertIs(fake_official_lora.LoRA, original_lora_cls)
-
-  def test_official_qlora_int4_round_trip_is_bounded(self):
-    weight = jnp.array([[-2.0, -0.25, 0.0], [0.5, 1.0, 2.0]], dtype=jnp.float32)
-
-    quantized = official_qlora.quantize_symmetric_int4(
-        weight,
-        scale_shape=(1, 3),
-        scale_dtype=jnp.float32,
-    )
-    restored = official_qlora.dequantize_symmetric_int4(
-        quantized.qvalue,
-        quantized.scale,
-        quantized.shape,
-        dtype=jnp.float32,
-    )
-
-    self.assertEqual(quantized.qvalue.dtype, jnp.uint8)
-    self.assertEqual(quantized.qvalue.shape, (2, 2))
-    self.assertEqual(quantized.scale.shape, (1, 3))
-    self.assertLessEqual(float(jnp.max(jnp.abs(restored - weight))), 0.15)
-
-  def test_official_qlora_dequantized_base_is_frozen_for_autodiff(self):
-    qvalue = official_qlora.pack_int4(
-        jnp.array([[1, -2, 3], [4, -5, 6]], dtype=jnp.int8)
-    )
-
-    def loss(scale):
-      return jnp.sum(
-          official_qlora.dequantize_symmetric_int4(
-              qvalue,
-              scale,
-              (2, 3),
-              dtype=jnp.float32,
-          )
-      )
-
-    grad = jax.grad(loss)(jnp.ones((1, 3), dtype=jnp.float32))
-
-    self.assertTrue(bool(jnp.all(grad == 0)))
-
-  def test_official_qlora_einsum_uses_official_lora_layout(self):
-    model = official_qlora.QuantizedLoRAEinsum(
-        rank=2,
-        shape=(4, 3),
-        weight_name="w",
-        dtype=jnp.float32,
-        scale_dtype=jnp.float32,
-    )
-    x = jnp.ones((2, 4), dtype=jnp.float32)
-    variables = model.init(jax.random.PRNGKey(0), "bd,df->bf", x)
-    flat_params = flax.traverse_util.flatten_dict(unfreeze(variables)["params"])
-    leaf_paths = {"/".join(str(part) for part in path) for path in flat_params}
-
-    self.assertIn("w_qvalue", leaf_paths)
-    self.assertIn("w_scale", leaf_paths)
-    self.assertIn("lora/a", leaf_paths)
-    self.assertIn("lora/b", leaf_paths)
-    self.assertNotIn("w", leaf_paths)
-
-    changed_variables = _set_lora_b_leaves_to_constant(variables, 0.01)
-    before = model.apply(variables, "bd,df->bf", x)
-    after = model.apply(changed_variables, "bd,df->bf", x)
-
-    self.assertTrue(bool(jnp.any(before != after)))
-
-  def test_official_qlora_einsum_forces_wrapper_compute_dtype(self):
-    model = official_qlora.QuantizedLoRAEinsum(
-        rank=2,
-        shape=(4, 3),
-        weight_name="w",
-        dtype=jnp.bfloat16,
-        scale_dtype=jnp.bfloat16,
-    )
-    x = jnp.ones((2, 4), dtype=jnp.float32)
-    variables = model.init(jax.random.PRNGKey(0), "bd,df->bf", x)
-
-    y = model.apply(variables, "bd,df->bf", x)
-
-    self.assertEqual(y.dtype, jnp.bfloat16)
-
-  def test_official_qlora_einsum_chunked_path_matches_dequantized_reference(
-      self,
-  ):
-    model = official_qlora.QuantizedLoRAEinsum(
-        rank=1,
-        shape=(3, 5),
-        weight_name="w",
-        dtype=jnp.float32,
-        scale_dtype=jnp.float32,
-        output_chunk_size=2,
-    )
-    x = jnp.arange(6, dtype=jnp.float32).reshape(2, 3) / 10.0
-    variables = model.init(jax.random.PRNGKey(0), "bd,df->bf", x)
-    dense_weight = jnp.arange(15, dtype=jnp.float32).reshape(3, 5) / 7.0
-    quantized = official_qlora.quantize_symmetric_int4(
-        dense_weight,
-        scale_shape=(1, 5),
-        scale_dtype=jnp.float32,
-    )
-    mutable = unfreeze(variables)
-    mutable["params"]["w_qvalue"] = quantized.qvalue
-    mutable["params"]["w_scale"] = quantized.scale
-    variables = freeze(mutable)
-
-    actual = model.apply(variables, "bd,df->bf", x)
-    reference_weight = official_qlora.dequantize_symmetric_int4(
-        quantized.qvalue,
-        quantized.scale,
-        quantized.shape,
-        dtype=jnp.float32,
-    )
-    expected = jnp.einsum("bd,df->bf", x, reference_weight)
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
-
-  def test_official_qlora_einsum_ellipsis_chunked_path_matches_reference(
-      self,
-  ):
-    model = official_qlora.QuantizedLoRAEinsum(
-        rank=1,
-        shape=(3, 5),
-        weight_name="w",
-        dtype=jnp.float32,
-        scale_dtype=jnp.float32,
-        output_chunk_size=2,
-    )
-    x = jnp.arange(12, dtype=jnp.float32).reshape(2, 2, 3) / 10.0
-    variables = model.init(jax.random.PRNGKey(0), "...d,df->...f", x)
-    dense_weight = jnp.arange(15, dtype=jnp.float32).reshape(3, 5) / 7.0
-    quantized = official_qlora.quantize_symmetric_int4(
-        dense_weight,
-        scale_shape=(1, 5),
-        scale_dtype=jnp.float32,
-    )
-    mutable = unfreeze(variables)
-    mutable["params"]["w_qvalue"] = quantized.qvalue
-    mutable["params"]["w_scale"] = quantized.scale
-    variables = freeze(mutable)
-
-    actual = model.apply(variables, "...d,df->...f", x)
-    reference_weight = official_qlora.dequantize_symmetric_int4(
-        quantized.qvalue,
-        quantized.scale,
-        quantized.shape,
-        dtype=jnp.float32,
-    )
-    expected = jnp.einsum("...d,df->...f", x, reference_weight)
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
-
-  def test_official_qlora_einsum_middle_output_axis_matches_reference(self):
-    model = official_qlora.QuantizedLoRAEinsum(
-        rank=1,
-        shape=(2, 5, 3),
-        weight_name="w",
-        dtype=jnp.float32,
-        scale_dtype=jnp.float32,
-        output_chunk_size=2,
-    )
-    x = jnp.arange(2 * 4 * 3, dtype=jnp.float32).reshape(2, 4, 3) / 10.0
-    variables = model.init(jax.random.PRNGKey(0), "...F,NHF->...NH", x)
-    dense_weight = jnp.arange(2 * 5 * 3, dtype=jnp.float32).reshape(2, 5, 3)
-    dense_weight = (dense_weight - 11.0) / 7.0
-    quantized = official_qlora.quantize_symmetric_int4(
-        dense_weight,
-        scale_shape=(2, 5, 1),
-        scale_dtype=jnp.float32,
-    )
-    mutable = unfreeze(variables)
-    mutable["params"]["w_qvalue"] = quantized.qvalue
-    mutable["params"]["w_scale"] = quantized.scale
-    variables = freeze(mutable)
-    official_qlora._LOGGED_DENSE_FALLBACKS.clear()  # pylint: disable=protected-access
-
-    actual = model.apply(variables, "...F,NHF->...NH", x)
-    reference_weight = official_qlora.dequantize_symmetric_int4(
-        quantized.qvalue,
-        quantized.scale,
-        quantized.shape,
-        dtype=jnp.float32,
-    )
-    expected = jnp.einsum("...F,NHF->...NH", x, reference_weight)
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
-    self.assertEmpty(official_qlora._LOGGED_DENSE_FALLBACKS)  # pylint: disable=protected-access
-
-  def test_official_qlora_einsum_middle_output_axis_jits_dynamic_path(self):
-    model = official_qlora.QuantizedLoRAEinsum(
-        rank=1,
-        shape=(2, 4, 3),
-        weight_name="w",
-        dtype=jnp.float32,
-        scale_dtype=jnp.float32,
-        output_chunk_size=2,
-    )
-    x = jnp.arange(2 * 4 * 3, dtype=jnp.float32).reshape(2, 4, 3) / 10.0
-    variables = model.init(jax.random.PRNGKey(0), "...F,NHF->...NH", x)
-    dense_weight = jnp.arange(2 * 4 * 3, dtype=jnp.float32).reshape(2, 4, 3)
-    dense_weight = (dense_weight - 11.0) / 7.0
-    quantized = official_qlora.quantize_symmetric_int4(
-        dense_weight,
-        scale_shape=(2, 4, 1),
-        scale_dtype=jnp.float32,
-    )
-    mutable = unfreeze(variables)
-    mutable["params"]["w_qvalue"] = quantized.qvalue
-    mutable["params"]["w_scale"] = quantized.scale
-    variables = freeze(mutable)
-    official_qlora._LOGGED_DENSE_FALLBACKS.clear()  # pylint: disable=protected-access
-
-    @jax.jit
-    def apply_model(params, inputs):
-      return model.apply(params, "...F,NHF->...NH", inputs)
-
-    actual = apply_model(variables, x)
-    reference_weight = official_qlora.dequantize_symmetric_int4(
-        quantized.qvalue,
-        quantized.scale,
-        quantized.shape,
-        dtype=jnp.float32,
-    )
-    expected = jnp.einsum("...F,NHF->...NH", x, reference_weight)
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
-    self.assertEmpty(official_qlora._LOGGED_DENSE_FALLBACKS)  # pylint: disable=protected-access
-
-  def test_official_qlora_einsum_input_grad_matches_reference(self):
-    dense_weight = jnp.arange(2 * 4 * 3, dtype=jnp.float32).reshape(2, 4, 3)
-    dense_weight = (dense_weight - 11.0) / 7.0
-    packed = official_qlora.quantize_symmetric_int4(
-        dense_weight,
-        scale_shape=(2, 4, 1),
-        scale_dtype=jnp.float32,
-    ).astype(jnp.float32)
-    reference_weight = official_qlora.dequantize_symmetric_int4(
-        packed.qvalue,
-        packed.scale,
-        packed.shape,
-        dtype=jnp.float32,
-    )
-    x = jnp.arange(2 * 4 * 3, dtype=jnp.float32).reshape(2, 4, 3) / 10.0
-    cotangent = jnp.arange(2 * 4 * 2 * 4, dtype=jnp.float32).reshape(
-        2, 4, 2, 4
-    )
-    cotangent = (cotangent - 9.0) / 13.0
-
-    def packed_loss(inputs):
-      y = official_qlora._packed_int4_einsum(  # pylint: disable=protected-access
-          "...F,NHF->...NH",
-          inputs,
-          packed,
-          output_chunk_size=2,
-      )
-      return jnp.sum(y * cotangent)
-
-    def reference_loss(inputs):
-      return jnp.sum(jnp.einsum("...F,NHF->...NH", inputs, reference_weight) * cotangent)
-
-    actual = jax.jit(jax.grad(packed_loss))(x)
-    expected = jax.jit(jax.grad(reference_loss))(x)
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
-
-  def test_official_qlora_matmul_input_grad_matches_reference(self):
-    dense_weight = jnp.arange(3 * 5, dtype=jnp.float32).reshape(3, 5) / 7.0
-    packed = official_qlora.quantize_symmetric_int4(
-        dense_weight,
-        scale_shape=(1, 5),
-        scale_dtype=jnp.float32,
-    ).astype(jnp.float32)
-    reference_weight = official_qlora.dequantize_symmetric_int4(
-        packed.qvalue,
-        packed.scale,
-        packed.shape,
-        dtype=jnp.float32,
-    )
-    x = jnp.arange(2 * 3, dtype=jnp.float32).reshape(2, 3) / 10.0
-    cotangent = jnp.arange(2 * 5, dtype=jnp.float32).reshape(2, 5) / 11.0
-
-    def packed_loss(inputs):
-      y = official_qlora._packed_int4_matmul(  # pylint: disable=protected-access
-          inputs,
-          packed,
-          output_chunk_size=2,
-      )
-      return jnp.sum(y * cotangent)
-
-    def reference_loss(inputs):
-      return jnp.sum(jnp.matmul(inputs, reference_weight) * cotangent)
-
-    actual = jax.jit(jax.grad(packed_loss))(x)
-    expected = jax.jit(jax.grad(reference_loss))(x)
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
-
-  def test_official_qlora_dot_general_input_grad_matches_reference(self):
-    dense_weight = jnp.arange(3 * 5 * 6, dtype=jnp.float32).reshape(3, 5, 6)
-    dense_weight = (dense_weight - 19.0) / 17.0
-    packed = official_qlora.quantize_symmetric_int4(
-        dense_weight,
-        scale_shape=(1, 5, 6),
-        scale_dtype=jnp.float32,
-    ).astype(jnp.float32)
-    reference_weight = official_qlora.dequantize_symmetric_int4(
-        packed.qvalue,
-        packed.scale,
-        packed.shape,
-        dtype=jnp.float32,
-    )
-    x = jnp.arange(2 * 3 * 4, dtype=jnp.float32).reshape(2, 3, 4) / 10.0
-    cotangent = jnp.arange(2 * 4 * 5 * 6, dtype=jnp.float32).reshape(
-        2, 4, 5, 6
-    )
-    cotangent = (cotangent - 7.0) / 23.0
-    dimension_numbers = (((1,), (0,)), ((), ()))
-
-    def packed_loss(inputs):
-      y = official_qlora._packed_int4_dot_general(  # pylint: disable=protected-access
-          inputs,
-          packed,
-          dimension_numbers=dimension_numbers,
-          output_chunk_size=2,
-      )
-      return jnp.sum(y * cotangent)
-
-    def reference_loss(inputs):
-      y = jax.lax.dot_general(inputs, reference_weight, dimension_numbers)
-      return jnp.sum(y * cotangent)
-
-    actual = jax.jit(jax.grad(packed_loss))(x)
-    expected = jax.jit(jax.grad(reference_loss))(x)
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
-
-  def test_official_qlora_packed_ragged_dot_matches_dequantized_reference(
-      self,
-  ):
-    dense_weight = jnp.arange(2 * 3 * 5, dtype=jnp.float32).reshape(2, 3, 5)
-    dense_weight = (dense_weight - 10.0) / 9.0
-    packed = official_qlora.quantize_symmetric_int4(
-        dense_weight,
-        scale_shape=(2, 1, 5),
-        scale_dtype=jnp.float32,
-    ).astype(jnp.float32)
-    x = jnp.arange(4 * 3, dtype=jnp.float32).reshape(4, 3) / 8.0
-    group_sizes = jnp.array([3, 1], dtype=jnp.int32)
-
-    with official_qlora._packed_int4_runtime_context(  # pylint: disable=protected-access
-        ragged_output_chunk_size=2
-    ):
-      actual = jax.lax.ragged_dot(x, packed, group_sizes=group_sizes)
-
-    reference_weight = official_qlora.dequantize_symmetric_int4(
-        packed.qvalue,
-        packed.scale,
-        packed.shape,
-        dtype=jnp.float32,
-    )
-    expected = jax.lax.ragged_dot(
-        x,
-        reference_weight,
-        group_sizes=group_sizes,
-    )
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
-
-  def test_official_qlora_packed_gating_ragged_dot_matches_reference(self):
-    dense_weight = jnp.arange(2 * 2 * 3 * 4, dtype=jnp.float32).reshape(
-        2, 2, 3, 4
-    )
-    dense_weight = (dense_weight - 17.0) / 11.0
-    packed = official_qlora.quantize_symmetric_int4(
-        dense_weight,
-        scale_shape=(2, 2, 3, 1),
-        scale_dtype=jnp.float32,
-    ).astype(jnp.float32)
-    x = jnp.arange(5 * 4, dtype=jnp.float32).reshape(5, 4) / 13.0
-    group_sizes = jnp.array([2, 3], dtype=jnp.int32)
-
-    with official_qlora._packed_int4_runtime_context(  # pylint: disable=protected-access
-        ragged_output_chunk_size=2
-    ):
-      rhs = jnp.transpose(packed, (0, 3, 1, 2)).reshape(2, 4, 6)
-      actual = jax.lax.ragged_dot(x, rhs, group_sizes=group_sizes)
-
-    reference_weight = official_qlora.dequantize_symmetric_int4(
-        packed.qvalue,
-        packed.scale,
-        packed.shape,
-        dtype=jnp.float32,
-    )
-    reference_rhs = jnp.transpose(reference_weight, (0, 3, 1, 2)).reshape(
-        2, 4, 6
-    )
-    expected = jax.lax.ragged_dot(
-        x,
-        reference_rhs,
-        group_sizes=group_sizes,
-    )
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
-
-  def test_official_qlora_packed_ragged_dot_input_grad_matches_reference(self):
-    dense_weight = jnp.arange(2 * 3 * 4, dtype=jnp.float32).reshape(2, 3, 4)
-    dense_weight = (dense_weight - 8.0) / 7.0
-    packed = official_qlora.quantize_symmetric_int4(
-        dense_weight,
-        scale_shape=(2, 1, 4),
-        scale_dtype=jnp.float32,
-    ).astype(jnp.float32)
-    reference_rhs = official_qlora.dequantize_symmetric_int4(
-        packed.qvalue,
-        packed.scale,
-        packed.shape,
-        dtype=jnp.float32,
-    )
-    x = jnp.arange(5 * 3, dtype=jnp.float32).reshape(5, 3) / 17.0
-    group_sizes = jnp.array([2, 3], dtype=jnp.int32)
-    cotangent = jnp.arange(5 * 4, dtype=jnp.float32).reshape(5, 4) / 19.0
-
-    def packed_loss(inputs):
-      with official_qlora._packed_int4_runtime_context(  # pylint: disable=protected-access
-          ragged_output_chunk_size=2
-      ):
-        y = jax.lax.ragged_dot(inputs, packed, group_sizes=group_sizes)
-      return jnp.sum(y * cotangent)
-
-    def reference_loss(inputs):
-      y = jax.lax.ragged_dot(inputs, reference_rhs, group_sizes=group_sizes)
-      return jnp.sum(y * cotangent)
-
-    actual = jax.jit(jax.grad(packed_loss))(x)
-    expected = jax.jit(jax.grad(reference_loss))(x)
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
-
-  def test_official_qlora_packed_ragged_dot_general_matches_reference(self):
-    dense_weight = jnp.arange(2 * 3 * 4, dtype=jnp.float32).reshape(2, 3, 4)
-    dense_weight = (dense_weight - 8.0) / 7.0
-    packed = official_qlora.quantize_symmetric_int4(
-        dense_weight,
-        scale_shape=(2, 1, 4),
-        scale_dtype=jnp.float32,
-    ).astype(jnp.float32)
-    x = jnp.arange(5 * 3, dtype=jnp.float32).reshape(5, 3) / 17.0
-    group_sizes = jnp.array([2, 3], dtype=jnp.int32)
-    dnums = jax.lax.RaggedDotDimensionNumbers(
-        (((1,), (1,)), ((), ())),
-        (0,),
-        (0,),
-    )
-
-    with official_qlora._packed_int4_runtime_context(  # pylint: disable=protected-access
-        ragged_output_chunk_size=2
-    ):
-      actual = jax.lax.ragged_dot_general(
-          x,
-          packed,
-          group_sizes=group_sizes,
-          ragged_dot_dimension_numbers=dnums,
-      )
-
-    reference_rhs = official_qlora.dequantize_symmetric_int4(
-        packed.qvalue,
-        packed.scale,
-        packed.shape,
-        dtype=jnp.float32,
-    )
-    expected = jax.lax.ragged_dot_general(
-        x,
-        reference_rhs,
-        group_sizes=group_sizes,
-        ragged_dot_dimension_numbers=dnums,
-    )
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
-
-  def test_official_qlora_packed_gating_ragged_dot_general_jits(self):
-    dense_weight = jnp.arange(2 * 2 * 3 * 4, dtype=jnp.float32).reshape(
-        2, 2, 3, 4
-    )
-    dense_weight = (dense_weight - 17.0) / 11.0
-    packed = official_qlora.quantize_symmetric_int4(
-        dense_weight,
-        scale_shape=(2, 2, 3, 1),
-        scale_dtype=jnp.float32,
-    ).astype(jnp.float32)
-    x = jnp.arange(5 * 4, dtype=jnp.float32).reshape(5, 4) / 13.0
-    group_sizes = jnp.array([2, 3], dtype=jnp.int32)
-    dnums = jax.lax.RaggedDotDimensionNumbers(
-        (((1,), (1,)), ((), ())),
-        (0,),
-        (0,),
-    )
-
-    def run(x, packed, group_sizes):
-      with official_qlora._packed_int4_runtime_context(  # pylint: disable=protected-access
-          ragged_output_chunk_size=2
-      ):
-        rhs = jnp.transpose(packed, (0, 3, 1, 2)).reshape(2, 4, 6)
-        return jax.lax.ragged_dot_general(
-            x,
-            rhs,
-            group_sizes=group_sizes,
-            ragged_dot_dimension_numbers=dnums,
-        )
-
-    actual = jax.jit(run)(x, packed, group_sizes)
-
-    reference_weight = official_qlora.dequantize_symmetric_int4(
-        packed.qvalue,
-        packed.scale,
-        packed.shape,
-        dtype=jnp.float32,
-    )
-    reference_rhs = jnp.transpose(reference_weight, (0, 3, 1, 2)).reshape(
-        2, 4, 6
-    )
-    expected = jax.lax.ragged_dot_general(
-        x,
-        reference_rhs,
-        group_sizes=group_sizes,
-        ragged_dot_dimension_numbers=dnums,
-    )
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
-
-  def test_official_qlora_checkpoint_candidates_match_gemma_paths(self):
-    self.assertIn(
-        "layer_0/mlp/gating_einsum",
-        official_qlora.checkpoint_candidates_for_quantized_path(
-            "layer_0/mlp/_QLoRAEinsum_gating_einsum/gating_einsum_qvalue"
-        ),
-    )
-    self.assertIn(
-        "layer_0/attn/q_einsum/w",
-        official_qlora.checkpoint_candidates_for_quantized_path(
-            "layer_0/attn/q_einsum/_QLoRAEinsum_0/w_scale"
-        ),
-    )
-    self.assertIn(
-        "layer_0/mlp/gating_einsum/w",
-        official_qlora.checkpoint_candidates_for_quantized_path(
-            "layer_0/mlp/gating_einsum/_QLoRAWeight_0/w_qvalue"
-        ),
-    )
-
-  def test_official_qlora_moe_weight_scale_shapes(self):
-    self.assertEqual(
-        official_qlora.deduce_moe_weight_scale_shape(
-            "layer_0/mlp/gating_einsum", (8, 2, 16, 32)
-        ),
-        (8, 2, 16, 1),
-    )
-    self.assertEqual(
-        official_qlora.deduce_moe_weight_scale_shape(
-            "layer_0/mlp/linear", (8, 16, 32)
-        ),
-        (8, 1, 32),
-    )
-
-  def test_official_qlora_moe_weight_provider_uses_quantized_storage(self):
-    model = official_qlora.QuantizedWeightProvider(
-        shape=(2, 3, 4),
-        dtype=jnp.float32,
-        scale_dtype=jnp.float32,
-        module_path="layer_0/mlp/linear",
-    )
-    variables = model.init(jax.random.PRNGKey(0))
-    flat_params = flax.traverse_util.flatten_dict(unfreeze(variables)["params"])
-    leaf_paths = {"/".join(str(part) for part in path) for path in flat_params}
-
-    self.assertIn("w_qvalue", leaf_paths)
-    self.assertIn("w_scale", leaf_paths)
-    self.assertNotIn("w", leaf_paths)
-    self.assertEqual(flat_params[("w_qvalue",)].shape, (2, 3, 2))
-    self.assertEqual(flat_params[("w_scale",)].shape, (2, 1, 4))
-
-  def test_official_qlora_can_skip_moe_weight_quantization(self):
-    class _Weight(linen_nn.Module):
-      shape: tuple[int, ...]
-      weight_name: str = "w"
-      dtype: jnp.dtype = jnp.float32
-
-    module = _Weight(shape=(2, 3, 4), name="linear")
-
-    replaced = official_qlora._replace_by_official_qlora(  # pylint: disable=protected-access
-        module,
-        rank=2,
-        dtype=jnp.float32,
-        target_modules=official_qlora.ALL_LINEAR,
-        supported_modules=(),
-        matches_target_modules=lambda module, target_modules: True,
-        lora_einsum_adapter_cls=None,
-        lora_dense_adapter_cls=None,
-        lora_dense_general_adapter_cls=None,
-        scale_dtype=jnp.float32,
-        quantize_moe_weights=False,
-        einsum_output_chunk_size=2,
-        ragged_output_chunk_size=2,
-    )
-
-    self.assertIs(replaced, module)
-
-  def test_official_qlora_quantizes_moe_weight_by_default(self):
-    class _Weight(linen_nn.Module):
-      shape: tuple[int, ...]
-      weight_name: str = "w"
-      dtype: jnp.dtype = jnp.float32
-
-    module = _Weight(shape=(2, 3, 4), name="linear")
-
-    replaced = official_qlora._replace_by_official_qlora(  # pylint: disable=protected-access
-        module,
-        rank=2,
-        dtype=jnp.float32,
-        target_modules=official_qlora.ALL_LINEAR,
-        supported_modules=(),
-        matches_target_modules=lambda module, target_modules: True,
-        lora_einsum_adapter_cls=None,
-        lora_dense_adapter_cls=None,
-        lora_dense_general_adapter_cls=None,
-        scale_dtype=jnp.float32,
-        quantize_moe_weights=True,
-        einsum_output_chunk_size=2,
-        ragged_output_chunk_size=2,
-    )
-
-    self.assertIsInstance(replaced, official_qlora.QuantizedWeightProvider)
-
-  def test_official_qlora_checkpoint_leaf_quantizes_dense_weight(self):
-    model_flat = {
-        "layer_0/attn/q_einsum/_QLoRAEinsum_0/w_qvalue": jax.ShapeDtypeStruct(
-            (4, 2), jnp.uint8
-        ),
-        "layer_0/attn/q_einsum/_QLoRAEinsum_0/w_scale": jax.ShapeDtypeStruct(
-            (1, 3), jnp.float32
-        ),
-    }
-    dense = jnp.arange(12, dtype=jnp.float32).reshape(4, 3) - 6.0
-
-    qvalue = official_qlora.quantize_checkpoint_leaf(
-        quantized_path="layer_0/attn/q_einsum/_QLoRAEinsum_0/w_qvalue",
-        checkpoint_value=dense,
-        model_flat=model_flat,
-    )
-    scale = official_qlora.quantize_checkpoint_leaf(
-        quantized_path="layer_0/attn/q_einsum/_QLoRAEinsum_0/w_scale",
-        checkpoint_value=dense,
-        model_flat=model_flat,
-    )
-
-    self.assertEqual(qvalue.shape, (4, 2))
-    self.assertEqual(qvalue.dtype, jnp.uint8)
-    self.assertEqual(scale.shape, (1, 3))
-    self.assertEqual(scale.dtype, jnp.float32)
-
-  def test_official_qlora_param_summary_counts_qvalue_scale_pair(self):
-    summary = hackable_adapter._param_tree_memory_summary({  # pylint: disable=protected-access
-        "layer_0": {
-            "attn": {
-                "q_einsum": {
-                    "_QLoRAEinsum_0": {
-                        "w_qvalue": jnp.zeros((6,), dtype=jnp.uint8),
-                        "w_scale": jnp.ones((1, 3), dtype=jnp.bfloat16),
-                        "lora": {
-                            "a": jnp.ones((4, 2), dtype=jnp.bfloat16),
-                            "b": jnp.ones((2, 3), dtype=jnp.bfloat16),
-                        },
-                    },
-                    "router_scale": jnp.ones((1,), dtype=jnp.bfloat16),
-                }
-            }
-        }
-    })
-
-    self.assertEqual(summary["quantized_base_leaves"], 1)
-    self.assertEqual(summary["quantized_base_qvalue_bytes"], 6)
-    self.assertEqual(summary["quantized_base_scale_bytes"], 6)
-    self.assertEqual(summary["quantized_base_storage_bytes"], 12)
-    self.assertEqual(summary["quantized_base_dense_equivalent_bf16_bytes"], 24)
-    self.assertEqual(summary["lora_path_leaves"], 2)
-    self.assertEqual(summary["dense_non_lora_leaves"], 1)
-    self.assertIn("int4", summary["qtypes"])
 
   def test_lora_adapter_apply_updates_keeps_base_frozen(self):
     original_apply_updates = optax.apply_updates

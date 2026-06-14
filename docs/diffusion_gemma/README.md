@@ -2,6 +2,10 @@
 
 This directory is the runbook for the Tunix DiffusionGemma MVP integration.
 
+For the current short-form status, validated H100 x2 evidence, user-facing API
+snippets, and remaining work, start with
+`docs/diffusion_gemma/STATUS_AND_RUNBOOK.md`.
+
 ## What Works
 
 - Adds `diffusion_gemma` as a Tunix model family.
@@ -31,7 +35,6 @@ This directory is the runbook for the Tunix DiffusionGemma MVP integration.
 - Decoder rematerialization is compatible with Qwix LoRA materialization in this MVP. The SFT adapter temporarily disables decoder remat while Qwix discovers LoRA targets, then restores remat for the actual forward/train path; GPU logs verify the same 366 LoRA leaves with `--remat_decoder`.
 - For public 26B validation runs, `scripts/run_diffusion_gemma_pubmedqa_tunix.py` defaults to a minimal `minimal_state.json` proof artifact instead of Tunix/Orbax optimizer checkpointing. Use `--orbax_checkpoint` only when the shape is known to fit; the public 26B optimizer checkpoint path can exceed memory.
 - The default LoRA target set is intentionally official-compatible for the ragged MoE implementation: Qwix handles regular attention/MLP/self-conditioner projections, and Tunix adds explicit router LoRA for `MoERagged.router_logits`. Raw expert weights (`gating_einsum`, `linear`) can be enabled with `--moe_lora_targets router_logits,gating_einsum,linear`, but that broader experimental path OOMs on H100x2 in the current implementation.
-- Qwix QLoRA is intentionally not exposed for DiffusionGemma. The Qwix bridge supports LoRA only; `lora_backend="qwix_qlora"` is rejected.
 
 ## Official Hackable Backend
 

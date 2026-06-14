@@ -49,7 +49,6 @@ _LOGGED_DEVICE_LOSS_KEYS: set[tuple[str, int]] = set()
 _QWIX_CHECKPOINTER_PATCHED = False
 _QWIX_KAULDRON_SELECT_PATCHED = False
 _ADAPTER_ONLY_OPTAX_PATCHED = False
-_OFFICIAL_QLORA_CHECKPOINTER_PATCHED = False
 _OFFICIAL_GEMMA4_BLOCK_REMAT_PATCHED = False
 
 
@@ -79,21 +78,9 @@ class OfficialSFTConfig:
       config factory is called so the official LoRA wrapper is constructed with
       the requested rank.
     lora_backend: LoRA implementation used by the official recipe. `official`
-      preserves the DeepMind Hackable Diffusion wrapper. `official_qlora`
-      keeps that wrapper surface but stores frozen base weights as packed int4
-      qvalue/scale leaves. `qwix_lora` patches only the recipe's LoRA
-      constructor so the Linen model is wrapped by Tunix/Qwix while the rest of
-      the official backend remains intact.
-    official_qlora_quantize_moe_weights: If true, the official-only QLoRA
-      bridge also stores Gemma4 MoERagged private `_Weight` leaves as packed
-      int4 qvalue/scale pairs. Disable this to isolate first-step compile or
-      peak-memory issues in the MoE weight path while keeping the rest of the
-      official QLoRA bridge active.
-    official_qlora_einsum_output_chunk_size: Output-feature chunk size for
-      packed int4 Dense/Einsum execution. Smaller values reduce temporary
-      dense buffers at the cost of more HLO.
-    official_qlora_ragged_output_chunk_size: Output-feature chunk size for
-      packed int4 MoE ragged_dot execution.
+      preserves the DeepMind Hackable Diffusion wrapper. `qwix_lora` patches
+      only the recipe's LoRA constructor so the Linen model is wrapped by
+      Tunix/Qwix while the rest of the official backend remains intact.
     official_remat_blocks: If true, applies the same Gemma4 block-level
       gradient checkpointing pattern used by the official Sudoku-full recipe.
       This is a process-global Linen monkey patch and is disabled by default
@@ -142,7 +129,7 @@ class OfficialSFTConfig:
       memory-safe encoder AR cross-entropy loss. When set together with
       `encoder_loss_token_chunk_size`, the wrapper computes exact CE without
       materializing full-vocab logits and treats the tied embedder weights as
-      frozen, matching LoRA/QLoRA optimizer semantics.
+      frozen, matching LoRA optimizer semantics.
     module_overrides: Additional module-level overrides applied before
       `get_config()` is called. Use sparingly; this is intended for path-like
       constants in the official config modules.
@@ -160,9 +147,6 @@ class OfficialSFTConfig:
   checkpoint_every_n_steps: int | None = None
   lora_rank: int | None = None
   lora_backend: str = "official"
-  official_qlora_quantize_moe_weights: bool = True
-  official_qlora_einsum_output_chunk_size: int = 256
-  official_qlora_ragged_output_chunk_size: int = 256
   official_remat_blocks: bool = False
   stop_gradient_from_denoiser_to_encoder: bool | None = None
   lora_alpha: float | None = None
@@ -266,6 +250,69 @@ class DiffusionGemmaQwixLoRAConfig:
     )
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class OfficialCheckpointInfo:
+  """Host-side metadata for a Tunix-wrapped official checkpoint workdir."""
+
+  workdir: pathlib.Path
+  checkpoints_dir: pathlib.Path
+  available_steps: tuple[int, ...]
+  selected_step: int | None
+  selected_path: pathlib.Path | None
+  checkpoint_saved: bool
+  hybrid_loop_state_path: pathlib.Path
+  hybrid_loop_state: Mapping[str, Any]
+
+  def as_dict(self) -> dict[str, Any]:
+    return {
+        "workdir": str(self.workdir),
+        "checkpoints_dir": str(self.checkpoints_dir),
+        "available_steps": list(self.available_steps),
+        "selected_step": self.selected_step,
+        "selected_path": (
+            str(self.selected_path) if self.selected_path else None
+        ),
+        "checkpoint_saved": self.checkpoint_saved,
+        "hybrid_loop_state_path": str(self.hybrid_loop_state_path),
+        "hybrid_loop_state": dict(self.hybrid_loop_state),
+    }
+
+  def as_generation_kwargs(
+      self,
+      config: OfficialSFTConfig | None = None,
+  ) -> dict[str, Any]:
+    """Builds kwargs for the official-backend generation script/API."""
+    kwargs: dict[str, Any] = {
+        "workdir": str(self.workdir),
+        "step": self.selected_step,
+    }
+    if config is not None:
+      kwargs.update({
+          "recipe": config.recipe,
+          "gemma_ref": (
+              str(config.gemma_ref) if config.gemma_ref is not None else None
+          ),
+          "hackable_diffusion_ref": (
+              str(config.hackable_diffusion_ref)
+              if config.hackable_diffusion_ref is not None
+              else None
+          ),
+          "checkpoint_path": (
+              str(config.checkpoint_path)
+              if config.checkpoint_path is not None
+              else None
+          ),
+          "num_train_steps": config.num_train_steps,
+          "checkpoint_every_n_steps": config.checkpoint_every_n_steps,
+          "lora_rank": config.lora_rank,
+          "lora_alpha": config.lora_alpha,
+          "lora_backend": config.lora_backend,
+          "qwix_lora_module_path": config.qwix_lora_module_path,
+          "encoder_loss_token_chunk_size": config.encoder_loss_token_chunk_size,
+      })
+    return {key: value for key, value in kwargs.items() if value is not None}
+
+
 def make_official_tunix_sft_config(
     *,
     base_config: OfficialSFTConfig | None = None,
@@ -285,6 +332,84 @@ def make_official_tunix_sft_config(
   if loss_config is not None:
     config = loss_config.apply_to_official_config(config)
   return config
+
+
+def list_official_checkpoint_steps(
+    workdir: str | pathlib.Path,
+) -> tuple[int, ...]:
+  """Lists saved Kauldron checkpoint steps under a wrapper workdir."""
+  checkpoints_dir = pathlib.Path(workdir).expanduser() / "checkpoints"
+  if not checkpoints_dir.exists():
+    return ()
+  steps = []
+  for child in checkpoints_dir.iterdir():
+    if not child.is_dir() or not child.name.startswith("ckpt_"):
+      continue
+    try:
+      steps.append(int(child.name.removeprefix("ckpt_")))
+    except ValueError:
+      continue
+  return tuple(sorted(steps))
+
+
+def resolve_official_checkpoint_step(
+    workdir: str | pathlib.Path,
+    step: int | str | None = None,
+) -> int | None:
+  """Resolves `None`/`latest`/integer checkpoint step for a workdir."""
+  if step is None:
+    steps = list_official_checkpoint_steps(workdir)
+    return steps[-1] if steps else None
+  if isinstance(step, str):
+    if step == "latest":
+      latest = resolve_official_checkpoint_step(workdir)
+      if latest is None:
+        raise ValueError(f"No checkpoints found under {workdir!s}.")
+      return latest
+    try:
+      return int(step)
+    except ValueError as exc:
+      raise ValueError(
+          "checkpoint step must be an integer, None, or 'latest', got "
+          f"{step!r}."
+      ) from exc
+  return int(step)
+
+
+def get_official_checkpoint_info(
+    workdir: str | pathlib.Path,
+    *,
+    step: int | str | None = None,
+) -> OfficialCheckpointInfo:
+  """Returns saved-checkpoint metadata for a wrapper workdir."""
+  workdir = pathlib.Path(workdir).expanduser()
+  checkpoints_dir = workdir / "checkpoints"
+  state_path = workdir / "hybrid_loop_state.json"
+  hybrid_loop_state: Mapping[str, Any] = {}
+  if state_path.exists():
+    hybrid_loop_state = json.loads(state_path.read_text(encoding="utf-8"))
+  available_steps = list_official_checkpoint_steps(workdir)
+  selected_step = resolve_official_checkpoint_step(workdir, step)
+  selected_path = (
+      checkpoints_dir / f"ckpt_{selected_step}"
+      if selected_step is not None
+      else None
+  )
+  if selected_path is not None and not selected_path.exists():
+    selected_path = None
+  checkpoint_saved = bool(hybrid_loop_state.get("checkpoint_saved")) or bool(
+      available_steps
+  )
+  return OfficialCheckpointInfo(
+      workdir=workdir,
+      checkpoints_dir=checkpoints_dir,
+      available_steps=available_steps,
+      selected_step=selected_step,
+      selected_path=selected_path,
+      checkpoint_saved=checkpoint_saved,
+      hybrid_loop_state_path=state_path,
+      hybrid_loop_state=hybrid_loop_state,
+  )
 
 
 def recipe_module_name(recipe: str) -> str:
@@ -394,12 +519,8 @@ def build_official_sft_config(config: OfficialSFTConfig):
   initialize_jax_before_tensorflow(_extra_paths(config))
   _patch_official_gemma4_block_remat(config)
   module = _import_recipe_module(config)
-  if config.lora_backend == "official_qlora":
-    _patch_official_lora_for_qlora(config)
-  else:
-    _restore_official_lora_after_qlora()
-    if config.lora_backend != "official":
-      _patch_kauldron_lora_select_for_qwix()
+  if config.lora_backend != "official":
+    _patch_kauldron_lora_select_for_qwix()
   module_overrides = dict(config.module_overrides)
   if config.checkpoint_path is not None:
     module_overrides["CHECKPOINT_PATH"] = str(config.checkpoint_path)
@@ -462,11 +583,43 @@ class OfficialDiffusionGemmaTrainer:
         )
     )
 
+  @classmethod
+  def from_pubmedqa(
+      cls,
+      *,
+      peft_config: DiffusionGemmaQwixLoRAConfig | None = None,
+      loss_config: DiffusionGemmaOfficialLossConfig | None = None,
+      base_config: OfficialSFTConfig | None = None,
+      **official_config_kwargs,
+  ) -> "OfficialDiffusionGemmaTrainer":
+    """Builds the official PubMedQA SFT backend from Tunix-facing configs."""
+    if "recipe" in official_config_kwargs:
+      raise ValueError("from_pubmedqa() sets recipe='pubmedqa' internally.")
+    return cls.from_official_backend(
+        recipe="pubmedqa",
+        peft_config=peft_config,
+        loss_config=loss_config,
+        base_config=base_config,
+        **official_config_kwargs,
+    )
+
   def build_config(self):
     return build_official_sft_config(self.config)
 
   def resolve(self):
     return resolve_official_trainer(self.config)
+
+  def checkpoint_info(
+      self, step: int | str | None = None
+  ) -> OfficialCheckpointInfo:
+    """Returns saved-checkpoint metadata for this trainer's workdir."""
+    if self.config.workdir is None:
+      raise ValueError("OfficialDiffusionGemmaTrainer.config.workdir is unset.")
+    return get_official_checkpoint_info(self.config.workdir, step=step)
+
+  def generation_kwargs(self, step: int | str | None = None) -> dict[str, Any]:
+    """Returns generation kwargs for a saved wrapper checkpoint."""
+    return self.checkpoint_info(step=step).as_generation_kwargs(self.config)
 
   def train(self):
     trainer = self.resolve()
@@ -690,11 +843,11 @@ def _hybrid_trainstep_with_total_loss(
   """Runs one Kauldron step and logs only the scalar total loss.
 
   Kauldron's public `TrainStep.step(return_losses=True)` returns full
-  per-loss accumulator states. For DiffusionGemma QLoRA those states can force
-  XLA to materialize a much larger executable/output tree than the training
-  update itself. Returning even `Context.loss_total` to Python can force a large
-  device-to-host materialization, so the hybrid Tunix loop emits the scalar from
-  inside the jitted step with `jax.debug.callback`.
+  per-loss accumulator states. For large DiffusionGemma runs those states can
+  force XLA to materialize a much larger executable/output tree than the
+  training update itself. Returning even `Context.loss_total` to Python can
+  force a large device-to-host materialization, so the hybrid Tunix loop emits
+  the scalar from inside the jitted step with `jax.debug.callback`.
   """
   return _jit_hybrid_trainstep_with_total_loss(
       trainstep,
@@ -828,7 +981,7 @@ def _import_recipe_module(config: OfficialSFTConfig):
 
 
 def _validate_lora_backend(config: OfficialSFTConfig) -> None:
-  valid = {"official", "official_qlora", "qwix_lora"}
+  valid = {"official", "qwix_lora"}
   if config.lora_backend not in valid:
     raise ValueError(
         "Official DiffusionGemma lora_backend must be one of "
@@ -842,8 +995,8 @@ def _patch_official_gemma4_block_remat(config: OfficialSFTConfig) -> None:
   The official `sft_sudoku_full` recipe carries this exact idea as a module
   monkey patch over `gemma.gm.nn.gemma4._modules.Block.__call__`. We keep it
   opt-in here because it changes the process-global Linen class, but it is the
-  lowest-risk way to reproduce the official activation-memory trick for
-  PubMedQA/QLoRA runs.
+      lowest-risk way to reproduce the official activation-memory trick for
+      PubMedQA runs.
   """
   global _OFFICIAL_GEMMA4_BLOCK_REMAT_PATCHED
   if not config.official_remat_blocks:
@@ -937,20 +1090,6 @@ def _replace_resolved_lora_backend(
 ) -> None:
   """Applies the selected LoRA backend to the resolved official trainer."""
   if config.lora_backend == "official":
-    return
-  if config.lora_backend == "official_qlora":
-    _patch_official_qlora_checkpoint_loader(config)
-    _patch_lora_adapter_only_optax_apply_updates()
-    print(
-        _json_dumps({
-            "event": "official_backend_official_qlora_ready",
-            "lora_backend": config.lora_backend,
-            "qtype": "int4",
-            "quantize_moe_weights": config.official_qlora_quantize_moe_weights,
-            "base_weight_storage": "packed_qvalue_scale",
-        }),
-        flush=True,
-    )
     return
   _patch_qwix_checkpoint_loader(config)
   _patch_lora_adapter_only_optax_apply_updates()
@@ -1086,73 +1225,6 @@ def _load_linen_qwix_lora_module():
   sys.modules[spec.name] = module
   spec.loader.exec_module(module)
   return module
-
-
-def _load_official_qlora_module():
-  module_path = pathlib.Path(__file__).with_name("official_qlora.py")
-  spec = importlib.util.spec_from_file_location(
-      "_tunix_diffusion_gemma_official_qlora", module_path
-  )
-  if spec is None or spec.loader is None:
-    raise OfficialBackendDependencyError(
-        f"Could not load official QLoRA bridge from {module_path}."
-    )
-  module = importlib.util.module_from_spec(spec)
-  sys.modules[spec.name] = module
-  spec.loader.exec_module(module)
-  return module
-
-
-def _patch_official_lora_for_qlora(config: OfficialSFTConfig) -> None:
-  """Patches official Hackable-Diffusion LoRA to use quantized base weights."""
-  try:
-    official_lora = importlib.import_module(
-        "gemma.diffusion.hackable_diffusion_adapter.hd.lora"
-    )
-  except Exception as exc:  # pylint: disable=broad-exception-caught
-    raise OfficialBackendDependencyError(
-        "Could not import official DiffusionGemma LoRA for QLoRA patching."
-    ) from exc
-  bridge = _load_official_qlora_module()
-  bridge.patch_official_lora_module(
-      official_lora,
-      quantization_config=bridge.OfficialQLoRAConfig(
-          quantize_moe_weights=config.official_qlora_quantize_moe_weights,
-          einsum_output_chunk_size=(
-              config.official_qlora_einsum_output_chunk_size
-          ),
-          ragged_output_chunk_size=(
-              config.official_qlora_ragged_output_chunk_size
-          ),
-      ),
-  )
-  print(
-      _json_dumps({
-          "event": "official_backend_official_lora_patched_for_qlora",
-          "lora_backend": "official_qlora",
-          "qtype": "int4",
-          "quantize_moe_weights": config.official_qlora_quantize_moe_weights,
-          "einsum_output_chunk_size": (
-              config.official_qlora_einsum_output_chunk_size
-          ),
-          "ragged_output_chunk_size": (
-              config.official_qlora_ragged_output_chunk_size
-          ),
-      }),
-      flush=True,
-  )
-
-
-def _restore_official_lora_after_qlora() -> None:
-  """Restores official LoRA when a non-QLoRA backend is selected."""
-  try:
-    official_lora = importlib.import_module(
-        "gemma.diffusion.hackable_diffusion_adapter.hd.lora"
-    )
-  except Exception:  # pylint: disable=broad-exception-caught
-    return
-  bridge = _load_official_qlora_module()
-  bridge.restore_official_lora_module(official_lora)
 
 
 def _qwix_methods_with_encoder_hidden(bridge: Any) -> tuple[str, ...]:
@@ -2221,29 +2293,6 @@ def _jax_key_path_to_string(path: Sequence[Any]) -> str:
   return "/".join(parts)
 
 
-def _is_qwix_quantized_value(value: Any) -> bool:
-  return hasattr(value, "array") and hasattr(value, "how")
-
-
-def _checkpoint_value_for_model_value(
-    model_value: Any,
-    checkpoint_value: Any,
-) -> Any:
-  """Converts checkpoint leaves to the model leaf shape."""
-  if not _is_qwix_quantized_value(model_value):
-    return checkpoint_value
-  try:
-    qwix_ptq = importlib.import_module("qwix._src.providers.ptq")
-  except Exception as exc:  # pylint: disable=broad-exception-caught
-    raise OfficialBackendDependencyError(
-        "Qwix quantized checkpoint restore requires qwix."
-    ) from exc
-  return qwix_ptq.WithAux(
-      qwix_ptq.qarray.quantize(checkpoint_value, model_value.how),
-      model_value.how,
-  )
-
-
 def _delete_jax_arrays_in_tree(value: Any, jax_module: Any) -> None:
   for leaf in jax_module.tree_util.tree_leaves(value):
     if isinstance(leaf, jax_module.Array):
@@ -2251,7 +2300,7 @@ def _delete_jax_arrays_in_tree(value: Any, jax_module: Any) -> None:
 
 
 def _patch_lora_adapter_only_optax_apply_updates() -> None:
-  """Keeps frozen base params unchanged during LoRA/QLoRA Optax updates."""
+  """Keeps frozen base params unchanged during LoRA Optax updates."""
   global _ADAPTER_ONLY_OPTAX_PATCHED
   if _ADAPTER_ONLY_OPTAX_PATCHED:
     return
@@ -2300,218 +2349,6 @@ def _patch_qwix_optax_apply_updates() -> None:
   _patch_lora_adapter_only_optax_apply_updates()
 
 
-def _patch_official_qlora_checkpoint_loader(config: OfficialSFTConfig) -> None:
-  """Extends the official memory-safe loader for official QLoRA leaves."""
-  del config
-  global _OFFICIAL_QLORA_CHECKPOINTER_PATCHED
-  if _OFFICIAL_QLORA_CHECKPOINTER_PATCHED:
-    return
-
-  try:
-    gemma_checkpointer = importlib.import_module(
-        "gemma.diffusion.hackable_diffusion_adapter.hd.gemma_checkpointer"
-    )
-  except Exception as exc:  # pylint: disable=broad-exception-caught
-    raise OfficialBackendDependencyError(
-        "Could not import the official DiffusionGemma checkpointer for "
-        "official QLoRA compatibility patching."
-    ) from exc
-
-  if getattr(gemma_checkpointer, "_tunix_official_qlora_patch_applied", False):
-    _OFFICIAL_QLORA_CHECKPOINTER_PATCHED = True
-    return
-
-  qlora = _load_official_qlora_module()
-
-  def _is_official_qlora_model_path(path: str, model_flat: Mapping[str, Any]):
-    if not qlora.is_quantized_param_path(path):
-      return False
-    try:
-      return qlora.paired_quantized_path(path) in model_flat
-    except ValueError:
-      return False
-
-  def _remap_and_match_params(
-      model_flat: dict[str, Any],
-      ckpt_flat: dict[str, Any],
-      lora_init_values: dict[str, Any] | None = None,
-  ) -> dict[str, Any]:
-    if lora_init_values is None:
-      lora_init_values = {}
-
-    remapped_ckpt = {}
-    for ckpt_path, value in ckpt_flat.items():
-      remapped_ckpt[ckpt_path] = value
-      if ckpt_path.endswith("/w"):
-        remapped_ckpt[ckpt_path.rsplit("/w", 1)[0]] = value
-
-    loaded_count = 0
-    consumed_ckpt_paths = set()
-    loaded_qlora_paths = set()
-    missing_qlora_paths = set()
-    quantized_cache: dict[str, Any] = {}
-    for path, model_value in model_flat.items():
-      if _is_official_qlora_model_path(path, model_flat):
-        candidates = qlora.checkpoint_candidates_for_quantized_path(path)
-        checkpoint_path = next(
-            (
-                candidate
-                for candidate in candidates
-                if candidate in remapped_ckpt
-            ),
-            None,
-        )
-        if checkpoint_path is None:
-          missing_qlora_paths.add(path)
-          continue
-        if checkpoint_path not in quantized_cache:
-          scale_path = (
-              path
-              if qlora.quantized_param_kind(path) == "scale"
-              else qlora.paired_quantized_path(path)
-          )
-          quantized_cache[checkpoint_path] = qlora.quantize_symmetric_int4(
-              remapped_ckpt[checkpoint_path],
-              scale_shape=tuple(
-                  int(dim) for dim in getattr(model_flat[scale_path], "shape")
-              ),
-              scale_dtype=getattr(model_flat[scale_path], "dtype"),
-          )
-        quantized = quantized_cache[checkpoint_path]
-        if qlora.quantized_param_kind(path) == "qvalue":
-          model_flat[path] = quantized.qvalue.astype(model_value.dtype)
-        else:
-          model_flat[path] = quantized.scale.astype(model_value.dtype)
-        loaded_count += 1
-        loaded_qlora_paths.add(path)
-        consumed_ckpt_paths.update(candidates)
-        continue
-      if path in remapped_ckpt:
-        model_flat[path] = remapped_ckpt[path]
-        loaded_count += 1
-
-    for key, value in lora_init_values.items():
-      model_flat[key] = value
-
-    ckpt_only = set(remapped_ckpt) - set(model_flat) - consumed_ckpt_paths
-    if ckpt_only:
-      gemma_checkpointer.logging.warning(
-          "Discarding %d checkpoint-only key(s) not present in the model: %s",
-          len(ckpt_only),
-          sorted(ckpt_only),
-      )
-
-    model_only = set(model_flat) - set(remapped_ckpt)
-    lora_keys = {key for key in model_only if _is_lora_adapter_path(key)}
-    qlora_keys = {
-        key
-        for key in model_only
-        if _is_official_qlora_model_path(key, model_flat)
-    }
-    non_lora_model_only = model_only - lora_keys - qlora_keys
-    if lora_keys:
-      gemma_checkpointer.logging.info(
-          "Keeping %d LoRA key(s) with their initialized values.",
-          len(lora_keys),
-      )
-    if qlora_keys:
-      gemma_checkpointer.logging.info(
-          "Loaded %d official QLoRA quantized base key(s) from dense "
-          "checkpoint weights.",
-          len(loaded_qlora_paths),
-      )
-    missing_qlora_paths.update(qlora_keys - loaded_qlora_paths)
-    if missing_qlora_paths:
-      raise KeyError(
-          f"Found {len(missing_qlora_paths)} official QLoRA base key(s) "
-          "without matching dense checkpoint weights: "
-          f"{sorted(missing_qlora_paths)}"
-      )
-    if non_lora_model_only:
-      raise KeyError(
-          f"Found {len(non_lora_model_only)} model-only key(s) "
-          f"(excluding LoRA/QLoRA): {sorted(non_lora_model_only)}"
-      )
-
-    gemma_checkpointer.logging.info(
-        "Checkpoint loading complete: %d params loaded, "
-        "%d checkpoint-only (discarded).",
-        loaded_count,
-        len(ckpt_only),
-    )
-    return model_flat
-
-  def cheaply_load_params(params_from_state, checkpoint_path):
-    existing = params_from_state
-    model_param_spec = (
-        gemma_checkpointer._convert_to_element_spec_with_sharding(existing)
-    )  # pylint: disable=protected-access
-
-    existing_flat_arrays = gemma_checkpointer.flax.traverse_util.flatten_dict(
-        existing, sep="/"
-    )
-    lora_init_values = {
-        key: value
-        for key, value in existing_flat_arrays.items()
-        if _is_lora_adapter_path(key)
-    }
-
-    for key, value in existing_flat_arrays.items():
-      if key not in lora_init_values:
-        _delete_jax_arrays_in_tree(value, gemma_checkpointer.jax)
-
-    with gemma_checkpointer.jax.default_device(
-        gemma_checkpointer.jax.devices("cpu")[0]
-    ):
-
-      def _make_empty_cpu_array(spec):
-        return gemma_checkpointer.jnp.empty(
-            spec.shape,
-            spec.dtype,
-            device=gemma_checkpointer.jax.devices("cpu")[0],
-        )
-
-      ckpt = gemma_checkpointer.ocp.PyTreeCheckpointer()
-      metadata = ckpt.metadata(checkpoint_path)
-      lparams_empty = gemma_checkpointer.jax.tree.map(
-          _make_empty_cpu_array, metadata.item_metadata.tree
-      )
-      gemma_params = ckpt.restore(checkpoint_path, item=lparams_empty)
-
-    existing_flat = gemma_checkpointer.flax.traverse_util.flatten_dict(
-        model_param_spec, sep="/"
-    )
-    ckpt_flat = gemma_checkpointer.flax.traverse_util.flatten_dict(
-        gemma_params, sep="/"
-    )
-    existing_flat = _remap_and_match_params(
-        existing_flat, ckpt_flat, lora_init_values
-    )
-    merged = gemma_checkpointer.flax.traverse_util.unflatten_dict(
-        existing_flat, sep="/"
-    )
-
-    return gemma_checkpointer.jax.tree.map(
-        lambda x, y: gemma_checkpointer.jax.device_put(
-            x.astype(y.dtype), device=y.sharding
-        ),
-        merged,
-        model_param_spec,
-    )
-
-  gemma_checkpointer._remap_and_match_params = _remap_and_match_params  # pylint: disable=protected-access
-  gemma_checkpointer.cheaply_load_params = cheaply_load_params
-  gemma_checkpointer._tunix_official_qlora_patch_applied = True
-  _OFFICIAL_QLORA_CHECKPOINTER_PATCHED = True
-  print(
-      _json_dumps({
-          "event": "official_backend_official_qlora_checkpoint_loader_patched",
-          "base_weight_storage": "packed_int4_qvalue_scale",
-      }),
-      flush=True,
-  )
-
-
 def _patch_qwix_checkpoint_loader(config: OfficialSFTConfig) -> None:
   """Extends the official memory-safe loader for Qwix LoRA leaves."""
   del config
@@ -2551,11 +2388,9 @@ def _patch_qwix_checkpoint_loader(config: OfficialSFTConfig) -> None:
       remapped_ckpt[ckpt_path] = value
 
     loaded_count = 0
-    for path, model_value in model_flat.items():
+    for path in model_flat:
       if path in remapped_ckpt:
-        model_flat[path] = _checkpoint_value_for_model_value(
-            model_value, remapped_ckpt[path]
-        )
+        model_flat[path] = remapped_ckpt[path]
         loaded_count += 1
 
     for key, value in lora_init_values.items():
@@ -2832,7 +2667,7 @@ def _param_tree_memory_summary(
     *,
     sample_limit: int = 12,
 ) -> dict[str, Any]:
-  """Summarizes quantized, LoRA, and dense leaf storage without host reads."""
+  """Summarizes LoRA and dense leaf storage without host reads."""
   try:
     import jax  # pylint: disable=g-import-not-at-top
   except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -2842,59 +2677,22 @@ def _param_tree_memory_summary(
 
   summary: dict[str, Any] = {
       "total_leaves": 0,
-      "quantized_base_leaves": 0,
-      "quantized_base_storage_bytes": 0,
-      "quantized_base_dense_equivalent_bf16_bytes": 0,
-      "quantized_base_qvalue_bytes": 0,
-      "quantized_base_scale_bytes": 0,
-      "quantized_base_zero_point_bytes": 0,
       "lora_path_leaves": 0,
       "lora_path_storage_bytes": 0,
       "dense_non_lora_leaves": 0,
       "dense_non_lora_storage_bytes": 0,
       "other_leaves": 0,
-      "qtypes": {},
-      "sample_quantized_base_paths": [],
       "sample_lora_paths": [],
       "sample_dense_non_lora_paths": [],
   }
 
-  leaves = jax.tree_util.tree_flatten_with_path(
-      tree,
-      is_leaf=_is_param_summary_leaf,
-  )[0]
-  leaf_records = [(_jax_path_to_string(path), leaf) for path, leaf in leaves]
-  path_strings = {path for path, _ in leaf_records}
-  for path_str, leaf in leaf_records:
+  leaves = jax.tree_util.tree_flatten_with_path(tree)[0]
+  for path, leaf in leaves:
+    path_str = _jax_path_to_string(path)
     summary["total_leaves"] += 1
-    if _is_qwix_quantized_value(leaf):
-      _add_quantized_leaf_summary(
-          summary,
-          path_str,
-          leaf.array,
-          sample_limit=sample_limit,
-      )
-      continue
-    if _is_qwix_qarray(leaf):
-      _add_quantized_leaf_summary(
-          summary,
-          path_str,
-          leaf,
-          sample_limit=sample_limit,
-      )
-      continue
-
     leaf_bytes = _array_nbytes_metadata(leaf)
     if leaf_bytes is None:
       summary["other_leaves"] += 1
-      continue
-    if _is_official_qlora_quantized_path(path_str, path_strings):
-      _add_official_qlora_leaf_summary(
-          summary,
-          path_str,
-          leaf,
-          sample_limit=sample_limit,
-      )
       continue
     if _is_lora_adapter_path(path_str):
       summary["lora_path_leaves"] += 1
@@ -2908,90 +2706,11 @@ def _param_tree_memory_summary(
       )
 
   for key in (
-      "quantized_base_storage_bytes",
-      "quantized_base_dense_equivalent_bf16_bytes",
       "lora_path_storage_bytes",
       "dense_non_lora_storage_bytes",
   ):
     summary[f"{key}_gib"] = summary[key] / float(1024**3)
-  q_storage = summary["quantized_base_storage_bytes"]
-  dense_equiv = summary["quantized_base_dense_equivalent_bf16_bytes"]
-  summary["quantized_base_vs_bf16_ratio"] = (
-      None if dense_equiv == 0 else q_storage / dense_equiv
-  )
   return summary
-
-
-def _is_param_summary_leaf(value: Any) -> bool:
-  return _is_qwix_quantized_value(value) or _is_qwix_qarray(value)
-
-
-def _is_qwix_qarray(value: Any) -> bool:
-  return hasattr(value, "qvalue") and hasattr(value, "scale")
-
-
-def _is_official_qlora_quantized_path(
-    path: str,
-    all_paths: set[str],
-) -> bool:
-  if path.endswith("_qvalue"):
-    return path[: -len("_qvalue")] + "_scale" in all_paths
-  if path.endswith("_scale"):
-    return path[: -len("_scale")] + "_qvalue" in all_paths
-  return False
-
-
-def _add_quantized_leaf_summary(
-    summary: dict[str, Any],
-    path: str,
-    qarray: Any,
-    *,
-    sample_limit: int,
-) -> None:
-  qvalue_bytes = _array_nbytes_metadata(getattr(qarray, "qvalue", None)) or 0
-  scale_bytes = _array_nbytes_metadata(getattr(qarray, "scale", None)) or 0
-  zero_point = getattr(qarray, "zero_point", None)
-  zero_point_bytes = (
-      0 if zero_point is None else (_array_nbytes_metadata(zero_point) or 0)
-  )
-  original_elements = _shape_num_elements(getattr(qarray, "shape", ()))
-  dense_equivalent_bf16_bytes = original_elements * 2
-  qtype = str(getattr(qarray, "qtype", None))
-
-  summary["quantized_base_leaves"] += 1
-  summary["quantized_base_qvalue_bytes"] += qvalue_bytes
-  summary["quantized_base_scale_bytes"] += scale_bytes
-  summary["quantized_base_zero_point_bytes"] += zero_point_bytes
-  summary["quantized_base_storage_bytes"] += (
-      qvalue_bytes + scale_bytes + zero_point_bytes
-  )
-  summary[
-      "quantized_base_dense_equivalent_bf16_bytes"
-  ] += dense_equivalent_bf16_bytes
-  summary["qtypes"][qtype] = summary["qtypes"].get(qtype, 0) + 1
-  _append_sample(summary["sample_quantized_base_paths"], path, sample_limit)
-
-
-def _add_official_qlora_leaf_summary(
-    summary: dict[str, Any],
-    path: str,
-    leaf: Any,
-    *,
-    sample_limit: int,
-) -> None:
-  leaf_bytes = _array_nbytes_metadata(leaf) or 0
-  summary["quantized_base_storage_bytes"] += leaf_bytes
-  if path.endswith("_qvalue"):
-    qvalue_elements = _shape_num_elements(getattr(leaf, "shape", ()))
-    summary["quantized_base_leaves"] += 1
-    summary["quantized_base_qvalue_bytes"] += leaf_bytes
-    summary["quantized_base_dense_equivalent_bf16_bytes"] += (
-        qvalue_elements * 2 * 2
-    )
-    summary["qtypes"]["int4"] = summary["qtypes"].get("int4", 0) + 1
-    _append_sample(summary["sample_quantized_base_paths"], path, sample_limit)
-  elif path.endswith("_scale"):
-    summary["quantized_base_scale_bytes"] += leaf_bytes
 
 
 def _append_sample(samples: list[str], value: str, limit: int) -> None:

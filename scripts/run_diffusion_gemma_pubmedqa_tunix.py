@@ -54,6 +54,7 @@ if str(REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(REPO_ROOT))
 
 from tunix.generate import tokenizer_adapter
+from tunix.models.diffusion_gemma import data as diffusion_data
 from tunix.models.diffusion_gemma import model as diffusion_model
 from tunix.models.diffusion_gemma import params as diffusion_params
 from tunix.models.diffusion_gemma import sft as diffusion_sft
@@ -402,54 +403,23 @@ def _make_batch(
     rng_seed: int,
     tiny_vocab_size: int | None = None,
 ) -> diffusion_sft.DiffusionGemmaSFTBatch:
-  pad_id = tokenizer.pad_id()
-  eos_id = tokenizer.eos_id()
-  bos_id = tokenizer.bos_id()
-  prompts = []
-  canvases = []
-  canvas_ids = []
-  canvas_masks = []
-  encoder_targets = []
-  encoder_target_masks = []
-  for example in examples:
-    prompt_ids = [bos_id] + tokenizer.encode(_model_prompt(example))
-    response_ids = tokenizer.encode(
-        _model_response(example, use_long_answer=use_long_answer)
-    )
-    if tiny_vocab_size is not None:
-      prompt_ids = [x % tiny_vocab_size for x in prompt_ids]
-      response_ids = [x % tiny_vocab_size for x in response_ids]
-      pad_id = pad_id % tiny_vocab_size
-      eos_id = eos_id % tiny_vocab_size
-
-    prompt = _pad_or_truncate(prompt_ids, prompt_len, pad_id)
-    canvas, canvas_id, canvas_mask = _canvas_chunk(
-        response_ids,
-        num_canvases=num_canvases,
-        canvas_size=canvas_size,
-        eos_id=eos_id,
-        pad_id=pad_id,
-    )
-    encoder_target, encoder_target_mask = _encoder_shift(
-        prompt, canvas, canvas_mask, pad_id=pad_id
-    )
-    prompts.append(prompt)
-    canvases.append(canvas[:, None])
-    canvas_ids.append(canvas_id)
-    canvas_masks.append(canvas_mask)
-    encoder_targets.append(encoder_target)
-    encoder_target_masks.append(encoder_target_mask.astype(np.float32))
-
-  return diffusion_sft.DiffusionGemmaSFTBatch(
-      prompt=jnp.asarray(np.stack(prompts), dtype=jnp.int32),
-      canvas=jnp.asarray(np.stack(canvases), dtype=jnp.int32),
-      canvas_id=jnp.asarray(np.stack(canvas_ids), dtype=jnp.int32),
-      canvas_mask=jnp.asarray(np.stack(canvas_masks), dtype=jnp.bool_),
-      encoder_target=jnp.asarray(np.stack(encoder_targets), dtype=jnp.int32),
-      encoder_target_mask=jnp.asarray(
-          np.stack(encoder_target_masks), dtype=jnp.float32
+  config = diffusion_data.config_from_tokenizer(
+      tokenizer,
+      prompt_len=prompt_len,
+      canvas_size=canvas_size,
+      num_canvases=num_canvases,
+      add_canvas_feature_axis=True,
+      tiny_vocab_size=tiny_vocab_size,
+  )
+  return diffusion_data.make_sft_batch_from_text_examples(
+      examples,
+      tokenizer=tokenizer,
+      config=config,
+      rng_seed=rng_seed,
+      prompt_fn=_model_prompt,
+      response_fn=lambda example: _model_response(
+          example, use_long_answer=use_long_answer
       ),
-      rng=jax.random.PRNGKey(rng_seed),
   )
 
 
@@ -907,9 +877,7 @@ def _train_with_separate_loss_jits(
             elapsed_seconds=time.monotonic() - phase_started,
         )
       micro_grads = jax.tree.map(
-          lambda decoder_grad, encoder_grad: (
-              decoder_grad + encoder_grad
-          )
+          lambda decoder_grad, encoder_grad: (decoder_grad + encoder_grad)
           * loss_scale.astype((decoder_grad + encoder_grad).dtype),
           decoder_grads,
           encoder_grads,
@@ -1026,7 +994,8 @@ def _train_with_separate_loss_jits(
           loop_step=step,
       )
     reached_max_runtime = (
-        max_runtime_seconds and time.monotonic() - start_time >= max_runtime_seconds
+        max_runtime_seconds
+        and time.monotonic() - start_time >= max_runtime_seconds
     )
     if reached_max_runtime:
       timed_out = True
@@ -1141,9 +1110,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         frozen=frozen_summary,
         lora_fraction=(
             trainable_summary["elements"]
-            / max(
-                trainable_summary["elements"] + frozen_summary["elements"], 1
-            )
+            / max(trainable_summary["elements"] + frozen_summary["elements"], 1)
         ),
     )
     ckpt_dir = _checkpoint_dir(
@@ -1154,7 +1121,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "steps": 0,
         "checkpoint_dir": ckpt_dir,
         "checkpoint_dir_exists": pathlib.Path(ckpt_dir).exists(),
-        "minimal_state_path": str(pathlib.Path(ckpt_dir) / "minimal_state.json"),
+        "minimal_state_path": str(
+            pathlib.Path(ckpt_dir) / "minimal_state.json"
+        ),
         "checkpoint": args.checkpoint,
         "tiny": args.tiny,
         "dtype": args.dtype,
@@ -1272,7 +1241,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
       examples, tokenizer=tokenizer, args=args, vocab_size=vocab_size
   )
   if args.skip_initial_loss and args.initial_loss_only:
-    raise ValueError("--skip_initial_loss cannot be used with --initial_loss_only.")
+    raise ValueError(
+        "--skip_initial_loss cannot be used with --initial_loss_only."
+    )
   initial_loss_value = None
   initial_decoder_loss_value = None
   initial_encoder_loss_value = None
@@ -1294,8 +1265,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not bool(jnp.isfinite(initial_loss)):
       raise RuntimeError(f"Initial PubMedQA loss is not finite: {initial_loss}")
     initial_loss_value = float(jax.device_get(initial_loss))
-    initial_decoder_loss_value = float(jax.device_get(initial_aux["decoder_loss"]))
-    initial_encoder_loss_value = float(jax.device_get(initial_aux["encoder_loss"]))
+    initial_decoder_loss_value = float(
+        jax.device_get(initial_aux["decoder_loss"])
+    )
+    initial_encoder_loss_value = float(
+        jax.device_get(initial_aux["encoder_loss"])
+    )
     initial_corrupted_fraction_value = float(
         jax.device_get(initial_aux["corrupted_fraction"])
     )
@@ -1331,7 +1306,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "steps": 0,
         "checkpoint_dir": ckpt_dir,
         "checkpoint_dir_exists": pathlib.Path(ckpt_dir).exists(),
-        "minimal_state_path": str(pathlib.Path(ckpt_dir) / "minimal_state.json"),
+        "minimal_state_path": str(
+            pathlib.Path(ckpt_dir) / "minimal_state.json"
+        ),
         "initial_loss": initial_loss_value,
         "initial_decoder_loss": initial_decoder_loss_value,
         "initial_encoder_loss": initial_encoder_loss_value,
@@ -1357,9 +1334,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not result["checkpoint_dir_exists"]:
       raise RuntimeError(f"Checkpoint directory was not created: {ckpt_dir}")
     return _write_result(
-      result,
-      event="initial_loss_only_complete",
-      gpu_memory_monitor=gpu_memory_monitor,
+        result,
+        event="initial_loss_only_complete",
+        gpu_memory_monitor=gpu_memory_monitor,
     )
 
   if not args.skip_initial_loss and args.clear_caches_after_initial_loss:
@@ -1663,9 +1640,10 @@ def parse_args() -> argparse.Namespace:
       action=argparse.BooleanOptionalAction,
       default=False,
       help=(
-          "Use Tunix/Orbax checkpointing. Disabled by default for public 26B "
-          "GPU validation runs because the optimizer checkpoint can exceed memory; "
-          "a minimal_state.json proof artifact is always written instead."
+          "Use Tunix/Orbax checkpointing. Disabled by default for public 26B"
+          " GPU validation runs because the optimizer checkpoint can exceed"
+          " memory; a minimal_state.json proof artifact is always written"
+          " instead."
       ),
   )
   parser.add_argument(

@@ -20,7 +20,6 @@ from tunix.models.diffusion_gemma import hackable_adapter
 from tunix.models.diffusion_gemma import linen_qwix_lora
 from tunix.models.diffusion_gemma import lora_inventory
 from tunix.models.diffusion_gemma import model
-from tunix.models.diffusion_gemma import official_qlora
 from tunix.models.diffusion_gemma import params
 from tunix.models.diffusion_gemma import params_safetensors
 from tunix.models.diffusion_gemma import sft
@@ -33,10 +32,14 @@ from tunix.models.diffusion_gemma.generation import (
 from tunix.models.diffusion_gemma.hackable_adapter import (
     DiffusionGemmaOfficialLossConfig,
     DiffusionGemmaQwixLoRAConfig,
+    OfficialCheckpointInfo,
     OfficialBackendDependencyError,
     OfficialDiffusionGemmaTrainer,
     OfficialSFTConfig,
+    get_official_checkpoint_info,
+    list_official_checkpoint_steps,
     make_official_tunix_sft_config,
+    resolve_official_checkpoint_step,
 )
 from tunix.models.diffusion_gemma.sft import (
     DiffusionGemmaEvalResult,
@@ -53,6 +56,7 @@ __all__ = [
     "DiffusionGemmaEvalResult",
     "DiffusionGemmaSFTLoss",
     "OfficialBackendDependencyError",
+    "OfficialCheckpointInfo",
     "OfficialDiffusionGemmaTrainer",
     "OfficialSFTConfig",
     "configure_peft_trainer_for_diffusion_gemma_sft",
@@ -60,14 +64,16 @@ __all__ = [
     "decode_trace",
     "evaluate_sft_loss",
     "generation",
+    "get_official_checkpoint_info",
     "generate_tokens",
     "hackable_adapter",
     "linen_qwix_lora",
     "lora_inventory",
+    "list_official_checkpoint_steps",
     "make_official_tunix_sft_config",
     "model",
-    "official_qlora",
     "params",
     "params_safetensors",
+    "resolve_official_checkpoint_step",
     "sft",
 ]

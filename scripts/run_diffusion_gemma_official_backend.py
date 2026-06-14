@@ -78,15 +78,6 @@ def _base_config_from_args(args: argparse.Namespace):
       checkpoint_every_n_steps=args.checkpoint_every_n_steps,
       lora_rank=args.lora_rank,
       lora_backend=args.lora_backend,
-      official_qlora_quantize_moe_weights=(
-          args.official_qlora_quantize_moe_weights
-      ),
-      official_qlora_einsum_output_chunk_size=(
-          args.official_qlora_einsum_output_chunk_size
-      ),
-      official_qlora_ragged_output_chunk_size=(
-          args.official_qlora_ragged_output_chunk_size
-      ),
       official_remat_blocks=args.official_remat_blocks,
       stop_gradient_from_denoiser_to_encoder=(
           args.stop_gradient_from_denoiser_to_encoder
@@ -157,41 +148,13 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--lora_rank", type=int, default=None)
   parser.add_argument(
       "--lora_backend",
-      choices=["official", "official_qlora", "qwix_lora"],
+      choices=["official", "qwix_lora"],
       default="official",
       help=(
           "LoRA implementation inside the official recipe. 'official' keeps"
-          " DeepMind Hackable Diffusion LoRA; 'official_qlora' keeps that"
-          " official LoRA surface but stores frozen base weights as packed"
-          " int4 qvalue/scale leaves; 'qwix_lora' patches only the Linen LoRA"
-          " constructor while retaining the official model/loss/trainstep."
-      ),
-  )
-  parser.add_argument(
-      "--official_qlora_quantize_moe_weights",
-      action=argparse.BooleanOptionalAction,
-      default=True,
-      help=(
-          "For lora_backend=official_qlora, also quantize Gemma4 MoERagged "
-          "private _Weight leaves. Disable to isolate the MoE weight path."
-      ),
-  )
-  parser.add_argument(
-      "--official_qlora_einsum_output_chunk_size",
-      type=int,
-      default=256,
-      help=(
-          "For lora_backend=official_qlora, chunk packed int4 Dense/Einsum "
-          "base-weight execution along the output feature axis."
-      ),
-  )
-  parser.add_argument(
-      "--official_qlora_ragged_output_chunk_size",
-      type=int,
-      default=256,
-      help=(
-          "For lora_backend=official_qlora, chunk packed int4 MoE ragged_dot "
-          "base-weight execution along the output feature axis."
+          " DeepMind Hackable Diffusion LoRA; 'qwix_lora' patches only the"
+          " Linen LoRA constructor while retaining the official"
+          " model/loss/trainstep."
       ),
   )
   parser.add_argument(
@@ -200,8 +163,8 @@ def parse_args() -> argparse.Namespace:
       default=False,
       help=(
           "Apply the official Sudoku-full Gemma4 Block.__call__ nn.remat "
-          "patch. This is useful for high-memory PubMedQA QLoRA runs and is "
-          "off by default so existing official/LoRA runs are unchanged."
+          "patch. This is useful for high-memory PubMedQA LoRA runs and is off"
+          " by default so existing official/LoRA runs are unchanged."
       ),
   )
   parser.add_argument(
@@ -383,15 +346,6 @@ def main() -> None:
                 "lora_backend": getattr(
                     getattr(cfg, "aux", None), "lora_backend", None
                 ),
-                "official_qlora_quantize_moe_weights": (
-                    args.official_qlora_quantize_moe_weights
-                ),
-                "official_qlora_einsum_output_chunk_size": (
-                    args.official_qlora_einsum_output_chunk_size
-                ),
-                "official_qlora_ragged_output_chunk_size": (
-                    args.official_qlora_ragged_output_chunk_size
-                ),
                 "official_remat_blocks": args.official_remat_blocks,
                 "stop_gradient_from_denoiser_to_encoder": (
                     args.stop_gradient_from_denoiser_to_encoder
@@ -435,15 +389,6 @@ def main() -> None:
           "num_train_steps": args.num_train_steps,
           "run_steps": args.run_steps,
           "lora_backend": args.lora_backend,
-          "official_qlora_quantize_moe_weights": (
-              args.official_qlora_quantize_moe_weights
-          ),
-          "official_qlora_einsum_output_chunk_size": (
-              args.official_qlora_einsum_output_chunk_size
-          ),
-          "official_qlora_ragged_output_chunk_size": (
-              args.official_qlora_ragged_output_chunk_size
-          ),
           "official_remat_blocks": args.official_remat_blocks,
           "stop_gradient_from_denoiser_to_encoder": (
               args.stop_gradient_from_denoiser_to_encoder
